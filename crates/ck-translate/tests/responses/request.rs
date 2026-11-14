@@ -304,3 +304,38 @@ fn chat_requests_use_responses_fence_and_streamed_text_projection() {
         }
     }
 }
+
+#[test]
+fn tool_outputs_link_to_an_earlier_call_with_their_call_id() {
+    let call = |id: &str| json!({"type":"function_call","call_id":id,"name":"f","arguments":"{}"});
+    let output = |id: &str| json!({"type":"function_call_output","call_id":id,"output":"r"});
+    let user = json!({"role":"user","content":"q"});
+    // A repeated call_id is accepted, and so is a second output for one call: the Responses
+    // API documents no uniqueness rule for call_id, so the output links to any earlier call.
+    for (input, linked) in [
+        (vec![call("a"), call("b"), output("b"), output("a")], true),
+        (vec![call("a"), user.clone(), call("a"), output("a"), output("a")], true),
+        (vec![output("a"), call("a")], false),
+        (vec![call("a"), output("b")], false),
+        (vec![call("ab"), output("a")], false),
+    ] {
+        let body = json!({"model":"m","input":input});
+        let mut m = Mapped::new();
+        let mut ingress = responses::request::Ingress::new(
+            &mut m.writer,
+            &m.store,
+            identity(Direction::Request),
+            Operation::Generate,
+            1024 * 1024,
+        )
+        .unwrap();
+        ingress
+            .advance(&mut m.writer, &serde_json::to_vec(&body).unwrap())
+            .unwrap();
+        let result = ingress.finish(&mut m.writer, &responses::request::ResponsesCapability);
+        assert_eq!(result.is_ok(), linked, "{body}");
+        if !linked {
+            assert_invalid_input(&m.output(&m.writer), "client");
+        }
+    }
+}
