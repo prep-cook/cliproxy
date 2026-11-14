@@ -367,3 +367,42 @@ fn native_temperature_and_top_p_reach_chat_together() {
         assert_eq!(body["stream"], upstream_stream);
     }
 }
+
+#[test]
+fn unknown_event_names_stay_opaque_and_known_names_must_match_the_type() {
+    let rows = [
+        json!({"type":"message_start","message":{"id":"r","model":"m"}}),
+        json!({"type":"message_delta","delta":{"stop_reason":"end_turn"}}),
+        json!({"type":"message_stop"}),
+    ];
+    let mut raw = crate::sse(&rows[..1]);
+    raw.extend_from_slice(b"event: future_event\ndata: not json\n\nevent: future_event\ndata: {\"x\":1}\n\n");
+    raw.extend_from_slice(&crate::sse(&rows[1..]));
+    let (_, canonical) = response(&raw, BodyMode::Streaming, BodyMode::Streaming, Operation::Generate, 5);
+    assert!(
+        canonical
+            .iter()
+            .any(|row| row["format"] == "text" && row["value"] == "not json")
+    );
+    assert!(
+        canonical
+            .iter()
+            .any(|row| row["format"] == "json" && row["value"] == json!({"x":1}))
+    );
+
+    let mut raw = crate::sse(&rows[..1]);
+    raw.extend_from_slice(b"event: message_stop\ndata: {\"type\":\"message_delta\",\"delta\":{}}\n\n");
+    let mut mapped = Mapped::new();
+    let mut ingress = anthropic::response::Ingress::new(
+        &mut mapped.writer,
+        identity(Direction::Response),
+        Operation::Generate,
+        BodyMode::Streaming,
+        1024 * 1024,
+    )
+    .unwrap();
+    assert!(matches!(
+        ingress.advance(&mut mapped.writer, &raw),
+        Err(codec::Error::Schema)
+    ));
+}
