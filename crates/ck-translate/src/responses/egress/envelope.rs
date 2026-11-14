@@ -31,13 +31,8 @@ impl<F: FnMut(&'static str, u64)> Egress<F> {
         )
     }
 
-    /// Publishes `response.created` with the restored native identity.
-    pub(super) fn response_start(
-        &mut self,
-        owner: &mut Writer,
-        incoming: Document,
-        output: &mut impl FnMut(ScratchLease) -> Result<()>,
-    ) -> Result<()> {
+    /// Restores the native identity; `response.created` is owed until `created` publishes it.
+    pub(super) fn response_start(&mut self, incoming: Document) -> Result<()> {
         let doc = &mut self.document;
         let target = doc.root();
         let node = doc.absorb(incoming)?;
@@ -52,7 +47,21 @@ impl<F: FnMut(&'static str, u64)> Egress<F> {
                 doc.transplant(target, value)?;
             }
         }
-        let response = encode::scratch(owner, |e| doc.write(target, e))?;
+        self.owed = true;
+        Ok(())
+    }
+
+    /// Publishes the owed `response.created` with the response as it stands.
+    pub(super) fn created(
+        &mut self,
+        owner: &mut Writer,
+        output: &mut impl FnMut(ScratchLease) -> Result<()>,
+    ) -> Result<()> {
+        if !self.owed {
+            return Ok(());
+        }
+        self.owed = false;
+        let response = encode::scratch(owner, |e| self.document.write(self.document.root(), e))?;
         self.emit(
             owner,
             "response.created",
@@ -109,19 +118,29 @@ impl<F: FnMut(&'static str, u64)> Egress<F> {
     ) -> Result<()> {
         let root = incoming.root();
         if is(&incoming, root, "name", "responses.response")? {
-            let progress = match incoming
+            let source = match incoming
                 .member(root, "x_ck")?
                 .map(|x| incoming.member(x, "source"))
                 .transpose()?
             {
-                Some(Some(source)) => is(&incoming, source, "event", "response.in_progress")?,
-                _ => false,
+                Some(Some(source)) => Some(source),
+                _ => None,
             };
+            let event = |name| source.map_or(Ok(false), |source| is(&incoming, source, "event", name));
+            let (creation, progress) = (event("response.created")?, event("response.in_progress")?);
+            // The creation snapshot completes the owed `response.created`; any other snapshot
+            // follows it.
+            if !creation {
+                self.created(owner, output)?;
+            }
             let doc = &mut self.document;
             let node = doc.absorb(incoming)?;
             let value = doc.required(node, "value")?;
             super::super::opaque::preserve_carrier_collision(doc, value)?;
             super::super::merge(doc, doc.root(), value)?;
+            if creation {
+                return self.created(owner, output);
+            }
             if !progress || self.mode == BodyMode::Buffered {
                 return Ok(());
             }

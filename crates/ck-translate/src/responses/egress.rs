@@ -37,6 +37,9 @@ pub struct Egress<F: FnMut(&'static str, u64)> {
     /// A message item from a source without native items, appended but not yet announced: it
     /// follows any reasoning item split out of it, and is dropped if it stays empty.
     pending: Option<usize>,
+    /// `response.created` is owed: it waits for the source's own creation snapshot, or for the
+    /// first event that needs a created response before it.
+    owed: bool,
 }
 impl<F: FnMut(&'static str, u64)> Egress<F> {
     pub fn new(
@@ -71,6 +74,7 @@ impl<F: FnMut(&'static str, u64)> Egress<F> {
             audio: Table::new(owner)?,
             usage_snapshot: None,
             pending: None,
+            owed: false,
         })
     }
     fn emit(
@@ -112,10 +116,13 @@ impl<F: FnMut(&'static str, u64)> Egress<F> {
                 return Ok(());
             }
         }
+        if !matches!(kind, Kind::Heartbeat | Kind::Usage | Kind::Opaque | Kind::ResponseStart) {
+            self.created(owner, output)?;
+        }
         match kind {
             Kind::Heartbeat => return Ok(()),
             Kind::Error | Kind::Cancelled => return self.failed(owner, output),
-            Kind::ResponseStart => return self.response_start(owner, incoming, output),
+            Kind::ResponseStart => return self.response_start(incoming),
             Kind::Done => return self.done(owner, output),
             Kind::Opaque => return self.opaque(owner, incoming, output),
             _ => {}

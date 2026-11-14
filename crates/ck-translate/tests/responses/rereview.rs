@@ -181,6 +181,72 @@ fn unnamed_data_is_not_classified_by_its_first_byte() {
     }
 }
 
+/// Streaming client JSON events for the queued → in progress → completed lifecycle after
+/// `prefix`; an unknown text record passes through as it is.
+fn lifecycle(prefix: &str) -> Vec<Value> {
+    let response = |status: &str| json!({"id":"r","status":status,"output":[]});
+    let records = [
+        json!({"type":"response.created","response":response("queued")}),
+        json!({"type":"response.in_progress","response":response("in_progress")}),
+        json!({"type":"response.completed","response":response("completed")}),
+    ];
+    let (out, _) = try_raw(format!("{prefix}{}", wire(&records)).as_bytes(), BodyMode::Streaming).unwrap();
+    std::str::from_utf8(&out)
+        .unwrap()
+        .lines()
+        .filter_map(|line| serde_json::from_str(line.strip_prefix("data: ")?).ok())
+        .collect()
+}
+
+#[test]
+fn a_heartbeat_before_creation_fixes_no_identity() {
+    for prefix in [": ping\n\n", "data: ordinary text\n\n"] {
+        let events = lifecycle(prefix);
+        let created = events.iter().find(|e| e["type"] == "response.created").unwrap();
+        assert_eq!(created["response"]["status"], "queued", "{prefix}");
+        for event in events.iter().filter(|e| e.get("response").is_some()) {
+            assert_eq!(event["response"]["id"], "r", "{prefix}");
+        }
+    }
+}
+
+#[test]
+fn response_created_carries_its_own_snapshot() {
+    let created = json!({"type":"response.created","response":{"id":"r","status":"in_progress",
+        "instructions":"RULE","tools":[{"type":"web_search"}],"output":[]}});
+    let (out, _) = try_raw(
+        format!("data: {created}\n\n{COMPLETED}").as_bytes(),
+        BodyMode::Streaming,
+    )
+    .unwrap();
+    let events = client_events(&out);
+    assert_eq!(events[0]["type"], "response.created");
+    assert_eq!(events[0]["response"]["instructions"], "RULE");
+    assert_eq!(events[0]["response"]["tools"], json!([{"type":"web_search"}]));
+    // The created event goes out with its snapshot, before any later record.
+    let input = format!("data: {created}\n\ndata: ordinary text\n\n{COMPLETED}");
+    let (out, _) = try_raw(input.as_bytes(), BodyMode::Streaming).unwrap();
+    let first = String::from_utf8(out)
+        .unwrap()
+        .lines()
+        .find(|l| l.starts_with("data: "))
+        .unwrap()
+        .to_owned();
+    assert!(first.starts_with("data: {\"type\":\"response.created\""), "{first}");
+    // A stream without a creation snapshot still opens with `response.created`.
+    let progress = json!({"type":"response.in_progress","response":{"id":"r","status":"in_progress","output":[]}});
+    let (out, _) = try_raw(
+        format!("data: {progress}\n\n{COMPLETED}").as_bytes(),
+        BodyMode::Streaming,
+    )
+    .unwrap();
+    let types: Vec<_> = client_events(&out).iter().map(|e| e["type"].clone()).collect();
+    assert_eq!(
+        types,
+        ["response.created", "response.in_progress", "response.completed"]
+    );
+}
+
 #[test]
 fn announced_text_parts_carry_their_annotations() {
     let citation = json!({"type":"url_citation","url":"https://e/","title":"t","start_index":0,"end_index":1});
