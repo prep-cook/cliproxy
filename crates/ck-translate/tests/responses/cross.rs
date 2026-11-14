@@ -1,7 +1,7 @@
 use super::*;
 
 /// Runs Chat `input` through Chat ingress and Responses egress; returns the client bytes.
-fn chat_to_responses(input: &[u8], mode: BodyMode, downstream: BodyMode) -> Vec<u8> {
+pub(super) fn chat_to_responses(input: &[u8], mode: BodyMode, downstream: BodyMode) -> Vec<u8> {
     let mut m = Mapped::new();
     let mut ingress = codec::chat::response::Ingress::new(
         &mut m.writer,
@@ -41,7 +41,7 @@ fn chat_to_responses(input: &[u8], mode: BodyMode, downstream: BodyMode) -> Vec<
 }
 
 /// Client SSE events as JSON values.
-fn client_events(output: &[u8]) -> Vec<Value> {
+pub(super) fn client_events(output: &[u8]) -> Vec<Value> {
     std::str::from_utf8(output)
         .unwrap()
         .lines()
@@ -50,7 +50,7 @@ fn client_events(output: &[u8]) -> Vec<Value> {
         .collect()
 }
 
-fn sse(records: &[Value]) -> String {
+pub(super) fn sse(records: &[Value]) -> String {
     let mut input: String = records.iter().map(|record| format!("data: {record}\n\n")).collect();
     input.push_str("data: [DONE]\n\n");
     input

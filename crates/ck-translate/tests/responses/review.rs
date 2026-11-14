@@ -149,3 +149,68 @@ fn incomplete_calls_end_incomplete_with_their_arguments() {
         assert_eq!(out["output"][0]["status"], "incomplete");
     }
 }
+
+#[test]
+fn chat_reasoning_becomes_a_reasoning_item_before_the_message() {
+    use super::cross::{chat_to_responses, client_events, sse};
+    // Raw bytes keep the source order: reasoning before content.
+    let chunk = |delta: Value, finish: Value| json!({"id":"r","object":"chat.completion.chunk","created":1,"model":"m","choices":[{"index":0,"delta":delta,"finish_reason":finish}]});
+    let streamed = sse(&[
+        chunk(json!({"role":"assistant","reasoning_content":"think"}), Value::Null),
+        chunk(json!({"content":"answer"}), Value::Null),
+        chunk(json!({}), json!("stop")),
+    ]);
+    // Chat ingress opens a buffered message's text block before its reasoning block, so only a
+    // streamed source puts the reasoning first.
+    for (input, mode) in [(streamed.as_bytes(), BodyMode::Streaming)] {
+        let body: Value = serde_json::from_slice(&chat_to_responses(input, mode, BodyMode::Buffered)).unwrap();
+        let events = client_events(&chat_to_responses(input, mode, BodyMode::Streaming));
+        for output in [&body["output"], &events.last().unwrap()["response"]["output"]] {
+            let kinds: Vec<_> = output.as_array().unwrap().iter().map(|i| i["type"].clone()).collect();
+            assert_eq!(kinds, [json!("reasoning"), json!("message")], "{output}");
+            assert_eq!(output[0]["content"][0]["type"], "reasoning_text");
+            assert_eq!(output[0]["content"][0]["text"], "think");
+            assert_eq!(output[0]["status"], "completed");
+            assert_eq!(output[1]["content"].as_array().unwrap().len(), 1);
+            assert_eq!(output[1]["content"][0]["text"], "answer");
+        }
+        // Chat keeps its blocks open until the choice ends, so the two items interleave.
+        for (kind, index, item) in [
+            ("added", 0, "reasoning"),
+            ("added", 1, "message"),
+            ("done", 0, "reasoning"),
+            ("done", 1, "message"),
+        ] {
+            let name = format!("response.output_item.{kind}");
+            let event = events
+                .iter()
+                .find(|e| e["type"] == name && e["item"]["type"] == item)
+                .unwrap();
+            assert_eq!(event["output_index"], index, "{event}");
+        }
+        let at = |name: &str| events.iter().position(|e| e["type"] == name).unwrap();
+        assert!(at("response.output_item.added") < at("response.content_part.added"));
+        let message = events
+            .iter()
+            .position(|e| e["type"] == "response.output_item.added" && e["item"]["type"] == "message");
+        assert!(message.unwrap() < at("response.output_text.delta"));
+    }
+    let only = sse(&[
+        chunk(json!({"role":"assistant","reasoning_content":"think"}), Value::Null),
+        chunk(json!({}), json!("stop")),
+    ]);
+    for downstream in [BodyMode::Buffered, BodyMode::Streaming] {
+        let raw = chat_to_responses(only.as_bytes(), BodyMode::Streaming, downstream);
+        let body = match downstream {
+            BodyMode::Buffered => serde_json::from_slice(&raw).unwrap(),
+            BodyMode::Streaming => client_events(&raw).last().unwrap()["response"].clone(),
+        };
+        let kinds: Vec<_> = body["output"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|i| i["type"].clone())
+            .collect();
+        assert_eq!(kinds, [json!("reasoning")], "{body}");
+    }
+}

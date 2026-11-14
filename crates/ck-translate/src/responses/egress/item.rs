@@ -16,7 +16,8 @@ impl<F: FnMut(&'static str, u64)> Egress<F> {
         if let Some(attributes) = doc.member(node, "attributes")? {
             super::super::merge(doc, item, attributes)?;
         }
-        if doc.member(item, "type")?.is_none() {
+        let native = doc.member(item, "type")?.is_some();
+        if !native {
             doc.set(item, "type", Value::Text("message"))?;
         }
         if doc.member(item, "id")?.is_none() {
@@ -33,6 +34,10 @@ impl<F: FnMut(&'static str, u64)> Egress<F> {
             doc.set(item, "summary", Value::Array)?;
         }
         doc.bind_origin(item, x, None)?;
+        if !native {
+            self.pending = Some(item);
+            return Ok(());
+        }
         let index = native_index(doc, item, "output_index", doc.children(output_node)?.count() as u64 - 1)?;
         let payload = encode::scratch(owner, |e| {
             e.bytes(b",\"output_index\":")?;
@@ -46,6 +51,78 @@ impl<F: FnMut(&'static str, u64)> Egress<F> {
             |e| write_lease(&payload, e),
             output,
         )
+    }
+
+    /// Publishes `response.output_item.added` for the pending message item.
+    pub(super) fn announce(
+        &mut self,
+        owner: &mut Writer,
+        output: &mut impl FnMut(ScratchLease) -> Result<()>,
+    ) -> Result<()> {
+        let Some(item) = self.pending.take() else {
+            return Ok(());
+        };
+        let doc = &self.document;
+        let payload = encode::scratch(owner, |e| {
+            e.bytes(b",\"output_index\":")?;
+            e.unsigned(position(doc, item)?)?;
+            e.bytes(b",\"item\":")?;
+            write_item(doc, item, e)
+        })?;
+        self.emit(
+            owner,
+            "response.output_item.added",
+            |e| write_lease(&payload, e),
+            output,
+        )
+    }
+
+    /// Splits reasoning block `at` out of its message item into its own reasoning item, placed
+    /// before a message that has not been announced yet, and publishes its added event.
+    fn reasoning_item(
+        &mut self,
+        owner: &mut Writer,
+        at: At,
+        output: &mut impl FnMut(ScratchLease) -> Result<()>,
+    ) -> Result<(usize, u64)> {
+        let doc = &mut self.document;
+        let output_node = doc.required(doc.root(), "output")?;
+        let message = doc.required(at.item, "id")?;
+        let block = doc.unsigned(doc.required(at.x, "block_index")?)?;
+        let lease = encode::scratch(owner, |e| {
+            e.bytes(b"\"")?;
+            doc.write_contents(message, e)?;
+            e.bytes(b"_r")?;
+            e.unsigned(block)?;
+            e.bytes(b"\"")
+        })?;
+        let id = doc.import_json(owner, lease)?;
+        let item = doc.add(None, Value::Object)?;
+        doc.append(output_node, item)?;
+        doc.rename(id, "id")?;
+        doc.append(item, id)?;
+        doc.set(item, "type", Value::Text("reasoning"))?;
+        doc.set(item, "status", Value::Text("in_progress"))?;
+        doc.set(item, "summary", Value::Array)?;
+        doc.bind_origin(item, at.x, Some(REASONING_ITEM))?;
+        if self.pending == Some(at.item) {
+            doc.detach(output_node, at.item)?;
+            doc.append(output_node, at.item)?;
+        }
+        let index = position(doc, item)?;
+        let payload = encode::scratch(owner, |e| {
+            e.bytes(b",\"output_index\":")?;
+            e.unsigned(index)?;
+            e.bytes(b",\"item\":")?;
+            write_item(doc, item, e)
+        })?;
+        self.emit(
+            owner,
+            "response.output_item.added",
+            |e| write_lease(&payload, e),
+            output,
+        )?;
+        Ok((item, index))
     }
 
     /// Turns the item into a function or custom call with the restored call identity. A source
@@ -124,10 +201,15 @@ impl<F: FnMut(&'static str, u64)> Egress<F> {
         at: At,
         output: &mut impl FnMut(ScratchLease) -> Result<()>,
     ) -> Result<()> {
-        let At { node, x, item, index } = at;
+        let At { node, x, .. } = at;
+        let summary = is(&self.document, node, "kind", "reasoning_summary")?;
+        let thinking = is(&self.document, node, "kind", "thinking")? || is(&self.document, node, "kind", "reasoning")?;
+        let (item, index) = if (summary || thinking) && is(&self.document, at.item, "type", "message")? {
+            self.reasoning_item(owner, at, output)?
+        } else {
+            (at.item, at.index)
+        };
         let doc = &mut self.document;
-        let summary = is(doc, node, "kind", "reasoning_summary")?;
-        let thinking = is(doc, node, "kind", "thinking")? || is(doc, node, "kind", "reasoning")?;
         if thinking
             && let Some(attributes) = doc.member(node, "attributes")?
             && (is(doc, attributes, "type", "encrypted")? || is(doc, attributes, "type", "redacted")?)
@@ -318,30 +400,44 @@ impl<F: FnMut(&'static str, u64)> Egress<F> {
     ) -> Result<()> {
         let At { x, item, index, .. } = at;
         let doc = &mut self.document;
-        let Some((part, summary, block)) = find_part(doc, item, x)? else {
-            return Ok(());
-        };
-        let payload = encode::scratch(owner, |e| {
-            item_fields(doc, item, index, e)?;
-            e.bytes(if summary {
-                b",\"summary_index\":"
-            } else {
-                b",\"content_index\":"
+        if let Some((part, summary, block)) = find_part(doc, item, x)? {
+            let payload = encode::scratch(owner, |e| {
+                item_fields(doc, item, index, e)?;
+                e.bytes(if summary {
+                    b",\"summary_index\":"
+                } else {
+                    b",\"content_index\":"
+                })?;
+                e.unsigned(block)?;
+                e.bytes(b",\"part\":")?;
+                write_part(doc, part, e)
             })?;
-            e.unsigned(block)?;
-            e.bytes(b",\"part\":")?;
-            write_part(doc, part, e)
+            self.emit(
+                owner,
+                if summary {
+                    "response.reasoning_summary_part.done"
+                } else {
+                    "response.content_part.done"
+                },
+                |e| write_lease(&payload, e),
+                output,
+            )?;
+        }
+        let doc = &mut self.document;
+        if !doc
+            .origin(item)?
+            .is_some_and(|(_, carrier)| carrier == Some(REASONING_ITEM))
+        {
+            return Ok(());
+        }
+        doc.set(item, "status", Value::Text("completed"))?;
+        let payload = encode::scratch(owner, |e| {
+            e.bytes(b",\"output_index\":")?;
+            e.unsigned(index)?;
+            e.bytes(b",\"item\":")?;
+            write_item(doc, item, e)
         })?;
-        self.emit(
-            owner,
-            if summary {
-                "response.reasoning_summary_part.done"
-            } else {
-                "response.content_part.done"
-            },
-            |e| write_lease(&payload, e),
-            output,
-        )
+        self.emit(owner, "response.output_item.done", |e| write_lease(&payload, e), output)
     }
 
     /// Publishes the done event of a call's arguments or input.
@@ -403,6 +499,16 @@ impl<F: FnMut(&'static str, u64)> Egress<F> {
         output: &mut impl FnMut(ScratchLease) -> Result<()>,
     ) -> Result<()> {
         let At { node, item, index, .. } = at;
+        if self.pending == Some(item) {
+            let doc = &mut self.document;
+            if doc.node(doc.required(item, "content")?)?.first.is_none() {
+                // Nothing but split-out reasoning: the message item is never announced.
+                self.pending = None;
+                let output_node = doc.required(doc.root(), "output")?;
+                return doc.detach(output_node, item);
+            }
+            self.announce(owner, output)?;
+        }
         let doc = &mut self.document;
         if let Some(attrs) = doc.member(node, "attributes")? {
             super::super::merge(doc, item, attrs)?;

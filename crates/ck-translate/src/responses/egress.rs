@@ -33,6 +33,9 @@ pub struct Egress<F: FnMut(&'static str, u64)> {
     audio: Table<super::audio::Projection>,
     /// Value slot of the retained canonical usage snapshot in the opaque carrier.
     usage_snapshot: Option<usize>,
+    /// A message item from a source without native items, appended but not yet announced: it
+    /// follows any reasoning item split out of it, and is dropped if it stays empty.
+    pending: Option<usize>,
 }
 impl<F: FnMut(&'static str, u64)> Egress<F> {
     pub fn new(
@@ -66,6 +69,7 @@ impl<F: FnMut(&'static str, u64)> Egress<F> {
             images: Table::new(owner)?,
             audio: Table::new(owner)?,
             usage_snapshot: None,
+            pending: None,
         })
     }
     fn emit(
@@ -151,6 +155,13 @@ impl<F: FnMut(&'static str, u64)> Egress<F> {
             return Err(Error::Schema);
         };
         let at = At { node, x, item, index };
+        // Role-only and finish chunks carry no content; a content chunk follows its block start.
+        if self.pending == Some(item)
+            && !matches!(kind, Kind::ItemEnd | Kind::Chunk)
+            && !(kind == Kind::BlockStart && reasoning(doc, node)?)
+        {
+            self.announce(owner, output)?;
+        }
         match kind {
             Kind::MediaStart => self.image_start(at),
             Kind::ToolStart => self.tool_start(owner, at, output),
@@ -224,6 +235,21 @@ fn write_lease(lease: &ScratchLease, e: &mut Encoder<'_, '_>) -> Result<()> {
 }
 /// Origin carrier of a call item split out of a message item.
 const CALL_ITEM: &str = "responses.tool";
+/// Origin carrier of a reasoning item split out of a message item.
+const REASONING_ITEM: &str = "responses.reasoning";
+
+/// Whether block start `node` opens readable, summary, encrypted or redacted reasoning.
+fn reasoning(doc: &Document, node: usize) -> Result<bool> {
+    Ok(is(doc, node, "kind", "reasoning_summary")?
+        || is(doc, node, "kind", "thinking")?
+        || is(doc, node, "kind", "reasoning")?)
+}
+/// Position of `item` in the response output.
+fn position(doc: &Document, item: usize) -> Result<u64> {
+    let output = doc.required(doc.root(), "output")?;
+    let at = doc.children(output)?.position(|i| i == item).ok_or(Error::Position)?;
+    Ok(at as u64)
+}
 
 /// The output item of the event with correlation `x`: its own call item when it has one, else
 /// the item named by `item_id`.
@@ -231,6 +257,17 @@ fn find_item(doc: &Document, output: usize, x: usize) -> Result<Option<(usize, u
     let Some(local) = doc.member(x, "item_id")? else {
         return Ok(None);
     };
+    if let Some(block) = doc.member(x, "block_index")? {
+        let block = doc.unsigned(block)?;
+        for (index, item) in doc.children(output)?.enumerate() {
+            if let Some((origin, Some(REASONING_ITEM))) = doc.origin(item)?
+                && doc.equal_strings(doc.required(origin, "item_id")?, local)?
+                && doc.unsigned(doc.required(origin, "block_index")?)? == block
+            {
+                return Ok(Some((item, index as u64)));
+            }
+        }
+    }
     if let Some(call) = doc.member(x, "tool_call_id")? {
         for (index, item) in doc.children(output)?.enumerate() {
             if let Some((origin, Some(CALL_ITEM))) = doc.origin(item)?
@@ -242,7 +279,7 @@ fn find_item(doc: &Document, output: usize, x: usize) -> Result<Option<(usize, u
     }
     for (index, item) in doc.children(output)?.enumerate() {
         if let Some((origin, carrier)) = doc.origin(item)?
-            && carrier != Some(CALL_ITEM)
+            && carrier.is_none()
             && doc.equal_strings(doc.required(origin, "item_id")?, local)?
         {
             return Ok(Some((item, native_index(doc, item, "output_index", index as u64)?)));
