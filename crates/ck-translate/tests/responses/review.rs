@@ -251,3 +251,24 @@ fn text_parts_publish_their_done_events_before_the_part_ends() {
         assert_eq!(events[at + 1]["type"], part, "{name}");
     }
 }
+
+#[test]
+fn late_part_attributes_reach_the_client() {
+    let message = |content: Value| json!({"id":"i","type":"message","role":"assistant","content":content});
+    let part = json!({"type":"output_text","text":"hi","vendor":{"a":null}});
+    let records = [
+        json!({"type":"response.output_item.added","output_index":0,"item":message(json!([]))}),
+        json!({"type":"response.output_text.delta","output_index":0,"item_id":"i","content_index":0,"delta":"hi"}),
+        json!({"type":"response.completed","response":{"id":"r","status":"completed","output":[message(json!([part]))]}}),
+    ];
+    let (out, _) = response(
+        wire(&records).as_bytes(),
+        BodyMode::Streaming,
+        BodyMode::Buffered,
+        Operation::Generate,
+    );
+    let raw = String::from_utf8(out).unwrap();
+    assert_eq!(raw.matches("\"type\":\"output_text\"").count(), 1, "{raw}");
+    let out: Value = serde_json::from_str(&raw).unwrap();
+    assert_eq!(out["output"][0]["content"][0]["vendor"], part["vendor"], "{out}");
+}

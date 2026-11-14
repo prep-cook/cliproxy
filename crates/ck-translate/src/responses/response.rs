@@ -1,7 +1,7 @@
 use super::{Table, is, object, string, usage::Usage};
 use crate::codec::{
     self, BodyMode, Error, Operation, Result,
-    document::{Document, Value},
+    document::{Document, Name, Value},
     encode::{self, Encoder},
     event::{Emitter, Identity, Kind, LocalId, Scope},
     json, media,

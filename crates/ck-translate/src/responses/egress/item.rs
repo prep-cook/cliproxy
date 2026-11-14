@@ -401,6 +401,7 @@ impl<F: FnMut(&'static str, u64)> Egress<F> {
         let At { x, item, index, .. } = at;
         let doc = &mut self.document;
         if let Some((part, summary, block)) = find_part(doc, item, x)? {
+            restore_originals(doc, x, part)?;
             let text = match text_done(doc, part)? {
                 Some((name, field)) => Some((
                     name,
@@ -563,6 +564,28 @@ impl<F: FnMut(&'static str, u64)> Egress<F> {
         })?;
         self.emit(owner, "response.output_item.done", |e| write_lease(&payload, e), output)
     }
+}
+
+/// Adds the Responses originals of event `x` to `target`.
+fn restore_originals(doc: &mut Document, x: usize, target: usize) -> Result<()> {
+    let Some(original) = doc.member(x, "original")? else {
+        return Ok(());
+    };
+    let mut next = doc.node(original)?.first;
+    while let Some(entry) = next {
+        next = doc.node(entry)?.next;
+        if !is(doc, entry, "protocol", "responses")? {
+            continue;
+        }
+        let Value::String(pointer) = doc.node(doc.required(entry, "pointer")?)?.value else {
+            return Err(Error::Schema);
+        };
+        let value = doc.remove(entry, "value")?.ok_or(Error::Schema)?;
+        let field = doc.add(Some(Name::Pointer(pointer)), Value::Null)?;
+        doc.transplant(field, value)?;
+        doc.append(target, field)?;
+    }
+    Ok(())
 }
 
 /// The done event and full-value member that close a text, refusal or reasoning part.

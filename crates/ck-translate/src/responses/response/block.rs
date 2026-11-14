@@ -29,12 +29,14 @@ impl State {
         self.block_annotations(owner, at, block, doc, part, snapshot)?;
         let item = &mut self.items[at];
         if close && !item.blocks[block].closed {
+            // Attributes the closing snapshot adds after the block started travel as originals.
+            let late = late_attributes(owner, &item.doc, item.blocks[block].value, doc, part)?;
             self.emitter.emit(
                 owner,
                 Kind::BlockEnd,
                 item.scope(Some(block as u64)),
                 |_| Ok(()),
-                |_| Ok(()),
+                |e| crate::boundary::original(&late, "responses", &[(late.root(), "", &[])], e),
             )?;
             item.blocks[block].closed = true;
         }
@@ -311,4 +313,55 @@ impl State {
         }
         Ok(())
     }
+}
+
+/// The members of snapshot `part` that the published block value lacks, other than its text,
+/// refusal, annotations and logprobs.
+fn late_attributes(
+    owner: &mut Writer,
+    stored: &Document,
+    value: usize,
+    doc: &Document,
+    part: usize,
+) -> Result<Document> {
+    super::super::mapped(owner, |e| {
+        e.bytes(b"{")?;
+        let mut first = true;
+        for field in doc.children(part)? {
+            let name = doc.node(field)?.name.ok_or(Error::Schema)?;
+            let mut known = false;
+            for content in ["text", "refusal", "annotations", "logprobs"] {
+                known |= doc.name_is(name, content)?;
+            }
+            if known || has_member(stored, value, doc, name)? {
+                continue;
+            }
+            if !first {
+                e.bytes(b",")?;
+            }
+            first = false;
+            doc.write_name(name, e)?;
+            e.bytes(b":")?;
+            doc.write(field, e)?;
+        }
+        e.bytes(b"}")
+    })
+}
+
+/// Whether object `parent` of `stored` has a member named `name` of `doc`.
+fn has_member(stored: &Document, parent: usize, doc: &Document, name: Name) -> Result<bool> {
+    for child in stored.children(parent)? {
+        let mut a = stored.name_chars(stored.node(child)?.name.ok_or(Error::Schema)?)?;
+        let mut b = doc.name_chars(name)?;
+        loop {
+            let (x, y) = (a.next_scalar()?, b.next_scalar()?);
+            if x != y {
+                break;
+            }
+            if x.is_none() {
+                return Ok(true);
+            }
+        }
+    }
+    Ok(false)
 }

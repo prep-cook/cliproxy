@@ -1,7 +1,7 @@
 use super::{Table, is, response::append_fragment};
 use crate::codec::{
     self, BodyMode, Error, Operation, Result,
-    document::{Document, Value},
+    document::{Document, Name, Value},
     encode::{self, Encoder},
     event::{Identity, Kind},
     internal,
