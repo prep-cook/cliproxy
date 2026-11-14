@@ -22,6 +22,10 @@ fn unfinished_string_releases_source_and_survives_unicode_tails() {
     let began = std::time::Instant::now();
     ingress.advance(&mut mapped.writer, &prefix).unwrap();
     assert!(began.elapsed() < std::time::Duration::from_millis(100));
+    // The owner flushes held string input by its deadline.
+    let deadline = ingress.flush_deadline().unwrap();
+    assert!(deadline <= std::time::Instant::now() + std::time::Duration::from_millis(100));
+    ingress.flush(&mut mapped.writer).unwrap();
     clock.advance(std::time::Duration::from_millis(100));
     let events = canonical_values(&mapped);
     assert!(
@@ -168,6 +172,7 @@ fn unfinished_native_media_publishes_one_lifetime_and_exact_bytes() {
         .unwrap();
         let input = format!(r#"{{"model":"m","messages":[{{"role":"user","content":[{prefix}AAEC"#);
         ingress.advance(&mut mapped.writer, input.as_bytes()).unwrap();
+        ingress.flush(&mut mapped.writer).unwrap();
         let events = canonical_values(&mapped);
         assert!(events.iter().any(|e| e["bytes"] == "AAEC"), "{carrier}: {events:?}");
         let wire = String::from_utf8(mapped.output(&mapped.writer)).unwrap();
@@ -434,4 +439,91 @@ fn payload_before_type_and_opaque_media_lookalikes_preserve_native_values() {
         assert_eq!(output["messages"][0]["content"][0], part);
         assert_eq!(output["unknown"], input["unknown"]);
     }
+}
+
+/// Small network pieces of one streamed string share data records instead of publishing one
+/// frame-aligned record per piece.
+#[test]
+fn small_pieces_of_a_streamed_string_share_data_records() {
+    let mut mapped = Mapped::configured(std::sync::Arc::new(ck_stream::ManualClock::default()), 64);
+    let mut ingress = Ingress::new(
+        &mut mapped.writer,
+        &mapped.store,
+        identity(Direction::Request),
+        Operation::Generate,
+        100_000,
+    )
+    .unwrap();
+    let message = format!(r#"{{"role":"user","content":"{}"}}"#, "a".repeat(2048));
+    let input = format!(r#"{{"model":"m","messages":[{}]}}"#, vec![message; 8].join(","));
+    for piece in input.as_bytes().chunks(16) {
+        ingress.advance(&mut mapped.writer, piece).unwrap();
+    }
+    ingress.finish(&mut mapped.writer, &ChatCapability).unwrap();
+    let wire = String::from_utf8(mapped.output(&mapped.writer)).unwrap();
+    assert_eq!(wire.matches("event: x_ck.data\n").count(), 8);
+}
+
+/// Held string input reports a deadline at most 100 ms after collection starts, which later
+/// input does not move, and a flush publishes it.
+#[test]
+fn held_string_input_has_a_deadline_and_flushes() {
+    let mut mapped = Mapped::new();
+    let mut ingress = Ingress::new(
+        &mut mapped.writer,
+        &mapped.store,
+        identity(Direction::Request),
+        Operation::Generate,
+        100_000,
+    )
+    .unwrap();
+    let mut prefix = br#"{"model":"m","messages":[{"role":"user","content":""#.to_vec();
+    prefix.extend(std::iter::repeat_n(b'a', 2048));
+    let began = std::time::Instant::now();
+    ingress.advance(&mut mapped.writer, &prefix).unwrap();
+    let deadline = ingress.flush_deadline().unwrap();
+    assert!(deadline > began && deadline <= std::time::Instant::now() + std::time::Duration::from_millis(100));
+    ingress.advance(&mut mapped.writer, b"bb").unwrap();
+    assert_eq!(ingress.flush_deadline(), Some(deadline));
+    let data = |mapped: &Mapped| {
+        String::from_utf8(mapped.output(&mapped.writer))
+            .unwrap()
+            .matches("event: x_ck.data\n")
+            .count()
+    };
+    assert_eq!(data(&mapped), 0);
+    ingress.flush(&mut mapped.writer).unwrap();
+    assert!(ingress.flush_deadline().is_none());
+    assert_eq!(data(&mapped), 1);
+}
+
+/// A long string fills data records of at least 28,672 input bytes, each within one frame, and
+/// its content survives intact.
+#[test]
+fn long_streamed_string_fills_data_records() {
+    let mut mapped = Mapped::new();
+    let mut ingress = Ingress::new(
+        &mut mapped.writer,
+        &mapped.store,
+        identity(Direction::Request),
+        Operation::Generate,
+        1_000_000,
+    )
+    .unwrap();
+    let content = "a".repeat(100_000);
+    let input = format!(r#"{{"model":"m","messages":[{{"role":"user","content":"{content}"}}]}}"#);
+    for piece in input.as_bytes().chunks(1000) {
+        ingress.advance(&mut mapped.writer, piece).unwrap();
+    }
+    let ready = ingress.finish(&mut mapped.writer, &ChatCapability).unwrap();
+    let output = Egress {
+        destination: "chat",
+        upstream_stream: false,
+    }
+    .encode(&ready, &mut mapped.writer)
+    .unwrap();
+    let output: serde_json::Value = serde_json::from_slice(&bytes(&output)).unwrap();
+    assert_eq!(output["messages"][0]["content"], content);
+    let wire = String::from_utf8(mapped.output(&mapped.writer)).unwrap();
+    assert_eq!(wire.matches("event: x_ck.data\n").count(), 4);
 }

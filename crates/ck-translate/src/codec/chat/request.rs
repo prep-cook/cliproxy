@@ -73,6 +73,11 @@ struct PendingString {
     node: usize,
     media: usize,
     offset: u64,
+    /// Input before this offset is named by no node other than this string's and is not needed
+    /// by the scanner; keys and topology stay fixed while one string streams.
+    floor: u64,
+    /// When input after `offset` was first held unpublished.
+    held: Option<std::time::Instant>,
     publisher: media::Publisher,
     decoder: media::InputDecoder,
 }
@@ -148,8 +153,8 @@ impl Ingress {
 
 impl codec::RequestIngress for Ingress {
     fn flush_deadline(&self) -> Option<std::time::Instant> {
-        // Every complete decoded fragment is published within advance.
-        None
+        let held = self.string.as_ref()?.held?;
+        Some(held + string::FLUSH_DELAY)
     }
 
     fn advance(&mut self, owner: &mut Writer, bytes: &[u8]) -> Result<()> {
@@ -160,6 +165,9 @@ impl codec::RequestIngress for Ingress {
             return Err(Error::Closed);
         }
         let result = (|| {
+            if bytes.is_empty() {
+                return self.flush_string(owner);
+            }
             for bytes in bytes.chunks(8192) {
                 self.document.push_input(owner, bytes)?;
                 self.scanner
@@ -304,6 +312,8 @@ mod tests {
             "a".repeat(8192)
         );
         ingress.advance(&mut owner, prefix.as_bytes()).unwrap();
+        // Held string input is published, and its positions retired, at a flush.
+        ingress.flush(&mut owner).unwrap();
         assert!(matches!(
             ingress.document.input().equals(Span { start: 2048, end: 2049 }, b"a"),
             Err(Error::Position)
@@ -325,6 +335,39 @@ mod tests {
         }
         let output: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(output["messages"][0]["content"], format!("{}🚀é", "a".repeat(8192)));
+        drop(ingress);
+        store.shutdown().unwrap();
+        std::fs::remove_dir(directory).unwrap();
+    }
+
+    /// A string that fills data records retires its published input without a flush.
+    #[test]
+    fn filled_string_records_retire_their_input() {
+        let directory = std::env::temp_dir().join(format!("ck-request-filled-{}", uuid::Uuid::new_v4()));
+        let mut config = ck_stream::Config::new(directory.clone());
+        config.pool_bytes = Some(48 * ck_stream::FRAME_BYTES);
+        config.workers = 1;
+        let mut store =
+            ck_stream::Store::with_clock(config, std::sync::Arc::new(ck_stream::ManualClock::default())).unwrap();
+        let mut owner = store.create().unwrap();
+        let identity = Identity {
+            request_id: LocalId::new("request").unwrap(),
+            stream_id: LocalId::new("stream").unwrap(),
+            attempt: 1,
+            direction: Direction::Request,
+        };
+        let mut ingress = Ingress::new(&mut owner, &store, identity, Operation::Generate, 1_000_000).unwrap();
+        let prefix = format!(
+            r#"{{"model":"m","messages":[{{"role":"user","content":"{}"#,
+            "a".repeat(70_000)
+        );
+        for piece in prefix.as_bytes().chunks(1000) {
+            ingress.advance(&mut owner, piece).unwrap();
+        }
+        assert!(matches!(
+            ingress.document.input().equals(Span { start: 2048, end: 2049 }, b"a"),
+            Err(Error::Position)
+        ));
         drop(ingress);
         store.shutdown().unwrap();
         std::fs::remove_dir(directory).unwrap();
