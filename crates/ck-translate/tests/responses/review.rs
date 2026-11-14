@@ -346,3 +346,43 @@ fn unknown_content_parts_stay_opaque() {
         assert_eq!(body["output"][0]["content"][0], part, "{body}");
     }
 }
+
+#[test]
+fn unknown_events_are_preserved_not_failed() {
+    let completed = json!({"type":"response.completed","response":{"id":"r","status":"completed","output":[]}});
+    let records = wire(&[json!({"type":"vendor.event","error":null}), completed.clone()]);
+    let (_, events) = response(
+        records.as_bytes(),
+        BodyMode::Streaming,
+        BodyMode::Buffered,
+        Operation::Generate,
+    );
+    assert!(events.iter().any(|e| e["value"]["type"] == "vendor.event"));
+    let input = format!("event: response.future\ndata: not-json\n\ndata: {completed}\n\n");
+    let (_, events) = response(
+        input.as_bytes(),
+        BodyMode::Streaming,
+        BodyMode::Buffered,
+        Operation::Generate,
+    );
+    assert!(events.iter().any(|e| e["format"] == "text" && e["value"] == "not-json"));
+    // A known event with broken data and an untyped error object still fail the stream.
+    for input in [
+        format!("event: response.output_text.delta\ndata: not-json\n\ndata: {completed}\n\n"),
+        format!("data: {}\n\ndata: {completed}\n\n", json!({"error":{"message":"m"}})),
+    ] {
+        let mut m = Mapped::new();
+        let mut ingress = responses::response::Ingress::new(
+            &mut m.writer,
+            identity(Direction::Response),
+            Operation::Generate,
+            BodyMode::Streaming,
+            1024 * 1024,
+        )
+        .unwrap();
+        let result = ingress
+            .advance(&mut m.writer, input.as_bytes())
+            .and_then(|()| ingress.finish(&mut m.writer));
+        assert!(result.is_err(), "{input}");
+    }
+}

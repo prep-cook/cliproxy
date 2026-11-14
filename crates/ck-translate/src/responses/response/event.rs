@@ -22,6 +22,44 @@ const CONSUMED: &[&str] = &[
     "partial_image_index",
 ];
 
+/// Event names this codec maps; data that is not JSON fails only under one of these names.
+const KNOWN: &[&str] = &[
+    "error",
+    "response.audio.delta",
+    "response.audio.done",
+    "response.audio.transcript.delta",
+    "response.audio.transcript.done",
+    "response.code_interpreter_call_code.delta",
+    "response.code_interpreter_call_code.done",
+    "response.completed",
+    "response.content_part.added",
+    "response.content_part.done",
+    "response.created",
+    "response.custom_tool_call_input.delta",
+    "response.custom_tool_call_input.done",
+    "response.failed",
+    "response.function_call_arguments.delta",
+    "response.function_call_arguments.done",
+    "response.image_generation_call.partial_image",
+    "response.incomplete",
+    "response.in_progress",
+    "response.mcp_call_arguments.delta",
+    "response.mcp_call_arguments.done",
+    "response.output_item.added",
+    "response.output_item.done",
+    "response.output_text.annotation.added",
+    "response.output_text.delta",
+    "response.output_text.done",
+    "response.reasoning_summary_part.added",
+    "response.reasoning_summary_part.done",
+    "response.reasoning_summary_text.delta",
+    "response.reasoning_summary_text.done",
+    "response.reasoning_text.delta",
+    "response.reasoning_text.done",
+    "response.refusal.delta",
+    "response.refusal.done",
+];
+
 impl State {
     pub(super) fn event(&mut self, owner: &mut Writer, source: &Source, event: &sse::Event) -> Result<()> {
         if self.terminal {
@@ -46,10 +84,13 @@ impl State {
             return Ok(());
         };
         let root = doc.root();
-        if is(&doc, root, "type", "error")?
-            || is(&doc, root, "type", "response.failed")?
-            || doc.member(root, "error")?.is_some()
-        {
+        // An untyped body with an error object is a provider failure; a typed unknown event
+        // that happens to carry an `error` member is not.
+        let untyped_error = doc.member(root, "type")?.is_none()
+            && doc
+                .member(root, "error")?
+                .is_some_and(|e| !matches!(doc.node(e).map(|n| n.value), Ok(Value::Null)));
+        if is(&doc, root, "type", "error")? || is(&doc, root, "type", "response.failed")? || untyped_error {
             return Err(Error::Schema);
         }
         self.lifecycle(owner, &doc)?;
@@ -104,13 +145,10 @@ impl State {
             Ok(doc) => Ok(Some(doc)),
             Err(Error::Json | Error::Truncated) => {
                 let name = event.name(source)?.ok_or(Error::Json)?;
-                let mut cursor = source.cursor(name)?;
-                let mut known = true;
-                for byte in b"response." {
-                    known &= cursor.next_byte()? == Some(*byte);
-                }
-                if known || source.equals(name, b"error")? {
-                    return Err(Error::Json);
+                for known in KNOWN {
+                    if source.equals(name, known.as_bytes())? {
+                        return Err(Error::Json);
+                    }
                 }
                 if self.base.is_none() {
                     self.start(owner, None)?;
