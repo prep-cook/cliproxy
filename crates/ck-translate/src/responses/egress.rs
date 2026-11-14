@@ -726,12 +726,22 @@ impl<F: FnMut(&'static str, u64)> Egress<F> {
             if let Some(reason) = doc.member(choice, "finish_reason")?
                 && !matches!(doc.node(reason)?.value, Value::Null)
             {
-                let status = if doc.string_is(reason, "length")? || doc.string_is(reason, "content_filter")? {
-                    "incomplete"
-                } else {
-                    "completed"
-                };
-                doc.set(doc.root(), "status", Value::Text(status))?;
+                let filtered = doc.string_is(reason, "content_filter")?;
+                if !filtered && !doc.string_is(reason, "length")? {
+                    doc.set(doc.root(), "status", Value::Text("completed"))?;
+                    break;
+                }
+                doc.set(doc.root(), "status", Value::Text("incomplete"))?;
+                // A native Responses source restores its own details later, by merge.
+                if doc.member(doc.root(), "incomplete_details")?.is_none() {
+                    let details = doc.set(doc.root(), "incomplete_details", Value::Object)?;
+                    let reason = if filtered {
+                        "content_filter"
+                    } else {
+                        "max_output_tokens"
+                    };
+                    doc.set(details, "reason", Value::Text(reason))?;
+                }
                 break;
             }
         }

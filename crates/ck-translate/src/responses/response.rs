@@ -1127,6 +1127,7 @@ impl State {
                 return Err(Error::Truncated);
             }
             let base = self.base.as_ref().ok_or(Error::Schema)?;
+            let reason = finish_reason(doc, root, &self.items)?;
             self.emitter.emit(
                 owner,
                 Kind::Chunk,
@@ -1137,11 +1138,7 @@ impl State {
                 |e| {
                     chunk_base(base, e)?;
                     e.bytes(b",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":")?;
-                    e.string(if is(doc, root, "status", "incomplete")? {
-                        "length"
-                    } else {
-                        "stop"
-                    })?;
+                    e.string(reason)?;
                     e.bytes(b"}]")
                 },
                 |e| {
@@ -1186,6 +1183,21 @@ impl State {
         self.terminal = true;
         Ok(())
     }
+}
+/// Chat finish of a validated terminal response: a filtered or truncated incomplete result, a
+/// call the client must run, or a stop. Server tools already ran and need no client call.
+fn finish_reason(doc: &Document, root: usize, items: &[Item]) -> Result<&'static str> {
+    if is(doc, root, "status", "incomplete")? {
+        let filtered = match doc.member(root, "incomplete_details")? {
+            Some(details) => is(doc, details, "reason", "content_filter")?,
+            None => false,
+        };
+        return Ok(if filtered { "content_filter" } else { "length" });
+    }
+    if items.iter().any(|item| item.tool.is_some() && item.server.is_none()) {
+        return Ok("tool_calls");
+    }
+    Ok("stop")
 }
 fn validate_arguments(owner: &mut Writer, item: &Item) -> Result<()> {
     if item.custom()? {

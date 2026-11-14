@@ -2,6 +2,8 @@
 mod audio;
 #[path = "responses/execution.rs"]
 mod execution;
+#[path = "responses/finish.rs"]
+mod finish;
 #[path = "responses/golden.rs"]
 mod golden;
 #[path = "responses/incremental.rs"]
