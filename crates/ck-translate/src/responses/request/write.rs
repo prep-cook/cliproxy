@@ -93,6 +93,14 @@ fn write_field(doc: &Document, field: usize, e: &mut Encoder<'_, '_>) -> Result<
     if doc.name_is(name, "response_format")? {
         e.bytes(b"{\"format\":")?;
         write_format(doc, field, e)?;
+        if let Some(text) = provider_text(doc)? {
+            for f in doc.children(text)? {
+                e.bytes(b",")?;
+                doc.write_name(doc.node(f)?.name.ok_or(Error::Schema)?, e)?;
+                e.bytes(b":")?;
+                doc.write(f, e)?;
+            }
+        }
         e.bytes(b"}")?;
     } else if doc.name_is(name, "tools")? {
         write_tools(doc, field, e)?;
@@ -107,6 +115,19 @@ fn write_field(doc: &Document, field: usize, e: &mut Encoder<'_, '_>) -> Result<
         doc.write(field, e)?;
     }
     Ok(())
+}
+/// The `text` options other than `format` that ingress kept as Responses provider parameters.
+fn provider_text(doc: &Document) -> Result<Option<usize>> {
+    let Some(x) = doc.member(doc.root(), "x_ck")? else {
+        return Ok(None);
+    };
+    let Some(providers) = doc.member(x, "provider_parameters")? else {
+        return Ok(None);
+    };
+    match doc.member(providers, "responses")? {
+        Some(p) => doc.member(p, "text"),
+        None => Ok(None),
+    }
 }
 /// Writes a canonical response format; Responses spells `json_schema` members flat.
 fn write_format(doc: &Document, format: usize, e: &mut Encoder<'_, '_>) -> Result<()> {
@@ -185,9 +206,15 @@ fn write_extensions(doc: &Document, x: usize, e: &mut Encoder<'_, '_>) -> Result
     if let Some(providers) = doc.member(x, "provider_parameters")?
         && let Some(p) = doc.member(providers, "responses")?
     {
+        let format = doc.member(doc.root(), "response_format")?.is_some();
         for f in doc.children(p)? {
+            let name = doc.node(f)?.name.ok_or(Error::Schema)?;
+            if format && doc.name_is(name, "text")? {
+                // Written beside `format` in the same `text` object.
+                continue;
+            }
             e.bytes(b",")?;
-            doc.write_name(doc.node(f)?.name.ok_or(Error::Schema)?, e)?;
+            doc.write_name(name, e)?;
             e.bytes(b":")?;
             doc.write(f, e)?;
         }

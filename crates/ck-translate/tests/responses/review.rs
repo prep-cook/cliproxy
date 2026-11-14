@@ -46,3 +46,38 @@ fn continuation_tool_outputs_link_to_the_referenced_state() {
         assert_eq!(encoded["input"][0], output);
     }
 }
+
+/// Encodes a Responses request and returns the raw upstream body.
+fn raw_request(input: &Value) -> String {
+    let mut m = Mapped::new();
+    let mut ingress = responses::request::Ingress::new(
+        &mut m.writer,
+        &m.store,
+        identity(Direction::Request),
+        Operation::Generate,
+        1024 * 1024,
+    )
+    .unwrap();
+    ingress
+        .advance(&mut m.writer, &serde_json::to_vec(input).unwrap())
+        .unwrap();
+    let ready = ingress
+        .finish(&mut m.writer, &responses::request::ResponsesCapability)
+        .unwrap();
+    let output = responses::request::Egress {
+        destination: "responses",
+        upstream_stream: false,
+    }
+    .encode(&ready, &mut m.writer)
+    .unwrap();
+    String::from_utf8(bytes(&output)).unwrap()
+}
+
+#[test]
+fn text_format_and_verbosity_share_one_text_object() {
+    let input = json!({"model":"m","input":"q","text":{"format":{"type":"json_object"},"verbosity":"low"}});
+    let raw = raw_request(&input);
+    assert_eq!(raw.matches("\"text\":").count(), 1, "{raw}");
+    let output: Value = serde_json::from_str(&raw).unwrap();
+    assert_eq!(output["text"], input["text"]);
+}
