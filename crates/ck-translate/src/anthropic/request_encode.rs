@@ -473,8 +473,13 @@ fn media_source(view: RequestView<'_>, part: usize, kind: usize, e: &mut Encoder
             doc.write(mime, e)?;
         }
         e.bytes(b",\"data\":")?;
-        view.media
-            .write_value(doc, doc.required(source, "ref")?, (doc.member(part, "mime")?, false), e)?;
+        // `media_type` carries the MIME, so a base64 source never takes a data URI prefix.
+        let data = doc.required(source, "ref")?;
+        if text {
+            view.media.write_value(doc, data, (None, false), e)?;
+        } else {
+            view.media.write_base64(doc, data, e)?;
+        }
     } else if super::is(doc, source, "kind", "uri")? {
         e.string("url")?;
         e.bytes(b",\"url\":")?;

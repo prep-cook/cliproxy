@@ -1,7 +1,7 @@
 //! Regression tests for the Anthropic codec review findings.
 use crate::{
-    BodyMode, Direction, Mapped, Operation, ResponseEgress, ResponseIngress, Value, anthropic, bytes, codec, events,
-    identity, json, request, request_fragmented, response, sse,
+    BodyMode, Direction, Mapped, Operation, RequestEgress, RequestIngress, ResponseEgress, ResponseIngress, Value,
+    anthropic, bytes, codec, events, identity, json, request, request_fragmented, response, sse,
 };
 use std::task::Poll;
 
@@ -302,5 +302,38 @@ fn partial_cache_creation_update_keeps_omitted_buckets() {
     assert_eq!(
         last["usage"]["native"]["value"]["cache_creation"],
         json!({"ephemeral_5m_input_tokens":1,"ephemeral_1h_input_tokens":3})
+    );
+}
+
+#[test]
+fn chat_data_uri_image_encodes_a_plain_base64_source() {
+    let mut mapped = Mapped::new();
+    let mut ingress = codec::chat::request::Ingress::new(
+        &mut mapped.writer,
+        &mapped.store,
+        identity(Direction::Request),
+        Operation::Generate,
+        10000,
+    )
+    .unwrap();
+    let body = json!({"model":"m","max_tokens":10,"messages":[{"role":"user","content":[
+        {"type":"image_url","image_url":{"url":"data:image/png;base64,AAEC"}}
+    ]}]});
+    ingress
+        .advance(&mut mapped.writer, &serde_json::to_vec(&body).unwrap())
+        .unwrap();
+    let ready = ingress
+        .finish(&mut mapped.writer, &anthropic::request::AnthropicCapability)
+        .unwrap();
+    let wire = anthropic::request::Egress {
+        destination: "anthropic",
+        upstream_stream: false,
+    }
+    .encode(&ready, &mut mapped.writer)
+    .unwrap();
+    let out: Value = serde_json::from_slice(&bytes(&wire)).unwrap();
+    assert_eq!(
+        out["messages"][0]["content"][0]["source"],
+        json!({"type":"base64","media_type":"image/png","data":"AAEC"})
     );
 }
