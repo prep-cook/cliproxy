@@ -52,3 +52,30 @@ fn fragmented_long_messages_fit_the_default_quota() {
     let input = messages(8, |_| format!(r#"{{"role":"user","content":"{content}"}}"#));
     fits(&input, 16).unwrap();
 }
+
+#[test]
+fn plain_messages_fit_the_default_quota() {
+    let input = messages(128, |_| r#"{"role":"user","content":"hi"}"#.into());
+    fits(&input, 1 << 20).unwrap();
+}
+
+#[test]
+fn metadata_keys_fit_the_default_quota() {
+    let keys: Vec<_> = (0..512).map(|i| format!(r#""k{i}":"v""#)).collect();
+    let input = format!(
+        r#"{{"model":"m","metadata":{{{}}},"messages":[{{"role":"user","content":"hi"}}]}}"#,
+        keys.join(",")
+    );
+    fits(&input, 1 << 20).unwrap();
+}
+
+/// Call and result rounds: an assistant tool call and its tool result per round.
+#[test]
+fn tool_rounds_fit_the_default_quota() {
+    let input = messages(32, |i| {
+        format!(
+            r#"{{"role":"assistant","content":null,"tool_calls":[{{"id":"call_{i}","type":"function","function":{{"name":"f","arguments":"{{}}"}}}}]}},{{"role":"tool","tool_call_id":"call_{i}","content":"ok"}}"#
+        )
+    });
+    fits(&input, 1 << 20).unwrap();
+}

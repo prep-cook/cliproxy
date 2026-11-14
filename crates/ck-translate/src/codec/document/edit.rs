@@ -75,6 +75,36 @@ impl Document {
         })
     }
 
+    /// Copies the subtree at `node` of an adopted record under `name`, mapping its texts.
+    pub(crate) fn copy_adopted(
+        &mut self,
+        event: &Document,
+        node: usize,
+        adopted: Adopted,
+        name: Option<Name>,
+    ) -> Result<usize> {
+        let source = event.node(node)?;
+        let value = match source.value {
+            Value::String(text) => Value::String(adopted.text(text)?),
+            Value::Number(text) => Value::Number(adopted.text(text)?),
+            value => value,
+        };
+        let target = self.add(name, value)?;
+        let mut child = source.first;
+        while let Some(index) = child {
+            let node = event.node(index)?;
+            child = node.next;
+            let name = match node.name {
+                Some(Name::Mapped(text)) => Some(Name::Mapped(adopted.text(text)?)),
+                Some(Name::Pointer(text)) => Some(Name::Pointer(adopted.text(text)?)),
+                name => name,
+            };
+            let copy = self.copy_adopted(event, index, adopted, name)?;
+            self.append(target, copy)?;
+        }
+        Ok(target)
+    }
+
     pub(crate) fn retire_scratch(&mut self) -> Result<()> {
         for source in &mut self.sources {
             source.retire_scratch()?;

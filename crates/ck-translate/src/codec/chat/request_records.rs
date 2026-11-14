@@ -182,22 +182,29 @@ impl Counts {
     }
 }
 
-/// Places one request field at its pointer and returns the node that holds its value.
-fn field(doc: &mut Document, counts: &mut Counts, event: Document) -> Result<usize> {
-    let root = doc.absorb(event)?;
-    let pointer = doc.required(root, "pointer")?;
-    let value = doc.required(root, "value")?;
-    if doc.string_is(pointer, "")? {
+/// Places one request field at its pointer and returns the node that holds its value. Only the
+/// record's pointer and value are kept; its envelope nodes are dropped with the record.
+fn field(doc: &mut Document, counts: &mut Counts, mut event: Document) -> Result<usize> {
+    let root = event.root();
+    let Value::String(pointer) = event.node(event.required(root, "pointer")?)?.value else {
+        return Err(Error::Schema);
+    };
+    let value = event.required(root, "value")?;
+    let adopted = doc.adopt_record(&mut event)?;
+    let pointer = adopted.text(pointer)?;
+    if doc.text_chars(pointer)?.next_scalar()?.is_none() {
+        let value = doc.copy_adopted(&event, value, adopted, None)?;
         doc.transplant(doc.root(), value)?;
         counts.replaced(doc.root());
         return Ok(doc.root());
     }
-    let parent = provenance::resolve_parent_indexed(doc, pointer, &mut |array, index| {
+    let parent = provenance::resolve_parent_indexed(doc, doc.text_chars(pointer)?, &mut |array, index| {
         let (count, last) = *counts.get(doc, array)?;
         Ok(last.filter(|_| index + 1 == count))
     })?;
-    let name = provenance::leaf(doc, pointer)?;
-    let target = if matches!(doc.node(parent)?.value, Value::Array) {
+    let array = matches!(doc.node(parent)?.value, Value::Array);
+    let name = provenance::leaf(doc.text_chars(pointer)?)?;
+    let target = if array {
         let index = name.index()?;
         let (count, _) = *counts.get(doc, parent)?;
         if index > count {
@@ -215,23 +222,12 @@ fn field(doc: &mut Document, counts: &mut Counts, event: Document) -> Result<usi
         counts.member(doc, parent, &name)?
     };
     if let Some(target) = target {
+        let value = doc.copy_adopted(&event, value, adopted, None)?;
         doc.transplant(target, value)?;
         counts.replaced(target);
         return Ok(target);
     }
-    let Value::String(pointer) = doc.node(pointer)?.value else {
-        return Err(Error::Schema);
-    };
-    doc.detach(root, value)?;
-    let node = doc.add(
-        if matches!(doc.node(parent)?.value, Value::Array) {
-            None
-        } else {
-            Some(Name::Pointer(pointer))
-        },
-        Value::Null,
-    )?;
-    doc.transplant(node, value)?;
+    let node = doc.copy_adopted(&event, value, adopted, (!array).then_some(Name::Pointer(pointer)))?;
     doc.append(parent, node)?;
     if let Some((count, last)) = counts.children.get_mut(&parent) {
         *count += 1;
