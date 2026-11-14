@@ -1,6 +1,18 @@
 use super::{Error, Result};
 use ck_stream::{MetadataPermit, Writer};
 
+/// The capacity that holds `extra` entries more than `len`: the current capacity while it does,
+/// else the needed length plus a quarter, at least `floor` more. A quarter keeps growth
+/// geometric, so pushes stay amortized O(1), while the charge stays within 1.25 times the use
+/// rather than the up to twice of a power-of-two step.
+pub(crate) fn grown(len: usize, extra: usize, capacity: usize, floor: usize) -> Result<usize> {
+    let needed = len.checked_add(extra).ok_or(Error::Limit)?;
+    if needed <= capacity {
+        return Ok(capacity);
+    }
+    needed.checked_add((needed / 4).max(floor)).ok_or(Error::Limit)
+}
+
 /// Capacity accounting for position/scalar tables; payload bytes never belong here.
 pub(crate) struct Table<T> {
     values: Vec<T>,

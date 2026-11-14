@@ -12,6 +12,7 @@ use super::{
     encode::Encoder,
     json,
     source::{Source, Span},
+    table::grown,
 };
 
 #[derive(Clone, Copy, Debug)]
@@ -172,17 +173,11 @@ impl Document {
         Ok(target)
     }
 
+    /// Makes room for `nodes` and `sources` more entries. The permit is charged for the new
+    /// capacity before the tables grow, then for the capacity actually allocated.
     fn reserve(&mut self, nodes: usize, sources: usize) -> Result<()> {
-        let n = (self.nodes.len() + nodes)
-            .max(self.nodes.capacity())
-            .max(8)
-            .checked_next_power_of_two()
-            .ok_or(Error::Limit)?;
-        let s = (self.sources.len() + sources)
-            .max(self.sources.capacity())
-            .max(2)
-            .checked_next_power_of_two()
-            .ok_or(Error::Limit)?;
+        let n = grown(self.nodes.len(), nodes, self.nodes.capacity(), 4)?;
+        let s = grown(self.sources.len(), sources, self.sources.capacity(), 4)?;
         self.metadata.resize(
             n.checked_mul(std::mem::size_of::<Node>())
                 .and_then(|v| v.checked_add(s * std::mem::size_of::<Source>()))

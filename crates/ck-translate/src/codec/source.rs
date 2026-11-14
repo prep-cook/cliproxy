@@ -174,8 +174,8 @@ impl Source {
         let end = self.len.checked_add(bytes).ok_or(Error::Limit)?;
         if bytes != 0 {
             if self.segments.len() == self.segments.capacity() {
-                // Most sources hold one segment: start at one, then double.
-                let capacity = self.segments.capacity().checked_mul(2).ok_or(Error::Limit)?.max(1);
+                // Most sources hold one segment; a document's records source holds one per record.
+                let capacity = super::table::grown(self.segments.len(), 1, self.segments.capacity(), 0)?;
                 self.metadata.resize(
                     capacity
                         .checked_mul(std::mem::size_of::<Segment>())

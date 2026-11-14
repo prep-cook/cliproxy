@@ -79,3 +79,10 @@ fn tool_rounds_fit_the_default_quota() {
     });
     fits(&input, 1 << 20).unwrap();
 }
+
+/// Each message carries an unknown member, which the request preserves as its own field.
+#[test]
+fn messages_with_unknown_members_fit_the_default_quota() {
+    let input = messages(150, |i| format!(r#"{{"role":"user","content":"hi","x_vendor":{i}}}"#));
+    fits(&input, 1 << 20).unwrap();
+}
