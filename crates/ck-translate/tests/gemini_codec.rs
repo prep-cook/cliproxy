@@ -11,6 +11,8 @@ mod finish;
 pub mod gemini;
 #[path = "gemini/incremental.rs"]
 mod incremental;
+#[path = "gemini/media.rs"]
+mod media;
 #[path = "semantic/mod.rs"]
 mod semantic;
 #[path = "gemini/streams.rs"]

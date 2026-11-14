@@ -1,8 +1,9 @@
 use super::request::{capture, preserve};
 use crate::codec::{
     Error, Result,
-    document::{Document, Value},
+    document::{Document, Text, Value},
     media::{self, Encoding, Registry},
+    source::Span,
 };
 use ck_stream::Writer;
 
@@ -234,7 +235,75 @@ fn media_part(owner: &mut Writer, doc: &mut Document, part: usize, data: usize, 
         doc.detach(data, n)?;
         preserve(owner, doc, source, n, None)?;
     }
-    capture(owner, doc, part, &["type", "source", "mime"], None)
+    timing(doc, part)?;
+    capture(owner, doc, part, &["type", "source", "mime", "timing"], None)
+}
+/// Adds the canonical `timing` for `videoMetadata` offsets. The native object stays an
+/// original, so a Gemini destination gets its exact spelling and `fps` back.
+fn timing(doc: &mut Document, part: usize) -> Result<()> {
+    let Some(metadata) = doc.member(part, "videoMetadata")? else {
+        return Ok(());
+    };
+    if !matches!(doc.node(metadata)?.value, Value::Object) {
+        return Ok(());
+    }
+    let start = match doc.member(metadata, "startOffset")? {
+        Some(n) => seconds(doc, n)?,
+        None => None,
+    };
+    let Some(start) = start else {
+        return Ok(());
+    };
+    let end = match doc.member(metadata, "endOffset")? {
+        Some(n) => seconds(doc, n)?,
+        None => None,
+    };
+    let timing = doc.set(part, "timing", Value::Object)?;
+    doc.set(timing, "start", start)?;
+    if let Some(end) = end {
+        doc.set(timing, "end", end)?;
+    }
+    doc.set(timing, "unit", Value::Text("seconds"))?;
+    Ok(())
+}
+/// A protobuf Duration spelled `<seconds>s` without escapes, as a JSON number over the same
+/// input bytes. Any other spelling (negative, leading zero, escaped) has no number.
+fn seconds(doc: &Document, node: usize) -> Result<Option<Value>> {
+    let Value::String(text) = doc.node(node)?.value else {
+        return Ok(None);
+    };
+    let mut buffer = [0u8; 32];
+    let mut length = 0;
+    let mut chars = doc.chars(node)?;
+    while let Some(c) = chars.next_scalar()? {
+        if !c.is_ascii() || length == buffer.len() {
+            return Ok(None);
+        }
+        buffer[length] = c as u8;
+        length += 1;
+    }
+    let Some((b's', number)) = buffer[..length].split_last() else {
+        return Ok(None);
+    };
+    let (whole, fraction) = match number.iter().position(|&b| b == b'.') {
+        Some(dot) => (&number[..dot], Some(&number[dot + 1..])),
+        None => (number, None),
+    };
+    let digits = |part: &[u8]| !part.is_empty() && part.iter().all(u8::is_ascii_digit);
+    if !digits(whole)
+        || (whole.len() > 1 && whole[0] == b'0')
+        || fraction.is_some_and(|f| !digits(f))
+        || text.span.end - text.span.start != length as u64 + 2
+    {
+        return Ok(None);
+    }
+    Ok(Some(Value::Number(Text {
+        source: text.source,
+        span: Span {
+            start: text.span.start + 1,
+            end: text.span.end - 2,
+        },
+    })))
 }
 pub(super) fn modality(doc: &Document, mime: usize) -> Result<&'static str> {
     for (prefix, kind) in [("image/", "image"), ("audio/", "audio"), ("video/", "video")] {
