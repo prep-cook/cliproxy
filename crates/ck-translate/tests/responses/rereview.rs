@@ -193,6 +193,29 @@ fn failed_responses_keep_their_identity_and_usage() {
 }
 
 #[test]
+fn failed_responses_publish_only_their_identity_and_usage() {
+    let failed = json!({"id":"r","object":"response","created_at":123,"model":"m","status":"failed","output":[],
+        "error":{"code":"server_error","message":"SENSITIVE"},"message":"SENSITIVE","metadata":{"m":"SENSITIVE"},
+        "usage":{"input_tokens":10,"output_tokens":2,"total_tokens":12}});
+    let buffered = failed.to_string();
+    let first = format!("data: {}\n\n", json!({"type":"response.failed","response":failed}));
+    for downstream in [BodyMode::Buffered, BodyMode::Streaming] {
+        for (input, mode) in [
+            (buffered.as_str(), BodyMode::Buffered),
+            (first.as_str(), BodyMode::Streaming),
+        ] {
+            let (out, canonical) = failing(input.as_bytes(), mode, downstream);
+            assert!(!format!("{canonical:?}").contains("SENSITIVE"), "{canonical:?}");
+            let response = failed_response(&out, downstream);
+            for name in ["id", "object", "created_at", "model", "usage"] {
+                assert_eq!(response[name], failed[name], "{name} {input}");
+            }
+            assert!(response.get("message").is_none() && response.get("metadata").is_none());
+        }
+    }
+}
+
+#[test]
 fn failures_carry_the_native_server_error_code() {
     let (out, _) = failing(FAILED.as_bytes(), BodyMode::Buffered, BodyMode::Buffered);
     let response: Value = serde_json::from_slice(&out).unwrap();

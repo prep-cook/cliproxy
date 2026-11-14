@@ -70,9 +70,9 @@ impl State {
         Ok(())
     }
 
-    /// Publishes what failed response `root` may tell the client, its identity, usage and the
-    /// members other than its status, error and output, then fails the stream. Egress writes a
-    /// sanitized error in place of the source's (crates/AGENTS.md, Security).
+    /// Publishes what failed response `root` may tell the client, its identity and usage, then
+    /// fails the stream. Every other member, its error and any nonstandard diagnostic included,
+    /// stays upstream; egress writes a sanitized error (crates/AGENTS.md, Security).
     pub(super) fn fail(&mut self, owner: &mut Writer, doc: &Document, root: usize) -> Result<()> {
         if !matches!(doc.node(root)?.value, Value::Object) {
             return Err(Error::Schema);
@@ -83,8 +83,20 @@ impl State {
             Kind::Opaque,
             Scope::default(),
             |e| {
-                e.bytes(b",\"name\":\"responses.response\",\"format\":\"json\",\"value\":")?;
-                object(doc, root, &["output", "usage", "audio", "status", "error"], e)
+                e.bytes(b",\"name\":\"responses.response\",\"format\":\"json\",\"value\":{")?;
+                let mut first = true;
+                for name in ["id", "object", "created_at", "model"] {
+                    if let Some(node) = doc.member(root, name)? {
+                        if !first {
+                            e.bytes(b",")?;
+                        }
+                        first = false;
+                        e.string(name)?;
+                        e.bytes(b":")?;
+                        doc.write(node, e)?;
+                    }
+                }
+                e.bytes(b"}")
             },
             |_| Ok(()),
         )?;
