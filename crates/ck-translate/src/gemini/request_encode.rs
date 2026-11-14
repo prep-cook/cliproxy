@@ -1,5 +1,9 @@
 use super::request::originals;
-use crate::codec::{Error, RequestView, Result, document::Value, encode::Encoder};
+use crate::codec::{
+    Error, RequestView, Result,
+    document::{Document, Value},
+    encode::Encoder,
+};
 
 pub(super) fn write(view: RequestView<'_>, e: &mut Encoder<'_, '_>) -> Result<()> {
     let doc = view.document;
@@ -44,129 +48,15 @@ pub(super) fn write(view: RequestView<'_>, e: &mut Encoder<'_, '_>) -> Result<()
         })?;
     if config_present {
         e.bytes(b",\"generationConfig\":{")?;
-        let mut first = true;
-        for &(wire, canonical) in super::request::config() {
-            if let Some(n) = doc.member(root, canonical)? {
-                comma(&mut first, e)?;
-                e.string(wire)?;
-                e.bytes(b":")?;
-                if canonical == "modalities" {
-                    e.bytes(b"[")?;
-                    let mut first = true;
-                    for modality in doc.children(n)? {
-                        comma(&mut first, e)?;
-                        e.bytes(b"\"")?;
-                        let mut chars = doc.chars(modality)?;
-                        while let Some(c) = chars.next_scalar()? {
-                            for c in c.to_uppercase() {
-                                e.escaped(c.encode_utf8(&mut [0; 4]))?;
-                            }
-                        }
-                        e.bytes(b"\"")?;
-                    }
-                    e.bytes(b"]")?;
-                } else {
-                    doc.write(n, e)?;
-                }
-            }
-        }
-        if let Some(format) = doc.member(root, "response_format")? {
-            for key in ["responseMimeType", "responseSchema", "responseJsonSchema"] {
-                if let Some(n) = doc.member(format, key)? {
-                    comma(&mut first, e)?;
-                    e.string(key)?;
-                    e.bytes(b":")?;
-                    doc.write(n, e)?;
-                }
-            }
-            if let Some(schema) = doc.member(format, "json_schema")? {
-                comma(&mut first, e)?;
-                e.bytes(b"\"responseMimeType\":\"application/json\",\"responseJsonSchema\":")?;
-                let schema = doc.member(schema, "schema")?.unwrap_or(schema);
-                doc.write(schema, e)?;
-            }
-        }
-        if let Some(thinking) = thinking {
-            comma(&mut first, e)?;
-            e.bytes(b"\"thinkingConfig\":{")?;
-            let mut first = true;
-            for (canonical, wire) in [
-                ("budget_tokens", "thinkingBudget"),
-                ("include", "includeThoughts"),
-                ("effort", "thinkingLevel"),
-            ] {
-                if let Some(n) = doc.member(thinking, canonical)? {
-                    comma(&mut first, e)?;
-                    e.string(wire)?;
-                    e.bytes(b":")?;
-                    doc.write(n, e)?;
-                }
-            }
-            if let Some(native) = doc.member(thinking, "native")? {
-                for n in doc.children(native)? {
-                    comma(&mut first, e)?;
-                    doc.write_name(doc.node(n)?.name.ok_or(Error::Schema)?, e)?;
-                    e.bytes(b":")?;
-                    doc.write(n, e)?;
-                }
-            }
-            e.bytes(b"}")?;
-        }
-        if let Some(config) = native_config {
-            for n in doc.children(config)? {
-                comma(&mut first, e)?;
-                doc.write_name(doc.node(n)?.name.ok_or(Error::Schema)?, e)?;
-                e.bytes(b":")?;
-                doc.write(n, e)?;
-            }
-        }
+        generation_config(doc, thinking, native_config, e)?;
         e.bytes(b"}")?;
     }
-    let native_tools = x.map(|x| doc.member(x, "tools")).transpose()?.flatten();
-    if let Some(tools) = doc.member(root, "tools")? {
-        e.bytes(b",\"tools\":[")?;
-        let mut first = true;
-        if doc.node(tools)?.first.is_some() {
-            e.bytes(b"{\"functionDeclarations\":[")?;
-            let mut first_function = true;
-            for tool in doc.children(tools)? {
-                comma(&mut first_function, e)?;
-                doc.write(doc.required(tool, "function")?, e)?;
-            }
-            e.bytes(b"]}")?;
-            first = false;
-        }
-        if let Some(tools) = native_tools {
-            for tool in doc.children(tools)? {
-                comma(&mut first, e)?;
-                doc.write(tool, e)?;
-            }
-        }
-        e.bytes(b"]")?;
-    }
+    tool_declarations(doc, x, e)?;
     if let Some(native) = native {
         super::members(doc, native, &["generationConfig"], e)?;
     }
     if let Some(choice) = doc.member(root, "tool_choice")? {
-        e.bytes(b",\"toolConfig\":{\"functionCallingConfig\":{")?;
-        if matches!(doc.node(choice)?.value, Value::Object) {
-            let function = doc.required(choice, "function")?;
-            e.bytes(b"\"mode\":\"ANY\",\"allowedFunctionNames\":[")?;
-            doc.write(doc.required(function, "name")?, e)?;
-            e.bytes(b"]")?;
-        } else {
-            e.bytes(b"\"mode\":")?;
-            e.string(if doc.string_is(choice, "none")? {
-                "NONE"
-            } else if doc.string_is(choice, "required")? {
-                "ANY"
-            } else if doc.string_is(choice, "auto")? {
-                "AUTO"
-            } else {
-                return Err(Error::Unsupported);
-            })?;
-        }
-        e.bytes(b"}}")?;
+        tool_config(doc, choice, e)?;
     }
     if !wrapper {
         originals(doc, root, None, e)?;
@@ -185,6 +75,148 @@ pub(super) fn write(view: RequestView<'_>, e: &mut Encoder<'_, '_>) -> Result<()
         originals(doc, root, None, e)?;
         e.bytes(b"}")?;
     }
+    Ok(())
+}
+/// Writes the members of `generationConfig`: mapped controls, response schema, thinking and the
+/// native config, comma-separated.
+fn generation_config(
+    doc: &Document,
+    thinking: Option<usize>,
+    native_config: Option<usize>,
+    e: &mut Encoder<'_, '_>,
+) -> Result<()> {
+    let root = doc.root();
+    let mut first = true;
+    for &(wire, canonical) in super::request::config() {
+        if let Some(n) = doc.member(root, canonical)? {
+            comma(&mut first, e)?;
+            e.string(wire)?;
+            e.bytes(b":")?;
+            if canonical == "modalities" {
+                modalities(doc, n, e)?;
+            } else {
+                doc.write(n, e)?;
+            }
+        }
+    }
+    if let Some(format) = doc.member(root, "response_format")? {
+        for key in ["responseMimeType", "responseSchema", "responseJsonSchema"] {
+            if let Some(n) = doc.member(format, key)? {
+                comma(&mut first, e)?;
+                e.string(key)?;
+                e.bytes(b":")?;
+                doc.write(n, e)?;
+            }
+        }
+        if let Some(schema) = doc.member(format, "json_schema")? {
+            comma(&mut first, e)?;
+            e.bytes(b"\"responseMimeType\":\"application/json\",\"responseJsonSchema\":")?;
+            let schema = doc.member(schema, "schema")?.unwrap_or(schema);
+            doc.write(schema, e)?;
+        }
+    }
+    if let Some(thinking) = thinking {
+        comma(&mut first, e)?;
+        thinking_config(doc, thinking, e)?;
+    }
+    if let Some(config) = native_config {
+        for n in doc.children(config)? {
+            comma(&mut first, e)?;
+            doc.write_name(doc.node(n)?.name.ok_or(Error::Schema)?, e)?;
+            e.bytes(b":")?;
+            doc.write(n, e)?;
+        }
+    }
+    Ok(())
+}
+/// Writes the modalities array in Gemini's upper-case spelling. Schema validation admits only
+/// ASCII modality names.
+fn modalities(doc: &Document, list: usize, e: &mut Encoder<'_, '_>) -> Result<()> {
+    e.bytes(b"[")?;
+    let mut first = true;
+    for modality in doc.children(list)? {
+        comma(&mut first, e)?;
+        e.bytes(b"\"")?;
+        let mut chars = doc.chars(modality)?;
+        while let Some(c) = chars.next_scalar()? {
+            e.escaped(c.to_ascii_uppercase().encode_utf8(&mut [0; 4]))?;
+        }
+        e.bytes(b"\"")?;
+    }
+    e.bytes(b"]")
+}
+/// Writes `"thinkingConfig":{...}` from the mapped controls and the native thinking config.
+fn thinking_config(doc: &Document, thinking: usize, e: &mut Encoder<'_, '_>) -> Result<()> {
+    e.bytes(b"\"thinkingConfig\":{")?;
+    let mut first = true;
+    for (canonical, wire) in [
+        ("budget_tokens", "thinkingBudget"),
+        ("include", "includeThoughts"),
+        ("effort", "thinkingLevel"),
+    ] {
+        if let Some(n) = doc.member(thinking, canonical)? {
+            comma(&mut first, e)?;
+            e.string(wire)?;
+            e.bytes(b":")?;
+            doc.write(n, e)?;
+        }
+    }
+    if let Some(native) = doc.member(thinking, "native")? {
+        for n in doc.children(native)? {
+            comma(&mut first, e)?;
+            doc.write_name(doc.node(n)?.name.ok_or(Error::Schema)?, e)?;
+            e.bytes(b":")?;
+            doc.write(n, e)?;
+        }
+    }
+    e.bytes(b"}")
+}
+/// Writes `,"tools":[...]`: Chat function declarations, then native tool groups.
+fn tool_declarations(doc: &Document, x: Option<usize>, e: &mut Encoder<'_, '_>) -> Result<()> {
+    let Some(tools) = doc.member(doc.root(), "tools")? else {
+        return Ok(());
+    };
+    e.bytes(b",\"tools\":[")?;
+    let mut first = true;
+    if doc.node(tools)?.first.is_some() {
+        e.bytes(b"{\"functionDeclarations\":[")?;
+        let mut first_function = true;
+        for tool in doc.children(tools)? {
+            comma(&mut first_function, e)?;
+            doc.write(doc.required(tool, "function")?, e)?;
+        }
+        e.bytes(b"]}")?;
+        first = false;
+    }
+    if let Some(native) = x.map(|x| doc.member(x, "tools")).transpose()?.flatten() {
+        for tool in doc.children(native)? {
+            comma(&mut first, e)?;
+            doc.write(tool, e)?;
+        }
+    }
+    e.bytes(b"]")
+}
+/// Writes `,"toolConfig":...` for a Chat `tool_choice`.
+fn tool_config(doc: &Document, choice: usize, e: &mut Encoder<'_, '_>) -> Result<()> {
+    e.bytes(b",\"toolConfig\":{\"functionCallingConfig\":{")?;
+    if matches!(doc.node(choice)?.value, Value::Object) {
+        let function = doc.required(choice, "function")?;
+        e.bytes(b"\"mode\":\"ANY\",\"allowedFunctionNames\":[")?;
+        doc.write(doc.required(function, "name")?, e)?;
+        e.bytes(b"]")?;
+    } else {
+        e.bytes(b"\"mode\":")?;
+        e.string(if doc.string_is(choice, "none")? {
+            "NONE"
+        } else if doc.string_is(choice, "required")? {
+            "ANY"
+        } else if doc.string_is(choice, "auto")? {
+            "AUTO"
+        } else {
+            return Err(Error::Unsupported);
+        })?;
+    }
+    e.bytes(b"}}")?;
     Ok(())
 }
 fn comma(first: &mut bool, e: &mut Encoder<'_, '_>) -> Result<()> {
@@ -253,60 +285,24 @@ fn write_message(view: RequestView<'_>, message: usize, system: bool, e: &mut En
 fn write_part(view: RequestView<'_>, part: usize, order: Option<usize>, e: &mut Encoder<'_, '_>) -> Result<()> {
     let doc = view.document;
     let kind = doc.required(part, "type")?;
+    let flag = |name| -> Result<bool> { Ok(order.map(|n| doc.member(n, name)).transpose()?.flatten().is_some()) };
     e.bytes(b"{")?;
-    let mut first = true;
+    let mut first = false;
     if doc.string_is(kind, "function")? {
-        e.bytes(b"\"functionCall\":{")?;
-        let function = doc.required(part, "function")?;
-        e.bytes(b"\"name\":")?;
-        doc.write(doc.required(function, "name")?, e)?;
-        if !order
-            .map(|n| doc.member(n, "synthetic_id"))
-            .transpose()?
-            .flatten()
-            .is_some()
-        {
-            super::member(doc, part, "id", e)?;
-        }
-        if let Some(args) = doc.member(function, "arguments")? {
-            e.bytes(b",\"args\":")?;
-            doc.write(args, e)?;
-        }
-        super::members(doc, function, &["name", "arguments"], e)?;
-        e.bytes(b"}")?;
-        first = false;
+        function_call(doc, part, flag("synthetic_id")?, e)?;
     } else if doc.string_is(kind, "tool_result")? {
-        e.bytes(b"\"functionResponse\":{")?;
-        let result = doc.required(part, "result")?;
-        e.bytes(b"\"name\":")?;
-        doc.write(doc.required(result, "name")?, e)?;
-        if order
-            .map(|n| doc.member(n, "synthetic_id"))
-            .transpose()?
-            .flatten()
-            .is_none()
-        {
-            e.bytes(b",\"id\":")?;
-            doc.write(doc.required(part, "tool_call_id")?, e)?;
-        }
-        super::members(doc, result, &["name"], e)?;
-        e.bytes(b"}")?;
-        first = false;
+        function_response(doc, part, flag("synthetic_id")?, e)?;
     } else if doc.string_is(kind, "text")? || doc.string_is(kind, "reasoning")? {
-        if order
-            .map(|n| doc.member(n, "signature_only"))
-            .transpose()?
-            .flatten()
-            .is_none()
-        {
+        first = flag("signature_only")?;
+        if !first {
             e.bytes(b"\"text\":")?;
             doc.write(doc.required(part, "text")?, e)?;
-            first = false;
             if doc.string_is(kind, "reasoning")? {
                 e.bytes(b",\"thought\":true")?;
             }
         }
     } else if doc.string_is(kind, "opaque")? {
+        first = true;
         let value = doc.required(part, "value")?;
         for n in doc.children(value)? {
             comma(&mut first, e)?;
@@ -315,22 +311,7 @@ fn write_part(view: RequestView<'_>, part: usize, order: Option<usize>, e: &mut 
             doc.write(n, e)?;
         }
     } else {
-        let source = doc.required(part, "source")?;
-        let inline = super::is(doc, source, "kind", "data")?;
-        e.bytes(if inline { b"\"inlineData\":{" } else { b"\"fileData\":{" })?;
-        e.bytes(if inline { b"\"data\":" } else { b"\"fileUri\":" })?;
-        if inline {
-            view.media.write_base64(doc, doc.required(source, "ref")?, e)?;
-        } else {
-            doc.write(doc.required(source, "uri")?, e)?;
-        }
-        if let Some(mime) = doc.member(part, "mime")? {
-            e.bytes(b",\"mimeType\":")?;
-            doc.write(mime, e)?;
-        }
-        originals(doc, source, None, e)?;
-        e.bytes(b"}")?;
-        first = false;
+        media(view, part, e)?;
     }
     for entry in doc.origins(part)? {
         if doc
@@ -358,5 +339,51 @@ fn write_part(view: RequestView<'_>, part: usize, order: Option<usize>, e: &mut 
             doc.write(doc.required(entry, "value")?, e)?;
         }
     }
+    e.bytes(b"}")
+}
+/// Writes `"functionCall":{...}`; a synthesized call id has no native field.
+fn function_call(doc: &Document, part: usize, synthetic_id: bool, e: &mut Encoder<'_, '_>) -> Result<()> {
+    e.bytes(b"\"functionCall\":{\"name\":")?;
+    let function = doc.required(part, "function")?;
+    doc.write(doc.required(function, "name")?, e)?;
+    if !synthetic_id {
+        super::member(doc, part, "id", e)?;
+    }
+    if let Some(args) = doc.member(function, "arguments")? {
+        e.bytes(b",\"args\":")?;
+        doc.write(args, e)?;
+    }
+    super::members(doc, function, &["name", "arguments"], e)?;
+    e.bytes(b"}")
+}
+/// Writes `"functionResponse":{...}`; a linked id the source omitted stays omitted.
+fn function_response(doc: &Document, part: usize, synthetic_id: bool, e: &mut Encoder<'_, '_>) -> Result<()> {
+    e.bytes(b"\"functionResponse\":{\"name\":")?;
+    let result = doc.required(part, "result")?;
+    doc.write(doc.required(result, "name")?, e)?;
+    if !synthetic_id {
+        e.bytes(b",\"id\":")?;
+        doc.write(doc.required(part, "tool_call_id")?, e)?;
+    }
+    super::members(doc, result, &["name"], e)?;
+    e.bytes(b"}")
+}
+/// Writes `"inlineData":{...}` from a registered payload or `"fileData":{...}` from a URI.
+fn media(view: RequestView<'_>, part: usize, e: &mut Encoder<'_, '_>) -> Result<()> {
+    let doc = view.document;
+    let source = doc.required(part, "source")?;
+    let inline = super::is(doc, source, "kind", "data")?;
+    e.bytes(if inline { b"\"inlineData\":{" } else { b"\"fileData\":{" })?;
+    e.bytes(if inline { b"\"data\":" } else { b"\"fileUri\":" })?;
+    if inline {
+        view.media.write_base64(doc, doc.required(source, "ref")?, e)?;
+    } else {
+        doc.write(doc.required(source, "uri")?, e)?;
+    }
+    if let Some(mime) = doc.member(part, "mime")? {
+        e.bytes(b",\"mimeType\":")?;
+        doc.write(mime, e)?;
+    }
+    originals(doc, source, None, e)?;
     e.bytes(b"}")
 }

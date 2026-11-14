@@ -158,22 +158,41 @@ pub(super) fn config() -> &'static [(&'static str, &'static str)] {
     CONFIG
 }
 fn normalize(owner: &mut Writer, doc: &mut Document, operation: Operation, model: &Document) -> Result<()> {
+    let x = envelope(owner, doc, operation, model)?;
+    let root = doc.root();
+    let provider = doc.set(x, "provider_parameters", Value::Object)?;
+    let native = doc.set(provider, "gemini", Value::Object)?;
+    for key in ["cachedContent", "safetySettings", "labels", "toolConfig"] {
+        if let Some(n) = doc.remove(root, key)? {
+            doc.append(native, n)?;
+        }
+    }
+    if let Some(config) = doc.remove(root, "generationConfig")? {
+        generation_config(doc, config, x)?;
+        doc.append(native, config)?;
+    }
+    messages(owner, doc)?;
+    if let Some(tools) = doc.remove(root, "tools")? {
+        normalize_tools(doc, tools, x)?;
+    }
+    Ok(())
+}
+/// Starts `x_ck`, unwraps a count request's `generateContentRequest`, preserves unknown root
+/// members and sets the URL model. Returns the `x_ck` node.
+fn envelope(owner: &mut Writer, doc: &mut Document, operation: Operation, model: &Document) -> Result<usize> {
     let root = doc.root();
     super::object(doc, root)?;
     let collision = doc.remove(root, "x_ck")?;
     let x = doc.set(root, "x_ck", Value::Object)?;
     doc.set(x, "v", Value::Unsigned(1))?;
     doc.set(x, "original_protocol", Value::Text("gemini"))?;
-    doc.set(
-        x,
-        "operation",
-        Value::Text(if operation == Operation::Generate {
-            "generate"
-        } else {
-            "count_tokens"
-        }),
-    )?;
-    let originals = doc.set(x, "original", Value::Array)?;
+    let operation_name = if operation == Operation::Generate {
+        "generate"
+    } else {
+        "count_tokens"
+    };
+    doc.set(x, "operation", Value::Text(operation_name))?;
+    doc.set(x, "original", Value::Array)?;
     doc.set(x, "replay", Value::Array)?;
     if let Some(n) = collision {
         preserve(owner, doc, root, n, None)?;
@@ -190,24 +209,7 @@ fn normalize(owner: &mut Writer, doc: &mut Document, operation: Operation, model
             doc.append(root, n)?;
         }
     }
-    capture(
-        owner,
-        doc,
-        root,
-        &[
-            "x_ck",
-            "model",
-            "contents",
-            "systemInstruction",
-            "generationConfig",
-            "tools",
-            "toolConfig",
-            "cachedContent",
-            "safetySettings",
-            "labels",
-        ],
-        None,
-    )?;
+    capture(owner, doc, root, ROOT_KNOWN, None)?;
     if let Some(n) = doc.remove(root, "model")? {
         preserve(owner, doc, root, n, Some("body_model"))?;
     }
@@ -215,51 +217,65 @@ fn normalize(owner: &mut Writer, doc: &mut Document, operation: Operation, model
     let value = doc.import_json(owner, value)?;
     doc.rename(value, "model")?;
     doc.append(root, value)?;
-    let provider = doc.set(x, "provider_parameters", Value::Object)?;
-    let native = doc.set(provider, "gemini", Value::Object)?;
-    for key in ["cachedContent", "safetySettings", "labels", "toolConfig"] {
-        if let Some(n) = doc.remove(root, key)? {
-            doc.append(native, n)?;
+    Ok(x)
+}
+/// Root members with a canonical home; the rest stay as provenance.
+const ROOT_KNOWN: &[&str] = &[
+    "x_ck",
+    "model",
+    "contents",
+    "systemInstruction",
+    "generationConfig",
+    "tools",
+    "toolConfig",
+    "cachedContent",
+    "safetySettings",
+    "labels",
+];
+/// Moves the mapped `generationConfig` members to the root, thinking to `x_ck.thinking` and
+/// the response schema to `response_format`; the rest stays in the native config.
+fn generation_config(doc: &mut Document, config: usize, x: usize) -> Result<()> {
+    let root = doc.root();
+    super::object(doc, config)?;
+    for &(wire, canonical) in CONFIG {
+        if let Some(n) = doc.remove(config, wire)? {
+            doc.rename(n, canonical)?;
+            doc.append(root, n)?;
         }
     }
-    if let Some(config) = doc.remove(root, "generationConfig")? {
-        super::object(doc, config)?;
-        for &(wire, canonical) in CONFIG {
-            if let Some(n) = doc.remove(config, wire)? {
+    if let Some(thinking) = doc.remove(config, "thinkingConfig")? {
+        super::object(doc, thinking)?;
+        let normalized = doc.set(x, "thinking", Value::Object)?;
+        for (wire, canonical) in [
+            ("thinkingBudget", "budget_tokens"),
+            ("includeThoughts", "include"),
+            ("thinkingLevel", "effort"),
+        ] {
+            if let Some(n) = doc.remove(thinking, wire)? {
                 doc.rename(n, canonical)?;
-                doc.append(root, n)?;
+                doc.append(normalized, n)?;
             }
         }
-        if let Some(thinking) = doc.remove(config, "thinkingConfig")? {
-            super::object(doc, thinking)?;
-            let normalized = doc.set(x, "thinking", Value::Object)?;
-            for (wire, canonical) in [
-                ("thinkingBudget", "budget_tokens"),
-                ("includeThoughts", "include"),
-                ("thinkingLevel", "effort"),
-            ] {
-                if let Some(n) = doc.remove(thinking, wire)? {
-                    doc.rename(n, canonical)?;
-                    doc.append(normalized, n)?;
-                }
-            }
-            doc.rename(thinking, "native")?;
-            doc.append(normalized, thinking)?;
-        }
-        if doc.member(config, "responseMimeType")?.is_some()
-            || doc.member(config, "responseSchema")?.is_some()
-            || doc.member(config, "responseJsonSchema")?.is_some()
-        {
-            let format = doc.set(root, "response_format", Value::Object)?;
-            doc.set(format, "type", Value::Text("json_schema"))?;
-            for key in ["responseMimeType", "responseSchema", "responseJsonSchema"] {
-                if let Some(n) = doc.remove(config, key)? {
-                    doc.append(format, n)?;
-                }
-            }
-        }
-        doc.append(native, config)?;
+        doc.rename(thinking, "native")?;
+        doc.append(normalized, thinking)?;
     }
+    const SCHEMA: [&str; 3] = ["responseMimeType", "responseSchema", "responseJsonSchema"];
+    if SCHEMA.iter().try_fold(false, |found, key| {
+        Ok::<_, Error>(found || doc.member(config, key)?.is_some())
+    })? {
+        let format = doc.set(root, "response_format", Value::Object)?;
+        doc.set(format, "type", Value::Text("json_schema"))?;
+        for key in SCHEMA {
+            if let Some(n) = doc.remove(config, key)? {
+                doc.append(format, n)?;
+            }
+        }
+    }
+    Ok(())
+}
+/// Turns `systemInstruction` and `contents` into canonical messages, system first.
+fn messages(owner: &mut Writer, doc: &mut Document) -> Result<()> {
+    let root = doc.root();
     let contents = doc.remove(root, "contents")?.ok_or(Error::Schema)?;
     super::array(doc, contents)?;
     let messages = doc.set(root, "messages", Value::Array)?;
@@ -279,29 +295,31 @@ fn normalize(owner: &mut Writer, doc: &mut Document, operation: Operation, model
         super::request_content::normalize(owner, doc, n, index)?;
         index += 1;
     }
-    if let Some(tools) = doc.remove(root, "tools")? {
-        super::array(doc, tools)?;
-        let normalized = doc.set(root, "tools", Value::Array)?;
-        let native_tools = doc.set(x, "tools", Value::Array)?;
-        while let Some(group) = doc.node(tools)?.first {
-            doc.detach(tools, group)?;
-            if let Some(functions) = doc.remove(group, "functionDeclarations")? {
-                super::array(doc, functions)?;
-                while let Some(function) = doc.node(functions)?.first {
-                    doc.detach(functions, function)?;
-                    let tool = doc.add(None, Value::Object)?;
-                    doc.append(normalized, tool)?;
-                    doc.set(tool, "type", Value::Text("function"))?;
-                    doc.rename(function, "function")?;
-                    doc.append(tool, function)?;
-                }
-            }
-            if doc.node(group)?.first.is_some() {
-                doc.append(native_tools, group)?;
+    Ok(())
+}
+/// Function declarations become Chat tools; other native tool groups stay in `x_ck.tools`.
+fn normalize_tools(doc: &mut Document, tools: usize, x: usize) -> Result<()> {
+    super::array(doc, tools)?;
+    let root = doc.root();
+    let normalized = doc.set(root, "tools", Value::Array)?;
+    let native_tools = doc.set(x, "tools", Value::Array)?;
+    while let Some(group) = doc.node(tools)?.first {
+        doc.detach(tools, group)?;
+        if let Some(functions) = doc.remove(group, "functionDeclarations")? {
+            super::array(doc, functions)?;
+            while let Some(function) = doc.node(functions)?.first {
+                doc.detach(functions, function)?;
+                let tool = doc.add(None, Value::Object)?;
+                doc.append(normalized, tool)?;
+                doc.set(tool, "type", Value::Text("function"))?;
+                doc.rename(function, "function")?;
+                doc.append(tool, function)?;
             }
         }
+        if doc.node(group)?.first.is_some() {
+            doc.append(native_tools, group)?;
+        }
     }
-    let _ = originals;
     Ok(())
 }
 pub(super) fn capture(

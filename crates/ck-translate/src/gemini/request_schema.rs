@@ -10,6 +10,18 @@ pub(super) fn validate(view: RequestView<'_>) -> Result<()> {
     let doc = view.document;
     let root = doc.root();
     super::string(doc, doc.required(root, "model")?)?;
+    messages(view)?;
+    controls(doc)?;
+    if let Some(x) = doc.member(root, "x_ck")? {
+        extension(doc, x)?;
+    }
+    view.media.validate_registrations(doc, 0)?;
+    Ok(())
+}
+/// Roles, content parts and history tool calls.
+fn messages(view: RequestView<'_>) -> Result<()> {
+    let doc = view.document;
+    let root = doc.root();
     let messages = doc.required(root, "messages")?;
     super::array(doc, messages)?;
     let mut system = false;
@@ -54,6 +66,11 @@ pub(super) fn validate(view: RequestView<'_>) -> Result<()> {
             }
         }
     }
+    Ok(())
+}
+/// Sampling, limits, modalities and tools; Chat controls Gemini cannot express fail.
+fn controls(doc: &Document) -> Result<()> {
+    let root = doc.root();
     for key in ["temperature", "top_p"] {
         if let Some(n) = doc.member(root, key)?
             && !matches!(doc.node(n)?.value, Value::Number(_) | Value::Unsigned(_))
@@ -101,42 +118,43 @@ pub(super) fn validate(view: RequestView<'_>) -> Result<()> {
             super::string(doc, doc.required(function, "name")?)?;
         }
     }
-    if let Some(x) = doc.member(root, "x_ck")? {
-        for key in ["session", "transport"] {
-            if doc.member(x, key)?.is_some() {
-                return Err(Error::Unsupported);
-            }
-        }
-        if let Some(provider) = doc.member(x, "provider_parameters")? {
-            for native in doc.children(provider)? {
-                if !doc.name_is(doc.node(native)?.name.ok_or(Error::Schema)?, "gemini")?
-                    && doc.node(native)?.first.is_some()
-                {
-                    return Err(Error::Unsupported);
-                }
-            }
-        }
-        if let Some(replay) = doc.member(x, "replay")? {
-            for entry in doc.children(replay)? {
-                if !super::is(doc, entry, "kind", "gemini")? {
-                    return Err(Error::Unsupported);
-                }
-                super::string(doc, doc.required(entry, "signature")?)?;
-            }
-        }
-        if let Some(cache) = doc.member(x, "cache_control")?
-            && doc.node(cache)?.first.is_some()
-        {
-            return Err(Error::Unsupported);
-        }
-        if let Some(native) = doc.member(x, "tools")?
-            && doc.node(native)?.first.is_some()
-            && !super::is(doc, x, "original_protocol", "gemini")?
-        {
+    Ok(())
+}
+/// Session, transport, provider parameters, replay, cache directives and native tools.
+fn extension(doc: &Document, x: usize) -> Result<()> {
+    for key in ["session", "transport"] {
+        if doc.member(x, key)?.is_some() {
             return Err(Error::Unsupported);
         }
     }
-    view.media.validate_registrations(doc, 0)?;
+    if let Some(provider) = doc.member(x, "provider_parameters")? {
+        for native in doc.children(provider)? {
+            if !doc.name_is(doc.node(native)?.name.ok_or(Error::Schema)?, "gemini")?
+                && doc.node(native)?.first.is_some()
+            {
+                return Err(Error::Unsupported);
+            }
+        }
+    }
+    if let Some(replay) = doc.member(x, "replay")? {
+        for entry in doc.children(replay)? {
+            if !super::is(doc, entry, "kind", "gemini")? {
+                return Err(Error::Unsupported);
+            }
+            super::string(doc, doc.required(entry, "signature")?)?;
+        }
+    }
+    if let Some(cache) = doc.member(x, "cache_control")?
+        && doc.node(cache)?.first.is_some()
+    {
+        return Err(Error::Unsupported);
+    }
+    if let Some(native) = doc.member(x, "tools")?
+        && doc.node(native)?.first.is_some()
+        && !super::is(doc, x, "original_protocol", "gemini")?
+    {
+        return Err(Error::Unsupported);
+    }
     Ok(())
 }
 fn validate_part(view: RequestView<'_>, part: usize) -> Result<()> {

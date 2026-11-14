@@ -36,131 +36,156 @@ pub(super) fn normalize(owner: &mut Writer, doc: &mut Document, message: usize, 
         super::object(doc, part)?;
         let entry = doc.add(None, Value::Object)?;
         doc.append(order_parts, entry)?;
-        let mut payloads = 0;
-        for key in [
-            "text",
-            "inlineData",
-            "fileData",
-            "functionCall",
-            "functionResponse",
-            "executableCode",
-            "codeExecutionResult",
-        ] {
-            payloads += usize::from(doc.member(part, key)?.is_some());
-        }
-        if payloads > 1 {
-            return Err(Error::Schema);
-        }
-        if let Some(signature) = doc.remove(part, "thoughtSignature")? {
-            super::string(doc, signature)?;
-            let replay = doc.required(x, "replay")?;
-            let binding = doc.add(None, Value::Object)?;
-            doc.append(replay, binding)?;
-            doc.set(binding, "message_index", Value::Unsigned(message_index))?;
-            doc.set(binding, "block_index", Value::Unsigned(index))?;
-            doc.set_id(
-                binding,
-                "item_id",
-                media::local_id(b'i', doc.children(replay)?.count() as u64)?,
-            )?;
-            doc.set(binding, "kind", Value::Text("gemini"))?;
-            doc.rename(signature, "signature")?;
-            doc.append(binding, signature)?;
-            let source = doc.set(binding, "source", Value::Object)?;
-            doc.set(source, "protocol", Value::Text("gemini"))?;
-            doc.bind_origin(binding, part, Some("signature"))?;
-        }
-        if let Some(call) = doc.remove(part, "functionCall")? {
-            let calls = match doc.member(message, "tool_calls")? {
-                Some(n) => n,
-                None => doc.set(message, "tool_calls", Value::Array)?,
-            };
-            doc.append(calls, part)?;
-            doc.set(part, "type", Value::Text("function"))?;
-            doc.set(part, "arguments_format", Value::Text("json"))?;
-            if let Some(id) = doc.remove(call, "id")? {
-                doc.append(part, id)?;
-            } else {
-                doc.set_id(
-                    part,
-                    "id",
-                    media::local_id(
-                        b't',
-                        message_index
-                            .checked_mul(1_000_000)
-                            .and_then(|n| n.checked_add(index))
-                            .ok_or(Error::Limit)?,
-                    )?,
-                )?;
-                doc.set(entry, "synthetic_id", Value::Bool(true))?;
-            }
-            if let Some(args) = doc.member(call, "args")? {
-                doc.rename(args, "arguments")?;
-            }
-            doc.rename(call, "function")?;
-            doc.append(part, call)?;
-            doc.set(entry, "kind", Value::Text("call"))?;
-        } else if let Some(result) = doc.remove(part, "functionResponse")? {
-            doc.append(content, part)?;
-            doc.set(part, "type", Value::Text("tool_result"))?;
-            let name = doc.required(result, "name")?;
-            super::string(doc, name)?;
-            let id = doc.remove(result, "id")?;
-            if let Some(id) = id {
-                doc.rename(id, "tool_call_id")?;
-                doc.append(part, id)?;
-            } else {
-                let linked = find_call(doc, message, name)?.ok_or(Error::Schema)?;
-                let id = doc.node(doc.required(linked, "id")?)?.value;
-                doc.set(part, "tool_call_id", id)?;
-                doc.set(entry, "synthetic_id", Value::Bool(true))?;
-            }
-            doc.rename(result, "result")?;
-            doc.append(part, result)?;
-            doc.set(entry, "kind", Value::Text("result"))?;
-        } else {
-            doc.append(content, part)?;
-            doc.set(entry, "kind", Value::Text("content"))?;
-            if let Some(text) = doc.member(part, "text")? {
-                super::string(doc, text)?;
-                let thought = doc.member(part, "thought")?;
-                let reasoning = if let Some(n) = thought {
-                    match doc.node(n)?.value {
-                        Value::Bool(b) => b,
-                        _ => return Err(Error::Schema),
-                    }
-                } else {
-                    false
-                };
-                if let Some(n) = doc.remove(part, "thought")? {
-                    preserve(owner, doc, part, n, None)?;
-                }
-                doc.set(part, "type", Value::Text(if reasoning { "reasoning" } else { "text" }))?;
-                capture(owner, doc, part, &["type", "text"], None)?;
-            } else if let Some(data) = doc.remove(part, "inlineData")? {
-                media_part(owner, doc, part, data, true)?;
-            } else if let Some(data) = doc.remove(part, "fileData")? {
-                media_part(owner, doc, part, data, false)?;
-            } else if payloads == 0 && super::origin(doc, part, "signature")?.is_some() {
-                doc.set(part, "type", Value::Text("reasoning"))?;
-                doc.set(part, "text", Value::Text(""))?;
-                doc.set(entry, "signature_only", Value::Bool(true))?;
-                capture(owner, doc, part, &["type", "text"], None)?;
-            } else {
-                let value = doc.add(None, Value::Object)?;
-                while let Some(n) = doc.node(part)?.first {
-                    doc.detach(part, n)?;
-                    doc.append(value, n)?;
-                }
-                doc.set(part, "type", Value::Text("opaque"))?;
-                doc.set(part, "protocol", Value::Text("gemini"))?;
-                doc.rename(value, "value")?;
-                doc.append(part, value)?;
-            }
-        }
+        let place = Place {
+            message,
+            content,
+            entry,
+            message_index,
+            index,
+        };
+        normalize_part(owner, doc, part, place)?;
         doc.bind_origin(entry, part, Some("part"))?;
         index += 1;
     }
+    Ok(())
+}
+/// Where a part sits: its message, the message's content array, its order entry and indexes.
+#[derive(Clone, Copy)]
+struct Place {
+    message: usize,
+    content: usize,
+    entry: usize,
+    message_index: u64,
+    index: u64,
+}
+/// Moves one native part to its canonical home: a tool call, a tool result or a content part.
+fn normalize_part(owner: &mut Writer, doc: &mut Document, part: usize, place: Place) -> Result<()> {
+    let mut payloads = 0;
+    for key in [
+        "text",
+        "inlineData",
+        "fileData",
+        "functionCall",
+        "functionResponse",
+        "executableCode",
+        "codeExecutionResult",
+    ] {
+        payloads += usize::from(doc.member(part, key)?.is_some());
+    }
+    if payloads > 1 {
+        return Err(Error::Schema);
+    }
+    if let Some(signature) = doc.remove(part, "thoughtSignature")? {
+        replay(doc, part, signature, place)?;
+    }
+    if let Some(call) = doc.remove(part, "functionCall")? {
+        return tool_call(doc, part, call, place);
+    }
+    if let Some(result) = doc.remove(part, "functionResponse")? {
+        return tool_result(doc, part, result, place);
+    }
+    doc.append(place.content, part)?;
+    doc.set(place.entry, "kind", Value::Text("content"))?;
+    if let Some(text) = doc.member(part, "text")? {
+        super::string(doc, text)?;
+        let reasoning = match doc.member(part, "thought")? {
+            Some(n) => match doc.node(n)?.value {
+                Value::Bool(b) => b,
+                _ => return Err(Error::Schema),
+            },
+            None => false,
+        };
+        if let Some(n) = doc.remove(part, "thought")? {
+            preserve(owner, doc, part, n, None)?;
+        }
+        doc.set(part, "type", Value::Text(if reasoning { "reasoning" } else { "text" }))?;
+        capture(owner, doc, part, &["type", "text"], None)
+    } else if let Some(data) = doc.remove(part, "inlineData")? {
+        media_part(owner, doc, part, data, true)
+    } else if let Some(data) = doc.remove(part, "fileData")? {
+        media_part(owner, doc, part, data, false)
+    } else if payloads == 0 && super::origin(doc, part, "signature")?.is_some() {
+        doc.set(part, "type", Value::Text("reasoning"))?;
+        doc.set(part, "text", Value::Text(""))?;
+        doc.set(place.entry, "signature_only", Value::Bool(true))?;
+        capture(owner, doc, part, &["type", "text"], None)
+    } else {
+        let value = doc.add(None, Value::Object)?;
+        while let Some(n) = doc.node(part)?.first {
+            doc.detach(part, n)?;
+            doc.append(value, n)?;
+        }
+        doc.set(part, "type", Value::Text("opaque"))?;
+        doc.set(part, "protocol", Value::Text("gemini"))?;
+        doc.rename(value, "value")?;
+        doc.append(part, value)
+    }
+}
+/// Binds a part's signature into `x_ck.replay` at the part's own message and block index.
+fn replay(doc: &mut Document, part: usize, signature: usize, place: Place) -> Result<()> {
+    super::string(doc, signature)?;
+    let x = doc.required(doc.root(), "x_ck")?;
+    let replay = doc.required(x, "replay")?;
+    let binding = doc.add(None, Value::Object)?;
+    doc.append(replay, binding)?;
+    doc.set(binding, "message_index", Value::Unsigned(place.message_index))?;
+    doc.set(binding, "block_index", Value::Unsigned(place.index))?;
+    doc.set_id(
+        binding,
+        "item_id",
+        media::local_id(b'i', doc.children(replay)?.count() as u64)?,
+    )?;
+    doc.set(binding, "kind", Value::Text("gemini"))?;
+    doc.rename(signature, "signature")?;
+    doc.append(binding, signature)?;
+    let source = doc.set(binding, "source", Value::Object)?;
+    doc.set(source, "protocol", Value::Text("gemini"))?;
+    doc.bind_origin(binding, part, Some("signature"))
+}
+fn tool_call(doc: &mut Document, part: usize, call: usize, place: Place) -> Result<()> {
+    let calls = match doc.member(place.message, "tool_calls")? {
+        Some(n) => n,
+        None => doc.set(place.message, "tool_calls", Value::Array)?,
+    };
+    doc.append(calls, part)?;
+    doc.set(part, "type", Value::Text("function"))?;
+    doc.set(part, "arguments_format", Value::Text("json"))?;
+    if let Some(id) = doc.remove(call, "id")? {
+        doc.append(part, id)?;
+    } else {
+        let id = place
+            .message_index
+            .checked_mul(1_000_000)
+            .and_then(|n| n.checked_add(place.index))
+            .ok_or(Error::Limit)?;
+        doc.set_id(part, "id", media::local_id(b't', id)?)?;
+        doc.set(place.entry, "synthetic_id", Value::Bool(true))?;
+    }
+    if let Some(args) = doc.member(call, "args")? {
+        doc.rename(args, "arguments")?;
+    }
+    doc.rename(call, "function")?;
+    doc.append(part, call)?;
+    doc.set(place.entry, "kind", Value::Text("call"))?;
+    Ok(())
+}
+fn tool_result(doc: &mut Document, part: usize, result: usize, place: Place) -> Result<()> {
+    doc.append(place.content, part)?;
+    doc.set(part, "type", Value::Text("tool_result"))?;
+    let name = doc.required(result, "name")?;
+    super::string(doc, name)?;
+    if let Some(id) = doc.remove(result, "id")? {
+        doc.rename(id, "tool_call_id")?;
+        doc.append(part, id)?;
+    } else {
+        let linked = find_call(doc, place.message, name)?.ok_or(Error::Schema)?;
+        let id = doc.node(doc.required(linked, "id")?)?.value;
+        doc.set(part, "tool_call_id", id)?;
+        doc.set(place.entry, "synthetic_id", Value::Bool(true))?;
+    }
+    doc.rename(result, "result")?;
+    doc.append(part, result)?;
+    doc.set(place.entry, "kind", Value::Text("result"))?;
     Ok(())
 }
 fn find_call(doc: &Document, message: usize, name: usize) -> Result<Option<usize>> {
