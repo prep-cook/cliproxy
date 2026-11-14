@@ -21,6 +21,8 @@ pub(super) struct Ingress {
     closed: bool,
     /// Started from the snapshot's `audio` object, whose metadata `media.start` already carries.
     native: bool,
+    /// Fed by the buffered body parser, which replaced the payload string with null.
+    buffered: bool,
 }
 
 impl Ingress {
@@ -67,6 +69,7 @@ impl Ingress {
             transcript_done: false,
             closed: false,
             native: native.is_some(),
+            buffered: false,
         })
     }
 
@@ -84,6 +87,22 @@ impl Ingress {
                 emit(bytes)
             })
         })
+    }
+
+    /// Publishes the bytes that `decode` yields from one validated span of a buffered body's
+    /// `audio.data` string.
+    pub fn buffered(
+        &mut self,
+        owner: &mut Writer,
+        emitter: &mut Emitter,
+        decode: impl FnOnce(&mut dyn FnMut(&[u8]) -> Result<()>) -> Result<()>,
+    ) -> Result<()> {
+        if self.closed || self.audio_done {
+            return Err(Error::Schema);
+        }
+        self.audio_seen = true;
+        self.buffered = true;
+        self.publisher.collect(emitter, owner, decode)
     }
 
     pub fn audio_done(&mut self) -> Result<()> {
@@ -155,7 +174,10 @@ impl Ingress {
     }
 
     pub fn snapshot(&mut self, owner: &mut Writer, emitter: &mut Emitter, doc: &Document, node: usize) -> Result<()> {
-        if let Some(data) = doc.member(node, "data")? {
+        // Buffered audio was published as it arrived; its snapshot holds null in place of data.
+        if let Some(data) = doc.member(node, "data")?
+            && !self.buffered
+        {
             if self.audio_seen {
                 if !self.decoder.complete()
                     || super::image::digest(doc, data)? != <[u8; 32]>::from(self.hash.clone().finalize())
@@ -177,14 +199,15 @@ impl Ingress {
     }
 
     /// Publishes the metadata of a snapshot `audio` object that arrives after streamed audio
-    /// started the media, as a `responses.audio` record egress merges into the audio.
+    /// started the media, as a `responses.audio` record egress merges into the audio. Buffered
+    /// audio starts before the members that follow `data`, so it sends the record too.
     fn late_metadata(&mut self, owner: &mut Writer, emitter: &mut Emitter, doc: &Document, node: usize) -> Result<()> {
         let mut late = false;
         for field in doc.children(node)? {
             let name = doc.node(field)?.name.ok_or(Error::Schema)?;
             late |= !doc.name_is(name, "data")? && !doc.name_is(name, "transcript")?;
         }
-        if self.native || !late {
+        if (self.native && !self.buffered) || !late {
             return Ok(());
         }
         emitter.emit(

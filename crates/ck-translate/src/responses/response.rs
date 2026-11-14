@@ -11,6 +11,7 @@ use crate::codec::{
 use ck_stream::Writer;
 
 mod block;
+mod buffered;
 mod complete;
 mod event;
 mod item;
@@ -21,7 +22,7 @@ pub struct Ingress {
     owner: u64,
     source: Option<Source>,
     scanner: Option<sse::Scanner>,
-    json: Option<json::Scanner>,
+    buffered: Option<buffered::Buffered>,
     state: State,
     failed: bool,
 }
@@ -38,14 +39,18 @@ impl Ingress {
         }
         Ok(Self {
             owner: owner.id(),
-            source: Some(Source::new(owner)?),
+            source: if mode == BodyMode::Streaming {
+                Some(Source::new(owner)?)
+            } else {
+                None
+            },
             scanner: if mode == BodyMode::Streaming {
                 Some(sse::Scanner::new(owner, limit)?)
             } else {
                 None
             },
-            json: if mode == BodyMode::Buffered {
-                Some(json::Scanner::new(owner, limit)?)
+            buffered: if mode == BodyMode::Buffered {
+                Some(buffered::Buffered::new(owner, limit)?)
             } else {
                 None
             },
@@ -79,15 +84,15 @@ impl codec::ResponseIngress for Ingress {
     fn advance(&mut self, owner: &mut Writer, bytes: &[u8]) -> Result<()> {
         crate::boundary::enter(self.owner, owner, self.failed || self.state.terminal)?;
         let result = (|| {
+            let Some(scanner) = &mut self.scanner else {
+                let buffered = self.buffered.as_mut().ok_or(Error::Closed)?;
+                return buffered.advance(owner, &mut self.state, bytes);
+            };
             let source = self.source.as_mut().ok_or(Error::Closed)?;
             source.push_bytes(owner, bytes)?;
-            if let Some(scanner) = &mut self.scanner {
-                let state = &mut self.state;
-                scanner.advance(source, |event| state.event(owner, source, event))?;
-                source.release_before(scanner.consumed())?;
-            } else {
-                self.json.as_mut().ok_or(Error::Closed)?.advance(source)?;
-            }
+            let state = &mut self.state;
+            scanner.advance(source, |event| state.event(owner, source, event))?;
+            source.release_before(scanner.consumed())?;
             Ok(())
         })();
         self.handle(owner, result)
@@ -103,11 +108,8 @@ impl codec::ResponseIngress for Ingress {
                     return Err(Error::Truncated);
                 }
             } else {
-                let source = self.source.take().ok_or(Error::Closed)?;
-                let mut scanner = self.json.take().ok_or(Error::Closed)?;
-                scanner.finish(&source)?;
-                let doc = Document::from_scanned(owner, source, scanner)?;
-                self.state.complete(owner, &doc, doc.root())?;
+                let buffered = self.buffered.take().ok_or(Error::Closed)?;
+                buffered.finish(owner, &mut self.state)?;
             }
             Ok(())
         })();
