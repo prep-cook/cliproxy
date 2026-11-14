@@ -119,7 +119,13 @@ impl Ingress {
         let scanned = input.scanner.pending_node(input.document.input(), wire)?;
         let node = input.node(wire)?;
         let doc = &mut input.document;
-        let native = native_media(doc, node)?;
+        let native = match native_media(doc, node)? {
+            // A possible carrier whose type follows it waits in the input until
+            // normalization publishes its one canonical representation.
+            Carrier::Unresolved => return Ok(()),
+            Carrier::Native(format) => Some(format),
+            Carrier::Other => None,
+        };
         if native.is_none() && scanned.validated_end - scanned.span.start <= 1024 {
             return Ok(());
         }
@@ -305,41 +311,59 @@ impl StringState {
     }
 }
 
-fn native_media(doc: &Document, node: usize) -> Result<Option<(Encoding, &'static str, Option<usize>)>> {
+enum Carrier {
+    Native((Encoding, &'static str, Option<usize>)),
+    /// The position may carry media, but a type member has not arrived yet.
+    Unresolved,
+    Other,
+}
+
+/// `Some` once the `type` member has arrived; `None` while it may still follow.
+fn type_is(doc: &Document, node: usize, value: &str) -> Result<Option<bool>> {
+    match doc.member(node, "type")? {
+        Some(_) => super::super::is(doc, node, "type", value).map(Some),
+        None => Ok(None),
+    }
+}
+
+fn native_media(doc: &Document, node: usize) -> Result<Carrier> {
     let Some(source) = doc.node(node)?.parent else {
-        return Ok(None);
+        return Ok(Carrier::Other);
     };
     let Some(name) = doc.node(node)?.name else {
-        return Ok(None);
+        return Ok(Carrier::Other);
     };
     if !doc.name_is(name, "data")? || !matches!(doc.node(source)?.value, Value::Object) {
-        return Ok(None);
+        return Ok(Carrier::Other);
     }
     let Some(name) = doc.node(source)?.name else {
-        return Ok(None);
+        return Ok(Carrier::Other);
     };
     if !doc.name_is(name, "source")? {
-        return Ok(None);
+        return Ok(Carrier::Other);
     }
     let Some(part) = doc.node(source)?.parent else {
-        return Ok(None);
+        return Ok(Carrier::Other);
     };
-    if !content_part(doc, part)? {
-        return Ok(None);
+    let kind = match (type_is(doc, part, "image")?, type_is(doc, part, "document")?) {
+        (Some(true), _) => Some("image"),
+        (_, Some(true)) => Some("document"),
+        (Some(false), _) => return Ok(Carrier::Other),
+        _ => None,
+    };
+    let encoding = match (type_is(doc, source, "base64")?, type_is(doc, source, "text")?) {
+        (Some(true), _) => Some(Encoding::Base64),
+        (_, Some(true)) => Some(Encoding::Utf8),
+        (Some(false), _) => return Ok(Carrier::Other),
+        _ => None,
+    };
+    match content_part(doc, part)? {
+        Some(false) => return Ok(Carrier::Other),
+        Some(true) => (),
+        None => return Ok(Carrier::Unresolved),
     }
-    let kind = if super::super::is(doc, part, "type", "image")? {
-        "image"
-    } else if super::super::is(doc, part, "type", "document")? {
-        "document"
-    } else {
-        return Ok(None);
-    };
-    let encoding = if super::super::is(doc, source, "type", "base64")? {
-        Encoding::Base64
-    } else if super::super::is(doc, source, "type", "text")? {
-        Encoding::Utf8
-    } else {
-        return Ok(None);
+    let (Some(kind), Some(encoding)) = (kind, encoding) else {
+        return Ok(Carrier::Unresolved);
     };
     let mime = doc.member(source, "media_type")?.filter(|&node| {
         matches!(
@@ -350,34 +374,41 @@ fn native_media(doc: &Document, node: usize) -> Result<Option<(Encoding, &'stati
             }))
         )
     });
-    Ok(Some((encoding, kind, mime)))
+    Ok(Carrier::Native((encoding, kind, mime)))
 }
 
-fn content_part(doc: &Document, part: usize) -> Result<bool> {
+/// Three-valued: `None` while an enclosing `tool_result` type may still follow.
+fn content_part(doc: &Document, part: usize) -> Result<Option<bool>> {
     let Some(array) = doc.node(part)?.parent else {
-        return Ok(false);
+        return Ok(Some(false));
     };
     if !matches!(doc.node(array)?.value, Value::Array) {
-        return Ok(false);
+        return Ok(Some(false));
     }
     let Some(name) = doc.node(array)?.name else {
-        return Ok(false);
+        return Ok(Some(false));
     };
     let Some(parent) = doc.node(array)?.parent else {
-        return Ok(false);
+        return Ok(Some(false));
     };
     if doc.name_is(name, "system")? && parent == doc.root() {
-        return Ok(true);
+        return Ok(Some(true));
     }
     if !doc.name_is(name, "content")? {
-        return Ok(false);
+        return Ok(Some(false));
     }
     if let Some(messages) = doc.node(parent)?.parent
         && doc.node(messages)?.parent == Some(doc.root())
         && let Some(name) = doc.node(messages)?.name
         && doc.name_is(name, "messages")?
     {
-        return Ok(true);
+        return Ok(Some(true));
     }
-    Ok(super::super::is(doc, parent, "type", "tool_result")? && content_part(doc, parent)?)
+    Ok(
+        match (type_is(doc, parent, "tool_result")?, content_part(doc, parent)?) {
+            (Some(false), _) | (_, Some(false)) => Some(false),
+            (Some(true), Some(true)) => Some(true),
+            _ => None,
+        },
+    )
 }

@@ -368,7 +368,7 @@ fn walk(doc: &mut Document, pending: &mut MediaRegistration<'_>, node: usize) ->
 }
 /// Registers and publishes the inline data of an image or document source.
 fn register_source(doc: &mut Document, pending: &mut MediaRegistration<'_>, node: usize, source: usize) -> Result<()> {
-    let mut data = doc.required(source, "ref")?;
+    let data = doc.required(source, "ref")?;
     let mime = doc.member(node, "mime")?;
     let encoding = if doc.member(source, "anthropic_text")?.is_some() {
         Encoding::Utf8
@@ -388,40 +388,6 @@ fn register_source(doc: &mut Document, pending: &mut MediaRegistration<'_>, node
         )
     }) {
         pending.registry.update_mime(data, mime);
-    } else if matches!(doc.node(data)?.value, Value::Utf8Media) {
-        // The payload preceded its native type. Decode the retained
-        // logical string, without assembling an encoded scratch body.
-        let logical = data;
-        doc.detach(source, logical)?;
-        data = doc.set(source, "ref", Value::Null)?;
-        let media = pending.registry.register(
-            doc,
-            data,
-            crate::codec::document::Text {
-                source: 0,
-                span: Default::default(),
-            },
-            encoding,
-            kind,
-            mime,
-        )?;
-        let mut publisher = media::Publisher::begin(doc, media, pending.emitter, pending.owner)?;
-        let mut decoder = media::InputDecoder::new(encoding);
-        publisher.collect(pending.emitter, pending.owner, |emit| {
-            let mut chars = doc.chars(logical)?;
-            while let Some(c) = chars.next_scalar()? {
-                decoder.push(c, &mut *emit)?;
-            }
-            if !decoder.complete() {
-                return Err(Error::Schema);
-            }
-            Ok(())
-        })?;
-        publisher.end(pending.emitter, pending.owner)?;
-        pending
-            .registry
-            .retain(doc, *pending.published, pending.owner, pending.reader)?;
-        *pending.published += 1;
     } else {
         let Value::String(text) = doc.node(data)?.value else {
             return Err(Error::Schema);

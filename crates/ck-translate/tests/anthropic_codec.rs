@@ -7,6 +7,9 @@ mod incremental;
 #[path = "anthropic/review.rs"]
 mod review;
 
+#[path = "anthropic/findings.rs"]
+mod findings;
+
 #[path = "anthropic/golden.rs"]
 mod golden;
 
