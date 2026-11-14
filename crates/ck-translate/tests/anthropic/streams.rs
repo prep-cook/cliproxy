@@ -44,46 +44,14 @@ fn expected(rows: &[Value]) -> Option<(Vec<Value>, Value)> {
                 if !open.contains(&index) {
                     return None;
                 }
-                let block = &mut blocks[*indices.get(&index)?];
-                let delta = &row["delta"];
-                match delta["type"].as_str()? {
-                    "text_delta" | "thinking_delta" | "signature_delta" => {
-                        let field = match delta["type"].as_str()? {
-                            "text_delta" => "text",
-                            "thinking_delta" => "thinking",
-                            _ => "signature",
-                        };
-                        let mut text = block[field].as_str().unwrap_or_default().to_owned();
-                        text.push_str(delta[field].as_str()?);
-                        block[field] = json!(text);
-                    }
-                    "input_json_delta" => arguments
-                        .entry(index)
-                        .or_default()
-                        .push_str(delta["partial_json"].as_str()?),
-                    "citations_delta" => {
-                        if block.get("citations").is_none() {
-                            block["citations"] = json!([]);
-                        }
-                        block["citations"].as_array_mut()?.push(delta["citation"].clone());
-                    }
-                    _ => {}
-                }
+                apply_delta(&mut blocks[*indices.get(&index)?], &mut arguments, index, &row["delta"])?;
             }
             "content_block_stop" => {
                 let index = row["index"].as_u64()?;
                 if !open.remove(&index) {
                     return None;
                 }
-                let block = &mut blocks[*indices.get(&index)?];
-                if let Some(text) = arguments.remove(&index) {
-                    block["input"] = serde_json::from_str(&text).ok()?;
-                }
-                if matches!(block["type"].as_str(), Some("tool_use" | "server_tool_use"))
-                    && block.get("input").is_some_and(|input| !input.is_object())
-                {
-                    return None;
-                }
+                close_block(&mut blocks[*indices.get(&index)?], arguments.remove(&index))?;
             }
             "message_delta" => {
                 if !started || !row["delta"].is_object() {
@@ -108,6 +76,47 @@ fn expected(rows: &[Value]) -> Option<(Vec<Value>, Value)> {
         }
     }
     stopped.then_some((blocks, reason))
+}
+
+/// Applies one content block delta to the expected block; `None` for an invalid delta.
+fn apply_delta(block: &mut Value, arguments: &mut BTreeMap<u64, String>, index: u64, delta: &Value) -> Option<()> {
+    match delta["type"].as_str()? {
+        "text_delta" | "thinking_delta" | "signature_delta" => {
+            let field = match delta["type"].as_str()? {
+                "text_delta" => "text",
+                "thinking_delta" => "thinking",
+                _ => "signature",
+            };
+            let mut text = block[field].as_str().unwrap_or_default().to_owned();
+            text.push_str(delta[field].as_str()?);
+            block[field] = json!(text);
+        }
+        "input_json_delta" => arguments
+            .entry(index)
+            .or_default()
+            .push_str(delta["partial_json"].as_str()?),
+        "citations_delta" => {
+            if block.get("citations").is_none() {
+                block["citations"] = json!([]);
+            }
+            block["citations"].as_array_mut()?.push(delta["citation"].clone());
+        }
+        _ => {}
+    }
+    Some(())
+}
+
+/// Completes a stopped block's tool input; `None` when a tool input is not an object.
+fn close_block(block: &mut Value, arguments: Option<String>) -> Option<()> {
+    if let Some(text) = arguments {
+        block["input"] = serde_json::from_str(&text).ok()?;
+    }
+    if matches!(block["type"].as_str(), Some("tool_use" | "server_tool_use"))
+        && block.get("input").is_some_and(|input| !input.is_object())
+    {
+        return None;
+    }
+    Some(())
 }
 
 #[test]
