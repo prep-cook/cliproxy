@@ -2,6 +2,8 @@
 mod audio;
 #[path = "responses/cross.rs"]
 mod cross;
+#[path = "responses/events.rs"]
+mod events;
 #[path = "responses/execution.rs"]
 mod execution;
 #[path = "responses/finish.rs"]
@@ -423,6 +425,7 @@ fn full_reasoning_and_summary_have_independent_block_identity() {
         assert_ne!(blocks[0]["x_ck"]["block_index"], blocks[1]["x_ck"]["block_index"]);
         if downstream == BodyMode::Buffered {
             let value: Value = serde_json::from_slice(&output).unwrap();
+            assert_eq!(value["output"][0]["content"][0]["type"], "reasoning_text");
             assert_eq!(value["output"][0]["content"][0]["text"], "full");
             assert_eq!(value["output"][0]["summary"][0]["text"], "brief");
         } else {
