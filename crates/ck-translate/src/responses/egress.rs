@@ -179,10 +179,14 @@ impl<F: FnMut(&'static str, u64)> Egress<F> {
             }
             return super::opaque::retain(&mut self.document, incoming);
         }
-        if matches!(
-            kind,
-            Kind::Grounding | Kind::CodeExecution | Kind::UrlContext | Kind::Operation
-        ) {
+        let native_execution = incoming
+            .member(x, "source")?
+            .map(|source| is(&incoming, source, "protocol", "responses"))
+            .transpose()?
+            .unwrap_or(false);
+        if matches!(kind, Kind::UrlContext | Kind::Operation)
+            || (matches!(kind, Kind::Grounding | Kind::CodeExecution) && !native_execution)
+        {
             (self.diagnostic)("unsupported event", 0);
             return Ok(());
         }
@@ -368,6 +372,9 @@ impl<F: FnMut(&'static str, u64)> Egress<F> {
             return Ok(());
         }
         if kind == Kind::ToolStart {
+            if is(doc, node, "kind", "server")? && super::response::Server::from_item(doc, item)?.is_some() {
+                return Ok(());
+            }
             if is(doc, node, "kind", "custom")? {
                 doc.set(item, "type", Value::Text("custom_tool_call"))?;
             } else {
@@ -455,6 +462,60 @@ impl<F: FnMut(&'static str, u64)> Egress<F> {
                 output,
             );
         }
+        if matches!(kind, Kind::ToolResult | Kind::Grounding | Kind::CodeExecution) {
+            let source = doc.member(x, "source")?;
+            let server = super::response::Server::from_item(doc, item)?;
+            if let (Some(source), Some(server)) = (source, server)
+                && is(doc, source, "protocol", "responses")?
+            {
+                let value = doc.required(node, "value")?;
+                if kind == Kind::CodeExecution
+                    && server == super::response::Server::Code
+                    && is(doc, node, "phase", "code")?
+                {
+                    if matches!(doc.node(value)?.value, Value::Null) {
+                        doc.set(item, "code", Value::Null)?;
+                        return Ok(());
+                    }
+                    let done = is(doc, source, "event", "response.code_interpreter_call_code.done")?;
+                    if let Some(code) = doc.member(item, "code")?
+                        && matches!(doc.node(code)?.value, Value::Null)
+                    {
+                        doc.remove(item, "code")?;
+                    }
+                    doc.detach(node, value)?;
+                    append_fragment(doc, item, "code", value)?;
+                    let payload = encode::scratch(owner, |e| {
+                        item_fields(doc, item, index, e)?;
+                        if done {
+                            super::member(doc, item, "code", e)
+                        } else {
+                            e.bytes(b",\"delta\":")?;
+                            doc.write(value, e)
+                        }
+                    })?;
+                    return self.emit(
+                        owner,
+                        if done {
+                            "response.code_interpreter_call_code.done"
+                        } else {
+                            "response.code_interpreter_call_code.delta"
+                        },
+                        |e| write_lease(&payload, e),
+                        output,
+                    );
+                }
+                for field in server.fields() {
+                    if is(doc, x, "responses_field", field)? {
+                        let target = doc.set(item, field, Value::Null)?;
+                        doc.transplant(target, value)?;
+                        return Ok(());
+                    }
+                }
+            }
+            (self.diagnostic)("unsupported execution event", 0);
+            return Ok(());
+        }
         if kind == Kind::Chunk {
             let choices = doc.required(node, "choices")?;
             if let Some(choice) = doc.node(choices)?.first {
@@ -474,6 +535,8 @@ impl<F: FnMut(&'static str, u64)> Egress<F> {
                             append_fragment(doc, item, field, args)?;
                             let name = if custom {
                                 "response.custom_tool_call_input.delta"
+                            } else if is(doc, item, "type", "mcp_call")? {
+                                "response.mcp_call_arguments.delta"
                             } else {
                                 "response.function_call_arguments.delta"
                             };
@@ -609,7 +672,13 @@ impl<F: FnMut(&'static str, u64)> Egress<F> {
             );
         }
         if kind == Kind::ToolEnd {
+            if let Some(server) = super::response::Server::from_item(doc, item)?
+                && (server != super::response::Server::Mcp || doc.member(item, "arguments")?.is_none())
+            {
+                return Ok(());
+            }
             let custom = is(doc, item, "type", "custom_tool_call")?;
+            let mcp = is(doc, item, "type", "mcp_call")?;
             let field = if custom { "input" } else { "arguments" };
             let payload = encode::scratch(owner, |e| {
                 item_fields(doc, item, index, e)?;
@@ -619,6 +688,8 @@ impl<F: FnMut(&'static str, u64)> Egress<F> {
                 owner,
                 if custom {
                     "response.custom_tool_call_input.done"
+                } else if mcp {
+                    "response.mcp_call_arguments.done"
                 } else {
                     "response.function_call_arguments.done"
                 },
@@ -630,15 +701,17 @@ impl<F: FnMut(&'static str, u64)> Egress<F> {
             if let Some(attrs) = doc.member(node, "attributes")? {
                 super::merge(doc, item, attrs)?;
             }
-            doc.set(
-                item,
-                "status",
-                Value::Text(if is(doc, node, "status", "incomplete")? {
-                    "incomplete"
-                } else {
-                    "completed"
-                }),
-            )?;
+            if doc.member(item, "status")?.is_none() || is(doc, item, "status", "in_progress")? {
+                doc.set(
+                    item,
+                    "status",
+                    Value::Text(if is(doc, node, "status", "incomplete")? {
+                        "incomplete"
+                    } else {
+                        "completed"
+                    }),
+                )?;
+            }
             for (field, index_field) in [("content", "content_index"), ("summary", "summary_index")] {
                 if let Some(parts) = doc.member(item, field)? {
                     order_array(doc, parts, index_field, owner)?;

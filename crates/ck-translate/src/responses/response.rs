@@ -10,6 +10,10 @@ use crate::codec::{
 };
 use ck_stream::{MetadataPermit, Writer};
 
+#[path = "response_tools.rs"]
+mod tools;
+pub(super) use tools::Server;
+
 pub struct Ingress {
     owner: u64,
     source: Option<Source>,
@@ -134,6 +138,12 @@ struct Item {
     closed: bool,
     arguments: Option<usize>,
     tool_closed: bool,
+    arguments_done: bool,
+    server: Option<Server>,
+    code: Option<usize>,
+    code_closed: bool,
+    code_null: bool,
+    results: Option<usize>,
     encrypted: bool,
     image: Option<[u8; 32]>,
 }
@@ -332,7 +342,10 @@ impl State {
             let index = doc.unsigned(doc.required(root, if summary { "summary_index" } else { "content_index" })?)?;
             let part = doc.required(root, "part")?;
             self.block(owner, at, (index, summary), &doc, part, (true, true))?;
-        } else if self.text_event(owner, &doc)? || self.audio_event(owner, &doc)? {
+        } else if self.text_event(owner, &doc)?
+            || self.audio_event(owner, &doc)?
+            || self.execution_event(owner, &doc)?
+        {
         } else if is(&doc, root, "type", "response.image_generation_call.partial_image")? {
             let at = self.find_event(&doc)?;
             let data = doc.required(root, "partial_image_b64")?;
@@ -340,12 +353,14 @@ impl State {
             self.image(owner, at, &doc, data, Some(partial))?;
         } else if is(&doc, root, "type", "response.function_call_arguments.delta")?
             || is(&doc, root, "type", "response.custom_tool_call_input.delta")?
+            || is(&doc, root, "type", "response.mcp_call_arguments.delta")?
         {
             let at = self.find_event(&doc)?;
             let delta = doc.required(root, "delta")?;
             self.arguments(owner, at, &doc, delta, false)?;
         } else if is(&doc, root, "type", "response.function_call_arguments.done")?
             || is(&doc, root, "type", "response.custom_tool_call_input.done")?
+            || is(&doc, root, "type", "response.mcp_call_arguments.done")?
         {
             let at = self.find_event(&doc)?;
             let custom = self.items[at].custom()?;
@@ -396,6 +411,7 @@ impl State {
                 "part",
                 "delta",
                 "text",
+                "code",
                 "refusal",
                 "arguments",
                 "input",
@@ -524,7 +540,10 @@ impl State {
         let native = super::mapped(owner, |e| item_metadata(doc, node, e))?;
         let root = native.root();
         let id = media::local_id(b'i', index)?;
-        let tool = is(&native, root, "type", "function_call")? || is(&native, root, "type", "custom_tool_call")?;
+        let server = Server::from_item(&native, root)?;
+        let tool = server.is_some()
+            || is(&native, root, "type", "function_call")?
+            || is(&native, root, "type", "custom_tool_call")?;
         let scope = Scope {
             choice_index: Some(0),
             item_id: Some(id),
@@ -577,7 +596,13 @@ impl State {
             metadata: owner.reserve_metadata(0)?,
             closed: false,
             arguments: None,
+            arguments_done: false,
             tool_closed: false,
+            server,
+            code: None,
+            code_closed: false,
+            code_null: false,
+            results: None,
             encrypted: false,
             image: None,
         };
@@ -589,9 +614,21 @@ impl State {
                 item.scope(None),
                 |e| {
                     e.bytes(b",\"name\":")?;
-                    item.doc.write(item.doc.required(root, "name")?, e)?;
+                    if let Some(name) = item.doc.member(root, "name")? {
+                        item.doc.write(name, e)?;
+                    } else if let Some(server) = server {
+                        e.string(server.name())?;
+                    } else {
+                        return Err(Error::Schema);
+                    }
                     e.bytes(b",\"kind\":")?;
-                    e.string(if custom { "custom" } else { "function" })?;
+                    e.string(if server.is_some() {
+                        "server"
+                    } else if custom {
+                        "custom"
+                    } else {
+                        "function"
+                    })?;
                     e.bytes(b",\"arguments_format\":")?;
                     e.string(if custom { "text" } else { "json" })?;
                     super::member(&item.doc, root, "namespace", e)
@@ -857,7 +894,7 @@ impl State {
             super::mapped(owner, |e| doc.write(node, e))?
         };
         let empty = fragment.chars(fragment.root())?.next_scalar()?.is_none();
-        if item.tool_closed && !empty {
+        if (item.tool_closed || item.arguments_done) && !empty {
             return Err(Error::Schema);
         }
         if !empty || item.arguments.is_none() {
@@ -883,6 +920,10 @@ impl State {
         }
         if snapshot && !item.tool_closed {
             validate_arguments(owner, item)?;
+            item.arguments_done = true;
+            if item.server.is_some() {
+                return Ok(());
+            }
             self.emitter.emit(
                 owner,
                 Kind::ToolEnd,
@@ -923,7 +964,9 @@ impl State {
             }
         }
         let custom = self.items[at].custom()?;
-        if self.items[at].tool.is_some() {
+        if self.items[at].server.is_some() {
+            self.server_snapshot(owner, at, doc, node, close)?;
+        } else if self.items[at].tool.is_some() {
             if let Some(arguments) = doc.member(node, if custom { "input" } else { "arguments" })? {
                 self.arguments(owner, at, doc, arguments, close)?;
             } else if close && !self.items[at].tool_closed {
@@ -1378,7 +1421,45 @@ fn equal(a: &Document, an: usize, b: &Document, bn: usize) -> Result<bool> {
 }
 
 fn item_metadata(doc: &Document, node: usize, e: &mut Encoder<'_, '_>) -> Result<()> {
-    let fields: &[&str] = if is(doc, node, "type", "image_generation_call")? {
+    let fields: &[&str] = if let Some(server) = Server::from_item(doc, node)? {
+        match server {
+            Server::Code => &[
+                "content",
+                "summary",
+                "arguments",
+                "input",
+                "encrypted_content",
+                "outputs",
+                "code",
+            ],
+            Server::Web => &[
+                "content",
+                "summary",
+                "arguments",
+                "input",
+                "encrypted_content",
+                "action",
+                "results",
+            ],
+            Server::File => &[
+                "content",
+                "summary",
+                "arguments",
+                "input",
+                "encrypted_content",
+                "results",
+            ],
+            Server::Mcp => &[
+                "content",
+                "summary",
+                "arguments",
+                "input",
+                "encrypted_content",
+                "output",
+                "error",
+            ],
+        }
+    } else if is(doc, node, "type", "image_generation_call")? {
         &[
             "content",
             "summary",
