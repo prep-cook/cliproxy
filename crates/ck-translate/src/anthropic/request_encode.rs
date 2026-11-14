@@ -230,8 +230,12 @@ fn message_value(view: RequestView<'_>, message: usize, message_index: u64, e: &
         e.bytes(b"[")?;
         let content = doc.member(message, "content")?;
         let mut part = content.and_then(|n| doc.node(n).ok().and_then(|n| n.first));
-        let string_content =
-            content.filter(|n| matches!(doc.node(*n).map(|n| n.value), Ok(Value::String(_) | Value::Text(_))));
+        let string_content = content.filter(|n| {
+            matches!(
+                doc.node(*n).map(|n| n.value),
+                Ok(Value::String(_) | Value::Text(_) | Value::Fragments | Value::Utf8Media)
+            )
+        });
         let mut call = doc.node(calls)?.first;
         let mut first = true;
         let mut block_index = 0;

@@ -87,7 +87,7 @@ pub(super) fn validate(view: RequestView<'_>) -> Result<()> {
         }
         if let Some(content) = doc.member(message, "content")? {
             match doc.node(content)?.value {
-                Value::String(_) | Value::Text(_) | Value::Fragments => (),
+                Value::String(_) | Value::Text(_) | Value::Fragments | Value::Utf8Media => (),
                 Value::Array => {
                     for part in doc.children(content)? {
                         validate_part(view, message, part)?;

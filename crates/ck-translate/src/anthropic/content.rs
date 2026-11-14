@@ -18,7 +18,7 @@ pub(super) fn normalize(owner: &mut Writer, doc: &mut Document, message: usize, 
     super::request::capture(owner, doc, message, &["role", "content", "cache_control"], original)?;
     let content = doc.required(message, "content")?;
     match doc.node(content)?.value {
-        Value::String(_) => (),
+        Value::String(_) | Value::Utf8Media => (),
         Value::Array => {
             let mut next = doc.node(content)?.first;
             let mut block_index = 0;
@@ -173,13 +173,14 @@ fn normalize_part(
         let id = doc.required(part, "tool_use_id")?;
         doc.rename(id, "tool_call_id")?;
         if let Some(content) = doc.member(part, "content")? {
-            if matches!(doc.node(content)?.value, Value::String(_)) {
-                let text = doc.add(Some(Name::Static("text")), doc.node(content)?.value)?;
-                doc.replace(content, Value::Array)?;
+            if matches!(doc.node(content)?.value, Value::String(_) | Value::Utf8Media) {
+                doc.detach(part, content)?;
+                doc.rename(content, "text")?;
+                let array = doc.set(part, "content", Value::Array)?;
                 let item = doc.add(None, Value::Object)?;
-                doc.append(content, item)?;
+                doc.append(array, item)?;
                 doc.set(item, "type", Value::Text("text"))?;
-                doc.append(item, text)?;
+                doc.append(item, content)?;
                 let marker = doc.add(Some(Name::Static("content_shape")), Value::Text("string"))?;
                 super::request::preserve(owner, doc, original, part, marker, Some("shape"))?;
             } else if matches!(doc.node(content)?.value, Value::Array) {
@@ -241,17 +242,28 @@ pub(super) fn cache(owner: &mut Writer, doc: &mut Document, parent: usize) -> Re
     let list = doc.required(x, "cache_control")?;
     super::request::preserve(owner, doc, list, parent, cache, None)
 }
-pub(super) fn register_media(doc: &mut Document, registry: &mut Registry) -> Result<()> {
-    fn walk(doc: &mut Document, registry: &mut Registry, node: usize) -> Result<()> {
+pub(super) fn register_media(
+    doc: &mut Document,
+    registry: &mut Registry,
+    owner: &mut Writer,
+    emitter: &mut crate::codec::event::Emitter,
+    reader: &mut ck_stream::Reader,
+    published: &mut usize,
+) -> Result<()> {
+    let mut pending = MediaRegistration {
+        registry,
+        owner,
+        emitter,
+        reader,
+        published,
+    };
+    fn walk(doc: &mut Document, pending: &mut MediaRegistration<'_>, node: usize) -> Result<()> {
         if matches!(doc.node(node)?.value, Value::Object)
             && (super::is(doc, node, "type", "image")? || super::is(doc, node, "type", "document")?)
         {
             let source = doc.required(node, "source")?;
             if super::is(doc, source, "kind", "data")? {
-                let data = doc.required(source, "ref")?;
-                let Value::String(text) = doc.node(data)?.value else {
-                    return Err(Error::Schema);
-                };
+                let mut data = doc.required(source, "ref")?;
                 let mime = doc.member(node, "mime")?;
                 let encoding = if doc.member(source, "anthropic_text")?.is_some() {
                     Encoding::Utf8
@@ -263,7 +275,59 @@ pub(super) fn register_media(doc: &mut Document, registry: &mut Registry) -> Res
                 } else {
                     "document"
                 };
-                registry.register(doc, data, text, encoding, kind, mime)?;
+                let registered = pending.registry.get(doc, data)?;
+                if registered.is_some_and(|media| {
+                    matches!(
+                        (media.encoding, encoding),
+                        (Encoding::Base64, Encoding::Base64) | (Encoding::Utf8, Encoding::Utf8)
+                    )
+                }) {
+                    pending.registry.update_mime(data, mime);
+                } else if matches!(doc.node(data)?.value, Value::Utf8Media) {
+                    // The payload preceded its native type. Decode the retained
+                    // logical string, without assembling an encoded scratch body.
+                    let logical = data;
+                    doc.detach(source, logical)?;
+                    data = doc.set(source, "ref", Value::Null)?;
+                    let media = pending.registry.register(
+                        doc,
+                        data,
+                        crate::codec::document::Text {
+                            source: 0,
+                            span: Default::default(),
+                        },
+                        encoding,
+                        kind,
+                        mime,
+                    )?;
+                    let mut publisher = media::Publisher::begin(doc, media, pending.emitter, pending.owner)?;
+                    let mut decoder = media::InputDecoder::new(encoding);
+                    publisher.collect(pending.emitter, pending.owner, |emit| {
+                        let mut chars = doc.chars(logical)?;
+                        while let Some(c) = chars.next_scalar()? {
+                            decoder.push(c, &mut *emit)?;
+                        }
+                        if !decoder.complete() {
+                            return Err(Error::Schema);
+                        }
+                        Ok(())
+                    })?;
+                    publisher.end(pending.emitter, pending.owner)?;
+                    pending
+                        .registry
+                        .retain(doc, *pending.published, pending.owner, pending.reader)?;
+                    *pending.published += 1;
+                } else {
+                    let Value::String(text) = doc.node(data)?.value else {
+                        return Err(Error::Schema);
+                    };
+                    let media = pending.registry.register(doc, data, text, encoding, kind, mime)?;
+                    media::publish(doc, media, pending.emitter, pending.owner, Default::default())?;
+                    pending
+                        .registry
+                        .retain(doc, *pending.published, pending.owner, pending.reader)?;
+                    *pending.published += 1;
+                }
                 return Ok(());
             }
         }
@@ -271,13 +335,13 @@ pub(super) fn register_media(doc: &mut Document, registry: &mut Registry) -> Res
             let mut child = doc.node(node)?.first;
             while let Some(index) = child {
                 child = doc.node(index)?.next;
-                walk(doc, registry, index)?;
+                walk(doc, pending, index)?;
             }
         } else if matches!(doc.node(node)?.value, Value::Object)
             && super::is(doc, node, "type", "tool_result")?
             && let Some(content) = doc.member(node, "content")?
         {
-            walk(doc, registry, content)?;
+            walk(doc, pending, content)?;
         }
         Ok(())
     }
@@ -287,8 +351,16 @@ pub(super) fn register_media(doc: &mut Document, registry: &mut Registry) -> Res
     while let Some(node) = message {
         message = doc.node(node)?.next;
         if let Some(content) = doc.member(node, "content")? {
-            walk(doc, registry, content)?;
+            walk(doc, &mut pending, content)?;
         }
     }
     Ok(())
+}
+
+struct MediaRegistration<'a> {
+    registry: &'a mut Registry,
+    owner: &'a mut Writer,
+    emitter: &'a mut crate::codec::event::Emitter,
+    reader: &'a mut ck_stream::Reader,
+    published: &'a mut usize,
 }

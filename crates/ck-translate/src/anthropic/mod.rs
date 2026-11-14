@@ -37,7 +37,10 @@ fn failure(emitter: &mut Emitter, owner: &mut Writer, client: bool) -> Result<()
 }
 
 fn string(doc: &Document, node: usize) -> Result<()> {
-    if matches!(doc.node(node)?.value, Value::String(_) | Value::Text(_) | Value::Id(_)) {
+    if matches!(
+        doc.node(node)?.value,
+        Value::String(_) | Value::Text(_) | Value::Id(_) | Value::Fragments | Value::Utf8Media
+    ) {
         Ok(())
     } else {
         Err(Error::Schema)

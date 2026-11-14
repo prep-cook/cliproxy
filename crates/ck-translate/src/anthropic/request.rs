@@ -1,18 +1,23 @@
 use crate::codec::{
     self, Capability, Error, Operation, RequestFence, RequestView, Result, ValidatedRequest,
-    document::{Document, Name, Value},
+    document::{Document, Name, Value, pending::Pending},
     encode,
     event::{Emitter, Identity, Kind, Scope},
     json,
     media::{self, Registry},
-    source::Source,
 };
 use ck_stream::{ScratchLease, Writer};
 
+#[path = "request_stream.rs"]
+mod stream;
+
 pub struct Ingress {
     owner: u64,
-    source: Option<Source>,
-    scanner: Option<json::Scanner>,
+    input: Option<Pending>,
+    active: Option<stream::StringState>,
+    started: bool,
+    last_field: Option<usize>,
+    published_media: usize,
     document: Option<Document>,
     media: Registry,
     emitter: Emitter,
@@ -34,8 +39,11 @@ impl Ingress {
         }
         Ok(Self {
             owner: owner.id(),
-            source: Some(Source::new(owner)?),
-            scanner: Some(json::Scanner::new(owner, max_bytes)?),
+            input: Some(Pending::new(owner, max_bytes)?),
+            active: None,
+            started: false,
+            last_field: None,
+            published_media: 0,
             document: None,
             media: Registry::new(owner)?,
             emitter: Emitter::new(identity),
@@ -46,29 +54,28 @@ impl Ingress {
         })
     }
     fn prepare(&mut self, owner: &mut Writer) -> Result<()> {
-        let source = self.source.take().ok_or(Error::Closed)?;
-        let mut scanner = self.scanner.take().ok_or(Error::Closed)?;
-        scanner.finish(&source)?;
-        let mut doc = Document::from_scanned(owner, source, scanner)?;
+        self.input.as_mut().ok_or(Error::Closed)?.finish()?;
+        self.consume(owner)?;
+        let mut doc = self.input.take().ok_or(Error::Closed)?.document;
+        self.media.validate_registrations(&doc)?;
         normalize(owner, &mut doc, self.operation)?;
-        super::content::register_media(&mut doc, &mut self.media)?;
+        self.media.relocate_ingress(&doc)?;
+        super::content::register_media(
+            &mut doc,
+            &mut self.media,
+            owner,
+            &mut self.emitter,
+            &mut self.reader,
+            &mut self.published_media,
+        )?;
         super::request_schema::validate(RequestView {
             document: &doc,
             media: &self.media,
             operation: self.operation,
         })?;
-        for media in self.media.entries() {
+        for media in self.media.entries().filter(|media| media.data.is_some()) {
             media::bytes(&doc, media, |_| Ok(()))?;
         }
-        self.emitter.request_start(
-            owner,
-            RequestView {
-                document: &doc,
-                media: &self.media,
-                operation: self.operation,
-            },
-        )?;
-        codec::internal::next(owner, &mut self.reader)?;
         let root = doc.root();
         fields(
             &mut doc,
@@ -79,7 +86,7 @@ impl Ingress {
             owner,
             &mut self.reader,
         )?;
-        for index in 0..self.media.len() {
+        for index in self.published_media..self.media.len() {
             media::publish(&doc, self.media.at(index), &mut self.emitter, owner, Scope::default())?;
             self.media.retain(&mut doc, index, owner, &mut self.reader)?;
         }
@@ -90,8 +97,7 @@ impl Ingress {
 }
 impl codec::RequestIngress for Ingress {
     fn flush_deadline(&self) -> Option<std::time::Instant> {
-        // The request is buffered and published only by finish.
-        None
+        self.pending_deadline()
     }
 
     fn advance(&mut self, owner: &mut Writer, bytes: &[u8]) -> Result<()> {
@@ -102,9 +108,14 @@ impl codec::RequestIngress for Ingress {
             return Err(Error::Closed);
         }
         let result = (|| {
-            let source = self.source.as_mut().ok_or(Error::Closed)?;
-            source.push_bytes(owner, bytes)?;
-            self.scanner.as_mut().ok_or(Error::Closed)?.advance(source)
+            if bytes.is_empty() {
+                self.flush_pending(owner)?;
+            }
+            for chunk in bytes.chunks(8192) {
+                self.input.as_mut().ok_or(Error::Closed)?.advance(owner, chunk)?;
+                self.consume(owner)?;
+            }
+            Ok(())
         })();
         if let Err(error) = result {
             self.closed = true;
@@ -458,43 +469,50 @@ fn fields(
         return Err(Error::Limit);
     }
     let registered = registry.get(doc, node)?;
-    emitter.emit(
-        owner,
-        Kind::RequestField,
-        Scope::default(),
-        |e| {
-            e.bytes(b",\"pointer\":\"")?;
-            for component in path[..depth].iter().flatten() {
-                e.bytes(b"/")?;
-                match component {
-                    Component::Index(index) => e.unsigned(*index)?,
-                    Component::Name(name) => {
-                        let mut chars = doc.name_chars(*name)?;
-                        while let Some(c) = chars.next_scalar()? {
-                            match c {
-                                '~' => e.bytes(b"~0")?,
-                                '/' => e.bytes(b"~1")?,
-                                c => e.escaped(c.encode_utf8(&mut [0; 4]))?,
+    if doc.published(node)? {
+        if registered.is_some() {
+            return Ok(());
+        }
+    } else {
+        emitter.emit(
+            owner,
+            Kind::RequestField,
+            Scope::default(),
+            |e| {
+                e.bytes(b",\"pointer\":\"")?;
+                for component in path[..depth].iter().flatten() {
+                    e.bytes(b"/")?;
+                    match component {
+                        Component::Index(index) => e.unsigned(*index)?,
+                        Component::Name(name) => {
+                            let mut chars = doc.name_chars(*name)?;
+                            while let Some(c) = chars.next_scalar()? {
+                                match c {
+                                    '~' => e.bytes(b"~0")?,
+                                    '/' => e.bytes(b"~1")?,
+                                    c => e.escaped(c.encode_utf8(&mut [0; 4]))?,
+                                }
                             }
                         }
                     }
                 }
-            }
-            e.bytes(b"\",\"value\":")?;
-            if let Some(media) = registered {
-                media::write_reference(media, e)
-            } else {
-                match doc.node(node)?.value {
-                    Value::Object => e.bytes(b"{}"),
-                    Value::Array => e.bytes(b"[]"),
-                    _ => doc.write(node, e),
+                e.bytes(b"\",\"value\":")?;
+                if let Some(media) = registered {
+                    media::write_reference(media, e)
+                } else {
+                    match doc.node(node)?.value {
+                        Value::Object => e.bytes(b"{}"),
+                        Value::Array => e.bytes(b"[]"),
+                        _ => doc.write(node, e),
+                    }
                 }
-            }
-        },
-        |_| Ok(()),
-    )?;
-    let (_, event) = codec::internal::next(owner, reader)?;
-    doc.bind_field(node, event)?;
+            },
+            |_| Ok(()),
+        )?;
+        let (_, event) = codec::internal::next(owner, reader)?;
+        doc.bind_field(node, event)?;
+        doc.mark_published(node);
+    }
     if registered.is_some() {
         return Ok(());
     }

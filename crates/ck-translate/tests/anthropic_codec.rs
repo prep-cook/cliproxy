@@ -1,3 +1,6 @@
+#[path = "anthropic/incremental.rs"]
+mod incremental;
+
 #[path = "anthropic/review.rs"]
 mod review;
 
@@ -353,7 +356,13 @@ fn native_image_bytes_mime_and_unknown_source_fields_survive() {
     let mut expected = input;
     expected["stream"] = json!(true);
     assert_eq!(out, expected);
-    assert!(canonical.iter().any(|v| v["bytes"] == "AAECAw=="));
+    use base64::Engine;
+    let decoded: Vec<_> = canonical
+        .iter()
+        .filter_map(|event| event["bytes"].as_str())
+        .flat_map(|value| base64::engine::general_purpose::STANDARD.decode(value).unwrap())
+        .collect();
+    assert_eq!(decoded, [0, 1, 2, 3]);
     assert!(!canonical.iter().any(|v| v["value"] == "AAECAw=="));
 }
 
