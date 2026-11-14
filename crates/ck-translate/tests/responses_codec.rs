@@ -6,6 +6,8 @@ mod cross;
 mod events;
 #[path = "responses/execution.rs"]
 mod execution;
+#[path = "responses/final_events.rs"]
+mod final_events;
 #[path = "responses/final_review.rs"]
 mod final_review;
 #[path = "responses/finish.rs"]

@@ -379,7 +379,12 @@ fn redacted_reasoning_has_no_responses_carrier() {
 }
 
 /// Streamed Responses `records` replayed to a client in `downstream` mode, or the ingress error.
-fn try_streamed(records: &[Value], downstream: BodyMode) -> codec::Result<(Vec<u8>, Vec<Value>)> {
+pub(super) fn try_streamed(records: &[Value], downstream: BodyMode) -> codec::Result<(Vec<u8>, Vec<Value>)> {
+    try_raw(wire(records).as_bytes(), downstream)
+}
+
+/// Raw Responses SSE `input` replayed to a client in `downstream` mode, or the ingress error.
+pub(super) fn try_raw(input: &[u8], downstream: BodyMode) -> codec::Result<(Vec<u8>, Vec<Value>)> {
     let mut m = Mapped::new();
     let mut ingress = responses::response::Ingress::new(
         &mut m.writer,
@@ -397,7 +402,7 @@ fn try_streamed(records: &[Value], downstream: BodyMode) -> codec::Result<(Vec<u
         |_, _| {},
     )?;
     let ingested = ingress
-        .advance(&mut m.writer, wire(records).as_bytes())
+        .advance(&mut m.writer, input)
         .and_then(|()| ingress.finish(&mut m.writer));
     let mut out = Vec::new();
     while let std::task::Poll::Ready(Some(ck_stream::Read::Record(lease))) = reader.try_next() {

@@ -40,16 +40,10 @@ impl Server {
 }
 
 impl State {
-    pub(super) fn execution_event(&mut self, owner: &mut Writer, doc: &Document) -> Result<bool> {
-        let root = doc.root();
-        let done = is(doc, root, "type", "response.code_interpreter_call_code.done")?;
-        if !done && !is(doc, root, "type", "response.code_interpreter_call_code.delta")? {
-            return Ok(false);
-        }
+    pub(super) fn code_event(&mut self, owner: &mut Writer, doc: &Document, done: bool) -> Result<()> {
         let at = self.find_event(doc)?;
-        let code = doc.required(root, if done { "code" } else { "delta" })?;
-        self.code(owner, at, doc, code, done)?;
-        Ok(true)
+        let code = doc.required(doc.root(), if done { "code" } else { "delta" })?;
+        self.code(owner, at, doc, code, done)
     }
 
     fn code(&mut self, owner: &mut Writer, at: usize, doc: &Document, node: usize, snapshot: bool) -> Result<()> {
