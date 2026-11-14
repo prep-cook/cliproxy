@@ -20,17 +20,33 @@ pub(super) fn write(view: RequestView<'_>, e: &mut Encoder<'_, '_>) -> Result<()
     e.bytes(b"{\"contents\":[")?;
     let messages = doc.required(root, "messages")?;
     let mut first = true;
+    // Consecutive Chat tool messages answer the preceding assistant's calls in one user turn.
+    let (mut calls, mut results) = (None, false);
     for message in doc.children(messages)? {
         if super::is(doc, message, "role", "system")? {
             continue;
         }
-        if !first {
-            e.bytes(b",")?;
+        let tool = super::is(doc, message, "role", "tool")?;
+        if results && !tool {
+            e.bytes(b"]}")?;
         }
-        first = false;
-        write_message(view, message, false, e)?;
+        if !(results && tool) {
+            comma(&mut first, e)?;
+        }
+        if tool {
+            e.bytes(if results {
+                b","
+            } else {
+                b"{\"role\":\"user\",\"parts\":["
+            })?;
+            function_result(doc, message, calls.ok_or(Error::Schema)?, e)?;
+        } else {
+            calls = doc.member(message, "tool_calls")?;
+            write_message(view, message, false, e)?;
+        }
+        results = tool;
     }
-    e.bytes(b"]")?;
+    e.bytes(if results { b"]}]" } else { b"]" })?;
     for message in doc.children(messages)? {
         if super::is(doc, message, "role", "system")? {
             e.bytes(b",\"systemInstruction\":")?;
@@ -393,6 +409,37 @@ fn function_response(doc: &Document, part: usize, synthetic_id: bool, e: &mut En
     }
     super::members(doc, result, &["name"], e)?;
     e.bytes(b"}")
+}
+/// Writes a Chat tool message as a `functionResponse` part: the name of the call it answers,
+/// its id and its text as `response.result`.
+fn function_result(doc: &Document, message: usize, calls: usize, e: &mut Encoder<'_, '_>) -> Result<()> {
+    let id = doc.required(message, "tool_call_id")?;
+    let mut name = None;
+    for call in doc.children(calls)? {
+        if doc.equal_strings(doc.required(call, "id")?, id)? {
+            name = Some(doc.required(doc.required(call, "function")?, "name")?);
+        }
+    }
+    e.bytes(b"{\"functionResponse\":{\"name\":")?;
+    doc.write(name.ok_or(Error::Schema)?, e)?;
+    e.bytes(b",\"id\":")?;
+    doc.write(id, e)?;
+    e.bytes(b",\"response\":{\"result\":")?;
+    match doc.member(message, "content")? {
+        Some(content) if matches!(doc.node(content)?.value, Value::Array) => {
+            e.bytes(b"\"")?;
+            for part in doc.children(content)? {
+                let mut chars = doc.chars(doc.required(part, "text")?)?;
+                while let Some(c) = chars.next_scalar()? {
+                    e.escaped(c.encode_utf8(&mut [0; 4]))?;
+                }
+            }
+            e.bytes(b"\"")?;
+        }
+        Some(content) => doc.write(content, e)?,
+        None => e.bytes(b"\"\"")?,
+    }
+    e.bytes(b"}}}")
 }
 /// Writes `"inlineData":{...}` from a registered payload or `"fileData":{...}` from a URI.
 fn media(view: RequestView<'_>, part: usize, e: &mut Encoder<'_, '_>) -> Result<()> {

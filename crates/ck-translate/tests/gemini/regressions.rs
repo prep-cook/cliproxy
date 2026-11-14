@@ -139,7 +139,7 @@ fn null_generation_config_is_unset() {
 }
 
 /// Encodes a Chat request for Gemini.
-fn chat_to_gemini(input: &[u8]) -> Value {
+pub(super) fn chat_to_gemini(input: &[u8]) -> Value {
     let mut mapped = Mapped::new();
     let mut ingress = codec::chat::request::Ingress::new(
         &mut mapped.writer,
@@ -177,7 +177,7 @@ fn foreign_unknown_members_do_not_reach_gemini() {
     assert_eq!(out["contents"][0]["parts"][0]["text"], "hi");
 }
 
-fn validate(input: &Value) -> codec::Result<()> {
+pub(super) fn validate(input: &Value) -> codec::Result<()> {
     let mut mapped = Mapped::new();
     let bytes = serde_json::to_vec(input).unwrap();
     let mut source = codec::source::Source::new(&mut mapped.writer).unwrap();

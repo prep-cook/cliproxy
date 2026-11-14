@@ -25,14 +25,20 @@ fn messages(view: RequestView<'_>) -> Result<()> {
     let messages = doc.required(root, "messages")?;
     super::array(doc, messages)?;
     let mut system = false;
+    let mut calls = None;
     for message in doc.children(messages)? {
         let role = doc.required(message, "role")?;
+        if doc.string_is(role, "tool")? {
+            tool_message(doc, message, calls)?;
+            continue;
+        }
+        calls = doc.member(message, "tool_calls")?;
         if doc.string_is(role, "system")? {
             if system {
                 return Err(Error::Unsupported);
             }
             system = true;
-        } else if !doc.string_is(role, "user")? && !doc.string_is(role, "assistant")? && !doc.string_is(role, "tool")? {
+        } else if !doc.string_is(role, "user")? && !doc.string_is(role, "assistant")? {
             return Err(Error::Unsupported);
         }
         if let Some(content) = doc.member(message, "content")? {
@@ -67,6 +73,39 @@ fn messages(view: RequestView<'_>) -> Result<()> {
         }
     }
     Ok(())
+}
+/// A Chat tool message answers a call of the preceding message and carries only text.
+fn tool_message(doc: &Document, message: usize, calls: Option<usize>) -> Result<()> {
+    let id = doc.required(message, "tool_call_id")?;
+    super::string(doc, id)?;
+    let mut answered = false;
+    for call in calls
+        .map(|calls| doc.children(calls))
+        .transpose()?
+        .into_iter()
+        .flatten()
+    {
+        answered |= doc.equal_strings(doc.required(call, "id")?, id)?;
+    }
+    if !answered {
+        return Err(Error::Unsupported);
+    }
+    match doc.member(message, "content")? {
+        Some(content) if matches!(doc.node(content)?.value, Value::Array) => {
+            for part in doc.children(content)? {
+                if !super::is(doc, part, "type", "text")? {
+                    return Err(Error::Unsupported);
+                }
+                super::string(doc, doc.required(part, "text")?)?;
+            }
+            Ok(())
+        }
+        Some(content) => match doc.node(content)?.value {
+            Value::String(_) | Value::Text(_) | Value::Fragments => Ok(()),
+            _ => Err(Error::Unsupported),
+        },
+        None => Ok(()),
+    }
 }
 /// Sampling, limits, modalities and tools; Chat controls Gemini cannot express fail.
 fn controls(doc: &Document) -> Result<()> {
