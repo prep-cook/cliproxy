@@ -9,6 +9,37 @@ pub(super) fn write(view: RequestView<'_>, streaming: bool, e: &mut Encoder<'_, 
     let root = doc.root();
     let x = doc.required(root, "x_ck")?;
     e.bytes(b"{")?;
+    if fields(doc, root, e)? {
+        e.bytes(b",")?;
+    }
+    messages(view, root, e)?;
+    if view.operation == Operation::Generate {
+        e.bytes(b",\"stream\":")?;
+        e.bytes(if streaming { b"true" } else { b"false" })?;
+    }
+    thinking(doc, x, e)?;
+    if let Some(provider) = doc.member(x, "provider_parameters")?
+        && let Some(native) = doc.member(provider, "anthropic")?
+    {
+        for field in doc.children(native)? {
+            if doc.name_is(doc.node(field)?.name.ok_or(Error::Schema)?, "output_config")? {
+                continue;
+            }
+            e.bytes(b",")?;
+            doc.write_name(doc.node(field)?.name.ok_or(Error::Schema)?, e)?;
+            e.bytes(b":")?;
+            doc.write(field, e)?;
+        }
+    }
+    output_config(doc, x, e)?;
+    tools(doc, root, x, e)?;
+    tool_choice(doc, root, e)?;
+    originals(doc, root, e)?;
+    e.bytes(b"}")
+}
+/// Writes the top-level fields that map one to one, renaming `stop`; returns whether any
+/// field was written.
+fn fields(doc: &Document, root: usize, e: &mut Encoder<'_, '_>) -> Result<bool> {
     let mut first = true;
     for field in doc.children(root)? {
         let name = doc.node(field)?.name.ok_or(Error::Schema)?;
@@ -44,9 +75,11 @@ pub(super) fn write(view: RequestView<'_>, streaming: bool, e: &mut Encoder<'_, 
             doc.write(field, e)?;
         }
     }
-    if !first {
-        e.bytes(b",")?;
-    }
+    Ok(!first)
+}
+/// Writes `messages` without the system message, then `system` from it.
+fn messages(view: RequestView<'_>, root: usize, e: &mut Encoder<'_, '_>) -> Result<()> {
+    let doc = view.document;
     e.bytes(b"\"messages\":[")?;
     let messages = doc.required(root, "messages")?;
     let mut first_message = true;
@@ -70,143 +103,138 @@ pub(super) fn write(view: RequestView<'_>, streaming: bool, e: &mut Encoder<'_, 
         e.bytes(b",\"system\":")?;
         content(view, doc.required(message, "content")?, message_index, e)?;
     }
-    if view.operation == Operation::Generate {
-        e.bytes(b",\"stream\":")?;
-        e.bytes(if streaming { b"true" } else { b"false" })?;
-    }
-    if let Some(thinking) = doc.member(x, "thinking")?
-        && (doc.member(thinking, "native")?.is_some()
-            || doc.member(thinking, "enabled")?.is_some()
-            || doc.member(thinking, "budget_tokens")?.is_some())
+    Ok(())
+}
+fn thinking(doc: &Document, x: usize, e: &mut Encoder<'_, '_>) -> Result<()> {
+    let Some(thinking) = doc.member(x, "thinking")? else {
+        return Ok(());
+    };
+    if doc.member(thinking, "native")?.is_none()
+        && doc.member(thinking, "enabled")?.is_none()
+        && doc.member(thinking, "budget_tokens")?.is_none()
     {
-        e.bytes(b",\"thinking\":")?;
-        e.bytes(b"{\"type\":")?;
-        let enabled = doc
-            .member(thinking, "enabled")?
-            .map(|n| doc.node(n))
-            .transpose()?
-            .is_some_and(|n| matches!(n.value, Value::Bool(true)));
-        let native = doc.member(thinking, "native")?;
-        let adaptive = native
-            .map(|n| super::is(doc, n, "type", "adaptive"))
-            .transpose()?
-            .unwrap_or(false);
-        e.string(if !enabled {
-            "disabled"
-        } else if adaptive {
-            "adaptive"
-        } else {
-            "enabled"
-        })?;
-        super::member(doc, thinking, "budget_tokens", e)?;
-        if let Some(native) = native {
-            for field in doc.children(native)? {
-                let name = doc.node(field)?.name.ok_or(Error::Schema)?;
-                if doc.name_is(name, "type")? || doc.name_is(name, "budget_tokens")? {
-                    continue;
-                }
-                e.bytes(b",")?;
-                doc.write_name(name, e)?;
-                e.bytes(b":")?;
-                doc.write(field, e)?;
-            }
-        }
-        e.bytes(b"}")?;
+        return Ok(());
     }
-    if let Some(provider) = doc.member(x, "provider_parameters")?
-        && let Some(native) = doc.member(provider, "anthropic")?
-    {
+    e.bytes(b",\"thinking\":")?;
+    e.bytes(b"{\"type\":")?;
+    let enabled = doc
+        .member(thinking, "enabled")?
+        .map(|n| doc.node(n))
+        .transpose()?
+        .is_some_and(|n| matches!(n.value, Value::Bool(true)));
+    let native = doc.member(thinking, "native")?;
+    let adaptive = native
+        .map(|n| super::is(doc, n, "type", "adaptive"))
+        .transpose()?
+        .unwrap_or(false);
+    e.string(if !enabled {
+        "disabled"
+    } else if adaptive {
+        "adaptive"
+    } else {
+        "enabled"
+    })?;
+    super::member(doc, thinking, "budget_tokens", e)?;
+    if let Some(native) = native {
         for field in doc.children(native)? {
-            if doc.name_is(doc.node(field)?.name.ok_or(Error::Schema)?, "output_config")? {
+            let name = doc.node(field)?.name.ok_or(Error::Schema)?;
+            if doc.name_is(name, "type")? || doc.name_is(name, "budget_tokens")? {
                 continue;
             }
             e.bytes(b",")?;
-            doc.write_name(doc.node(field)?.name.ok_or(Error::Schema)?, e)?;
+            doc.write_name(name, e)?;
             e.bytes(b":")?;
             doc.write(field, e)?;
         }
     }
-    output_config(doc, x, e)?;
-    if let Some(tools) = doc.member(root, "tools")? {
-        e.bytes(b",\"tools\":[")?;
-        for (index, tool) in doc.children(tools)?.enumerate() {
-            if index != 0 {
-                e.bytes(b",")?;
-            }
-            if super::is(doc, tool, "type", "server")? {
-                let declarations = doc.required(x, "tools")?;
-                let entry = doc
-                    .children(declarations)?
-                    .find(|entry| doc.origin(*entry).ok().flatten().is_some_and(|(n, _)| n == tool))
-                    .ok_or(Error::Schema)?;
-                let declaration = doc.required(entry, "declaration")?;
-                e.bytes(b"{")?;
-                for (index, field) in doc.children(declaration)?.enumerate() {
-                    if index != 0 {
-                        e.bytes(b",")?;
-                    }
-                    doc.write_name(doc.node(field)?.name.ok_or(Error::Schema)?, e)?;
-                    e.bytes(b":")?;
-                    doc.write(field, e)?;
-                }
-                originals(doc, tool, e)?;
-                e.bytes(b"}")?;
-            } else {
-                let function = doc.required(tool, "function")?;
-                e.bytes(b"{")?;
-                for (i, field) in doc.children(function)?.enumerate() {
-                    if i != 0 {
-                        e.bytes(b",")?;
-                    }
-                    let name = doc.node(field)?.name.ok_or(Error::Schema)?;
-                    if doc.name_is(name, "parameters")? {
-                        e.string("input_schema")?;
-                    } else {
-                        doc.write_name(name, e)?;
-                    }
-                    e.bytes(b":")?;
-                    doc.write(field, e)?;
-                }
-                originals(doc, tool, e)?;
-                e.bytes(b"}")?;
-            }
+    e.bytes(b"}")?;
+    Ok(())
+}
+fn tools(doc: &Document, root: usize, x: usize, e: &mut Encoder<'_, '_>) -> Result<()> {
+    let Some(tools) = doc.member(root, "tools")? else {
+        return Ok(());
+    };
+    e.bytes(b",\"tools\":[")?;
+    for (index, tool) in doc.children(tools)?.enumerate() {
+        if index != 0 {
+            e.bytes(b",")?;
         }
-        e.bytes(b"]")?;
+        if super::is(doc, tool, "type", "server")? {
+            let declarations = doc.required(x, "tools")?;
+            let entry = doc
+                .children(declarations)?
+                .find(|entry| doc.origin(*entry).ok().flatten().is_some_and(|(n, _)| n == tool))
+                .ok_or(Error::Schema)?;
+            let declaration = doc.required(entry, "declaration")?;
+            e.bytes(b"{")?;
+            for (index, field) in doc.children(declaration)?.enumerate() {
+                if index != 0 {
+                    e.bytes(b",")?;
+                }
+                doc.write_name(doc.node(field)?.name.ok_or(Error::Schema)?, e)?;
+                e.bytes(b":")?;
+                doc.write(field, e)?;
+            }
+            originals(doc, tool, e)?;
+            e.bytes(b"}")?;
+        } else {
+            let function = doc.required(tool, "function")?;
+            e.bytes(b"{")?;
+            for (i, field) in doc.children(function)?.enumerate() {
+                if i != 0 {
+                    e.bytes(b",")?;
+                }
+                let name = doc.node(field)?.name.ok_or(Error::Schema)?;
+                if doc.name_is(name, "parameters")? {
+                    e.string("input_schema")?;
+                } else {
+                    doc.write_name(name, e)?;
+                }
+                e.bytes(b":")?;
+                doc.write(field, e)?;
+            }
+            originals(doc, tool, e)?;
+            e.bytes(b"}")?;
+        }
     }
+    e.bytes(b"]")?;
+    Ok(())
+}
+fn tool_choice(doc: &Document, root: usize, e: &mut Encoder<'_, '_>) -> Result<()> {
     let choice = doc.member(root, "tool_choice")?;
     let parallel = doc.member(root, "parallel_tool_calls")?;
-    if choice.is_some() || parallel.is_some() {
-        e.bytes(b",\"tool_choice\":{\"type\":")?;
-        if let Some(choice) = choice {
-            if matches!(doc.node(choice)?.value, Value::Object) {
-                e.string("tool")?;
-                let function = doc.required(choice, "function")?;
-                super::member(doc, function, "name", e)?;
-                originals(doc, choice, e)?;
-            } else {
-                e.string(if doc.string_is(choice, "required")? {
-                    "any"
-                } else if doc.string_is(choice, "none")? {
-                    "none"
-                } else {
-                    "auto"
-                })?;
-                originals(doc, choice, e)?;
-            }
-        } else {
-            e.string("auto")?;
-        }
-        if let Some(parallel) = parallel {
-            let Value::Bool(value) = doc.node(parallel)?.value else {
-                return Err(Error::Schema);
-            };
-            e.bytes(b",\"disable_parallel_tool_use\":")?;
-            e.bytes(if value { b"false" } else { b"true" })?;
-        }
-        e.bytes(b"}")?;
+    if choice.is_none() && parallel.is_none() {
+        return Ok(());
     }
-    originals(doc, root, e)?;
-    e.bytes(b"}")
+    e.bytes(b",\"tool_choice\":{\"type\":")?;
+    if let Some(choice) = choice {
+        if matches!(doc.node(choice)?.value, Value::Object) {
+            e.string("tool")?;
+            let function = doc.required(choice, "function")?;
+            super::member(doc, function, "name", e)?;
+            originals(doc, choice, e)?;
+        } else {
+            e.string(if doc.string_is(choice, "required")? {
+                "any"
+            } else if doc.string_is(choice, "none")? {
+                "none"
+            } else {
+                "auto"
+            })?;
+            originals(doc, choice, e)?;
+        }
+    } else {
+        e.string("auto")?;
+    }
+    if let Some(parallel) = parallel {
+        let Value::Bool(value) = doc.node(parallel)?.value else {
+            return Err(Error::Schema);
+        };
+        e.bytes(b",\"disable_parallel_tool_use\":")?;
+        e.bytes(if value { b"false" } else { b"true" })?;
+    }
+    e.bytes(b"}")?;
+    Ok(())
 }
 fn message_value(view: RequestView<'_>, message: usize, message_index: u64, e: &mut Encoder<'_, '_>) -> Result<()> {
     let doc = view.document;
@@ -357,28 +385,7 @@ fn part_value(
         e.string("redacted_thinking")?;
         super::member(doc, part, "data", e)?;
     } else if doc.string_is(kind, "image")? || doc.string_is(kind, "document")? {
-        doc.write(kind, e)?;
-        let source = doc.required(part, "source")?;
-        e.bytes(b",\"source\":{\"type\":")?;
-        if super::is(doc, source, "kind", "data")? {
-            let text = doc.member(source, "anthropic_text")?.is_some();
-            e.string(if text { "text" } else { "base64" })?;
-            if let Some(mime) = doc.member(part, "mime")? {
-                e.bytes(b",\"media_type\":")?;
-                doc.write(mime, e)?;
-            }
-            e.bytes(b",\"data\":")?;
-            view.media.write_value(doc, doc.required(source, "ref")?, e)?;
-        } else if super::is(doc, source, "kind", "uri")? {
-            e.string("url")?;
-            e.bytes(b",\"url\":")?;
-            doc.write(doc.required(source, "uri")?, e)?;
-        } else {
-            e.string("file")?;
-            super::member(doc, source, "file_id", e)?;
-        }
-        originals(doc, source, e)?;
-        e.bytes(b"}")?;
+        media_source(view, part, kind, e)?;
     } else if doc.string_is(kind, "tool_result")? {
         if let Some(entry) = super::content::history(doc, part)?
             && let Some(native) = doc.member(entry, "native_type")?
@@ -408,6 +415,32 @@ fn part_value(
     }
     originals(doc, part, e)?;
     e.bytes(b"}")
+}
+fn media_source(view: RequestView<'_>, part: usize, kind: usize, e: &mut Encoder<'_, '_>) -> Result<()> {
+    let doc = view.document;
+    doc.write(kind, e)?;
+    let source = doc.required(part, "source")?;
+    e.bytes(b",\"source\":{\"type\":")?;
+    if super::is(doc, source, "kind", "data")? {
+        let text = doc.member(source, "anthropic_text")?.is_some();
+        e.string(if text { "text" } else { "base64" })?;
+        if let Some(mime) = doc.member(part, "mime")? {
+            e.bytes(b",\"media_type\":")?;
+            doc.write(mime, e)?;
+        }
+        e.bytes(b",\"data\":")?;
+        view.media.write_value(doc, doc.required(source, "ref")?, e)?;
+    } else if super::is(doc, source, "kind", "uri")? {
+        e.string("url")?;
+        e.bytes(b",\"url\":")?;
+        doc.write(doc.required(source, "uri")?, e)?;
+    } else {
+        e.string("file")?;
+        super::member(doc, source, "file_id", e)?;
+    }
+    originals(doc, source, e)?;
+    e.bytes(b"}")?;
+    Ok(())
 }
 fn shape(doc: &Document, parent: usize, expected: &str) -> Result<bool> {
     let x = doc.required(doc.root(), "x_ck")?;
