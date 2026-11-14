@@ -54,7 +54,8 @@ impl<F: FnMut(&'static str, u64)> Egress<F> {
         Ok(())
     }
 
-    /// Publishes the owed `response.created` with the response as it stands.
+    /// Publishes the owed `response.created` with the response as it stands. Every event other
+    /// than a heartbeat, usage, start or opaque record calls it before its own output.
     pub(super) fn created(
         &mut self,
         owner: &mut Writer,
@@ -85,6 +86,7 @@ impl<F: FnMut(&'static str, u64)> Egress<F> {
         if self.images.iter().any(|image| !image.closed) || self.audio.iter().any(|audio| !audio.closed) {
             return Err(Error::Truncated);
         }
+        self.created(owner, output)?;
         self.terminal = true;
         let doc = &mut self.document;
         let root = doc.root();

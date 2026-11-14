@@ -236,7 +236,7 @@ fn the_fence_refuses_missing_text_and_null_continuations() {
 
 /// Canonical `records` through Responses egress in `mode`; returns the client bytes and the
 /// names of the diagnostics egress reported.
-fn egress_of(
+pub(super) fn egress_of(
     records: &[(codec::event::Kind, codec::event::Scope, &str)],
     mode: BodyMode,
 ) -> (Vec<u8>, Vec<&'static str>) {

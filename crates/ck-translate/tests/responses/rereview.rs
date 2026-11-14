@@ -2,9 +2,9 @@
 //! lifecycle a streaming client sees.
 use super::cross::client_events;
 use super::final_events::buffered_output;
-use super::final_review::try_raw;
-use super::final_review::try_streamed;
+use super::final_review::{egress_of, try_raw, try_streamed};
 use super::*;
+use codec::event::{Kind, Scope};
 
 /// The part that a streamed message starts with `started` and closes with `done`, as a buffered
 /// client receives it.
@@ -278,6 +278,15 @@ fn response_created_carries_its_own_snapshot() {
         types,
         ["response.created", "response.in_progress", "response.completed"]
     );
+    // So does a canonical response that ends right after its start.
+    let start = (
+        Kind::ResponseStart,
+        Scope::default(),
+        r#","id":"r","model":"m","created":1"#,
+    );
+    let (out, _) = egress_of(&[start, (Kind::Done, Scope::default(), "")], BodyMode::Streaming);
+    let types: Vec<_> = client_events(&out).iter().map(|e| e["type"].clone()).collect();
+    assert_eq!(types, ["response.created", "response.completed"]);
 }
 
 #[test]

@@ -116,16 +116,14 @@ impl<F: FnMut(&'static str, u64)> Egress<F> {
                 return Ok(());
             }
         }
-        if !matches!(kind, Kind::Heartbeat | Kind::Usage | Kind::Opaque | Kind::ResponseStart) {
-            self.created(owner, output)?;
-        }
         match kind {
             Kind::Heartbeat => return Ok(()),
             Kind::Error | Kind::Cancelled => return self.failed(owner, output),
             Kind::ResponseStart => return self.response_start(incoming),
             Kind::Done => return self.done(owner, output),
             Kind::Opaque => return self.opaque(owner, incoming, output),
-            _ => {}
+            Kind::Usage => {}
+            _ => self.created(owner, output)?,
         }
         let native_execution = incoming
             .member(x, "source")?
