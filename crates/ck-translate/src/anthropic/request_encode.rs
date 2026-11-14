@@ -1,0 +1,468 @@
+use crate::codec::{
+    Error, Operation, RequestView, Result,
+    document::{Document, Value},
+    encode::Encoder,
+};
+
+pub(super) fn write(view: RequestView<'_>, streaming: bool, e: &mut Encoder<'_, '_>) -> Result<()> {
+    let doc = view.document;
+    let root = doc.root();
+    let x = doc.required(root, "x_ck")?;
+    e.bytes(b"{")?;
+    let mut first = true;
+    for field in doc.children(root)? {
+        let name = doc.node(field)?.name.ok_or(Error::Schema)?;
+        if [
+            "x_ck",
+            "messages",
+            "stream",
+            "tools",
+            "tool_choice",
+            "parallel_tool_calls",
+            "response_format",
+        ]
+        .iter()
+        .try_fold(false, |yes, key| Ok::<_, Error>(yes || doc.name_is(name, key)?))?
+        {
+            continue;
+        }
+        if !first {
+            e.bytes(b",")?;
+        }
+        first = false;
+        if doc.name_is(name, "stop")? {
+            e.string("stop_sequences")?;
+        } else {
+            doc.write_name(name, e)?;
+        }
+        e.bytes(b":")?;
+        doc.write(field, e)?;
+    }
+    if !first {
+        e.bytes(b",")?;
+    }
+    e.bytes(b"\"messages\":[")?;
+    let messages = doc.required(root, "messages")?;
+    let mut first_message = true;
+    let mut system = None;
+    for (message_index, message) in doc.children(messages)?.enumerate() {
+        if super::is(doc, message, "role", "system")? {
+            if system.is_some() {
+                return Err(Error::Unsupported);
+            }
+            system = Some((message_index as u64, message));
+            continue;
+        }
+        if !first_message {
+            e.bytes(b",")?;
+        }
+        first_message = false;
+        message_value(view, message, message_index as u64, e)?;
+    }
+    e.bytes(b"]")?;
+    if let Some((message_index, message)) = system {
+        e.bytes(b",\"system\":")?;
+        content(view, doc.required(message, "content")?, message_index, e)?;
+    }
+    if view.operation == Operation::Generate {
+        e.bytes(b",\"stream\":")?;
+        e.bytes(if streaming { b"true" } else { b"false" })?;
+    }
+    if let Some(thinking) = doc.member(x, "thinking")?
+        && (doc.member(thinking, "native")?.is_some()
+            || doc.member(thinking, "enabled")?.is_some()
+            || doc.member(thinking, "budget_tokens")?.is_some())
+    {
+        e.bytes(b",\"thinking\":")?;
+        if let Some(native) = doc.member(thinking, "native")? {
+            doc.write(native, e)?;
+        } else {
+            e.bytes(b"{\"type\":")?;
+            let enabled = doc
+                .member(thinking, "enabled")?
+                .map(|n| doc.node(n))
+                .transpose()?
+                .is_some_and(|n| matches!(n.value, Value::Bool(true)));
+            e.string(if enabled { "enabled" } else { "disabled" })?;
+            super::member(doc, thinking, "budget_tokens", e)?;
+            e.bytes(b"}")?;
+        }
+    }
+    if let Some(provider) = doc.member(x, "provider_parameters")?
+        && let Some(native) = doc.member(provider, "anthropic")?
+    {
+        for field in doc.children(native)? {
+            if doc.name_is(doc.node(field)?.name.ok_or(Error::Schema)?, "output_config")? {
+                continue;
+            }
+            e.bytes(b",")?;
+            doc.write_name(doc.node(field)?.name.ok_or(Error::Schema)?, e)?;
+            e.bytes(b":")?;
+            doc.write(field, e)?;
+        }
+    }
+    output_config(doc, x, e)?;
+    if let Some(tools) = doc.member(root, "tools")? {
+        e.bytes(b",\"tools\":[")?;
+        for (index, tool) in doc.children(tools)?.enumerate() {
+            if index != 0 {
+                e.bytes(b",")?;
+            }
+            if super::is(doc, tool, "type", "server")? {
+                let declarations = doc.required(x, "tools")?;
+                let entry = doc
+                    .children(declarations)?
+                    .find(|entry| doc.origin(*entry).ok().flatten().is_some_and(|(n, _)| n == tool))
+                    .ok_or(Error::Schema)?;
+                let declaration = doc.required(entry, "declaration")?;
+                e.bytes(b"{")?;
+                for (index, field) in doc.children(declaration)?.enumerate() {
+                    if index != 0 {
+                        e.bytes(b",")?;
+                    }
+                    doc.write_name(doc.node(field)?.name.ok_or(Error::Schema)?, e)?;
+                    e.bytes(b":")?;
+                    doc.write(field, e)?;
+                }
+                originals(doc, tool, e)?;
+                e.bytes(b"}")?;
+            } else {
+                let function = doc.required(tool, "function")?;
+                e.bytes(b"{")?;
+                for (i, field) in doc.children(function)?.enumerate() {
+                    if i != 0 {
+                        e.bytes(b",")?;
+                    }
+                    let name = doc.node(field)?.name.ok_or(Error::Schema)?;
+                    if doc.name_is(name, "parameters")? {
+                        e.string("input_schema")?;
+                    } else {
+                        doc.write_name(name, e)?;
+                    }
+                    e.bytes(b":")?;
+                    doc.write(field, e)?;
+                }
+                originals(doc, tool, e)?;
+                e.bytes(b"}")?;
+            }
+        }
+        e.bytes(b"]")?;
+    }
+    let choice = doc.member(root, "tool_choice")?;
+    let parallel = doc.member(root, "parallel_tool_calls")?;
+    if choice.is_some() || parallel.is_some() {
+        e.bytes(b",\"tool_choice\":{\"type\":")?;
+        if let Some(choice) = choice {
+            if matches!(doc.node(choice)?.value, Value::Object) {
+                e.string("tool")?;
+                let function = doc.required(choice, "function")?;
+                super::member(doc, function, "name", e)?;
+                originals(doc, choice, e)?;
+            } else {
+                e.string(if doc.string_is(choice, "required")? {
+                    "any"
+                } else if doc.string_is(choice, "none")? {
+                    "none"
+                } else {
+                    "auto"
+                })?;
+                originals(doc, choice, e)?;
+            }
+        } else {
+            e.string("auto")?;
+        }
+        if let Some(parallel) = parallel {
+            let Value::Bool(value) = doc.node(parallel)?.value else {
+                return Err(Error::Schema);
+            };
+            e.bytes(b",\"disable_parallel_tool_use\":")?;
+            e.bytes(if value { b"false" } else { b"true" })?;
+        }
+        e.bytes(b"}")?;
+    }
+    originals(doc, root, e)?;
+    e.bytes(b"}")
+}
+fn message_value(view: RequestView<'_>, message: usize, message_index: u64, e: &mut Encoder<'_, '_>) -> Result<()> {
+    let doc = view.document;
+    e.bytes(b"{\"role\":")?;
+    let tool_result = super::is(doc, message, "role", "tool")?;
+    if tool_result {
+        e.string("user")?;
+    } else {
+        doc.write(doc.required(message, "role")?, e)?;
+    }
+    e.bytes(b",\"content\":")?;
+    if tool_result {
+        e.bytes(b"[{\"type\":\"tool_result\",\"tool_use_id\":")?;
+        doc.write(doc.required(message, "tool_call_id")?, e)?;
+        if let Some(value) = doc.member(message, "content")? {
+            e.bytes(b",\"content\":")?;
+            content(view, value, message_index, e)?;
+        }
+        e.bytes(b"}]")?;
+    } else if let Some(calls) = doc.member(message, "tool_calls")? {
+        e.bytes(b"[")?;
+        let content = doc.member(message, "content")?;
+        let mut part = content.and_then(|n| doc.node(n).ok().and_then(|n| n.first));
+        let string_content =
+            content.filter(|n| matches!(doc.node(*n).map(|n| n.value), Ok(Value::String(_) | Value::Text(_))));
+        let mut call = doc.node(calls)?.first;
+        let mut first = true;
+        let mut block_index = 0;
+        if let Some(text) = string_content {
+            e.bytes(b"{\"type\":\"text\",\"text\":")?;
+            doc.write(text, e)?;
+            e.bytes(b"}")?;
+            first = false;
+            block_index += 1;
+        }
+        while part.is_some() || call.is_some() {
+            let use_call = if let Some(call) = call {
+                call_position(doc, call)?.is_some_and(|position| position <= block_index) || part.is_none()
+            } else {
+                false
+            };
+            if !first {
+                e.bytes(b",")?;
+            }
+            first = false;
+            if use_call {
+                let node = call.ok_or(Error::Schema)?;
+                call = doc.node(node)?.next;
+                tool_call(doc, node, e)?;
+            } else {
+                let node = part.ok_or(Error::Schema)?;
+                part = doc.node(node)?.next;
+                part_value(view, node, message_index, block_index, e)?;
+            }
+            block_index += 1;
+        }
+        e.bytes(b"]")?;
+    } else if let Some(value) = doc.member(message, "content")? {
+        content(view, value, message_index, e)?;
+    } else {
+        e.bytes(b"[]")?;
+    }
+    originals(doc, message, e)?;
+    e.bytes(b"}")
+}
+fn call_position(doc: &Document, call: usize) -> Result<Option<u64>> {
+    let x = doc.required(doc.root(), "x_ck")?;
+    if let Some(order) = doc.member(x, "anthropic_order")? {
+        for entry in doc.children(order)? {
+            if doc.origin(entry)?.is_some_and(|(parent, _)| parent == call) {
+                return Ok(Some(doc.unsigned(doc.required(entry, "block_index")?)?));
+            }
+        }
+    }
+    Ok(None)
+}
+fn tool_call(doc: &Document, call: usize, e: &mut Encoder<'_, '_>) -> Result<()> {
+    e.bytes(b"{\"type\":")?;
+    e.string(if super::is(doc, call, "type", "server")? {
+        "server_tool_use"
+    } else {
+        "tool_use"
+    })?;
+    super::member(doc, call, "id", e)?;
+    let function = doc.required(call, "function")?;
+    super::member(doc, function, "name", e)?;
+    if let Some(input) = doc.member(function, "arguments")? {
+        e.bytes(b",\"input\":")?;
+        doc.write(input, e)?;
+    }
+    originals(doc, call, e)?;
+    e.bytes(b"}")
+}
+fn content(view: RequestView<'_>, node: usize, message_index: u64, e: &mut Encoder<'_, '_>) -> Result<()> {
+    let doc = view.document;
+    if !matches!(doc.node(node)?.value, Value::Array) {
+        return doc.write(node, e);
+    }
+    e.bytes(b"[")?;
+    for (index, part) in doc.children(node)?.enumerate() {
+        if index != 0 {
+            e.bytes(b",")?;
+        }
+        part_value(view, part, message_index, index as u64, e)?;
+    }
+    e.bytes(b"]")
+}
+fn part_value(
+    view: RequestView<'_>,
+    part: usize,
+    message_index: u64,
+    block_index: u64,
+    e: &mut Encoder<'_, '_>,
+) -> Result<()> {
+    let doc = view.document;
+    let kind = doc.required(part, "type")?;
+    if doc.string_is(kind, "opaque")? {
+        return doc.write(doc.required(part, "value")?, e);
+    }
+    e.bytes(b"{\"type\":")?;
+    if doc.string_is(kind, "reasoning")? {
+        e.string("thinking")?;
+        e.bytes(b",\"thinking\":")?;
+        doc.write(doc.required(part, "text")?, e)?;
+        let x = doc.required(doc.root(), "x_ck")?;
+        if let Some(replay) = doc.member(x, "replay")? {
+            for entry in doc.children(replay)? {
+                let bound = if let Some((parent, _)) = doc.origin(entry)? {
+                    parent == part
+                } else {
+                    doc.unsigned(doc.required(entry, "message_index")?)? == message_index
+                        && doc.unsigned(doc.required(entry, "block_index")?)? == block_index
+                };
+                if bound {
+                    super::member(doc, entry, "signature", e)?;
+                }
+            }
+        }
+    } else if doc.string_is(kind, "redacted")? {
+        e.string("redacted_thinking")?;
+        super::member(doc, part, "data", e)?;
+    } else if doc.string_is(kind, "image")? || doc.string_is(kind, "document")? {
+        doc.write(kind, e)?;
+        let source = doc.required(part, "source")?;
+        e.bytes(b",\"source\":{\"type\":")?;
+        if super::is(doc, source, "kind", "data")? {
+            let text = doc.member(source, "anthropic_text")?.is_some();
+            e.string(if text { "text" } else { "base64" })?;
+            if let Some(mime) = doc.member(part, "mime")? {
+                e.bytes(b",\"media_type\":")?;
+                doc.write(mime, e)?;
+            }
+            e.bytes(b",\"data\":")?;
+            view.media.write_value(doc, doc.required(source, "ref")?, e)?;
+        } else if super::is(doc, source, "kind", "uri")? {
+            e.string("url")?;
+            e.bytes(b",\"url\":")?;
+            doc.write(doc.required(source, "uri")?, e)?;
+        } else {
+            e.string("file")?;
+            super::member(doc, source, "file_id", e)?;
+        }
+        originals(doc, source, e)?;
+        e.bytes(b"}")?;
+    } else if doc.string_is(kind, "tool_result")? {
+        e.string("tool_result")?;
+        e.bytes(b",\"tool_use_id\":")?;
+        doc.write(doc.required(part, "tool_call_id")?, e)?;
+        if let Some(value) = doc.member(part, "content")? {
+            e.bytes(b",\"content\":")?;
+            if shape_string(doc, part)? {
+                let text = doc.node(value)?.first.ok_or(Error::Schema)?;
+                doc.write(doc.required(text, "text")?, e)?;
+            } else {
+                content(view, value, message_index, e)?;
+            }
+        }
+        super::member(doc, part, "is_error", e)?;
+    } else {
+        doc.write(kind, e)?;
+        super::member(doc, part, "text", e)?;
+    }
+    originals(doc, part, e)?;
+    e.bytes(b"}")
+}
+fn shape_string(doc: &Document, parent: usize) -> Result<bool> {
+    let x = doc.required(doc.root(), "x_ck")?;
+    if let Some(original) = doc.member(x, "original")? {
+        for entry in doc.children(original)? {
+            if doc.origin(entry)? == Some((parent, Some("shape"))) {
+                return Ok(true);
+            }
+        }
+    }
+    Ok(false)
+}
+fn originals(doc: &Document, parent: usize, e: &mut Encoder<'_, '_>) -> Result<()> {
+    let x = doc.required(doc.root(), "x_ck")?;
+    for field in ["original", "cache_control"] {
+        if let Some(original) = doc.member(x, field)? {
+            for entry in doc.children(original)? {
+                if doc.origin(entry)? != Some((parent, None)) {
+                    continue;
+                }
+                let pointer = doc.required(entry, "pointer")?;
+                let mut chars = doc.chars(pointer)?;
+                if chars.next_scalar()? != Some('/') {
+                    return Err(Error::Schema);
+                }
+                e.bytes(b",\"")?;
+                while let Some(c) = chars.next_scalar()? {
+                    let c = if c == '~' {
+                        match chars.next_scalar()? {
+                            Some('0') => '~',
+                            Some('1') => '/',
+                            _ => return Err(Error::Schema),
+                        }
+                    } else {
+                        c
+                    };
+                    e.escaped(c.encode_utf8(&mut [0; 4]))?;
+                }
+                e.bytes(b"\":")?;
+                doc.write(doc.required(entry, "value")?, e)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn output_config(doc: &Document, x: usize, e: &mut Encoder<'_, '_>) -> Result<()> {
+    let native = match doc.member(x, "provider_parameters")? {
+        Some(provider) => match doc.member(provider, "anthropic")? {
+            Some(native) => doc.member(native, "output_config")?,
+            None => None,
+        },
+        None => None,
+    };
+    let effort = match doc.member(x, "thinking")? {
+        Some(thinking) => doc.member(thinking, "effort")?,
+        None => None,
+    };
+    let format = doc.member(doc.root(), "response_format")?;
+    if native.is_none() && effort.is_none() && format.is_none() {
+        return Ok(());
+    }
+    e.bytes(b",\"output_config\":{")?;
+    let mut first = true;
+    if let Some(native) = native {
+        for field in doc.children(native)? {
+            if !first {
+                e.bytes(b",")?;
+            }
+            first = false;
+            doc.write_name(doc.node(field)?.name.ok_or(Error::Schema)?, e)?;
+            e.bytes(b":")?;
+            doc.write(field, e)?;
+        }
+    }
+    if let Some(effort) = effort {
+        if !first {
+            e.bytes(b",")?;
+        }
+        first = false;
+        e.bytes(b"\"effort\":")?;
+        doc.write(effort, e)?;
+    }
+    if let Some(format) = format {
+        if !first {
+            e.bytes(b",")?;
+        }
+        e.bytes(b"\"format\":{\"type\":")?;
+        doc.write(doc.required(format, "type")?, e)?;
+        let schema = doc.required(format, "json_schema")?;
+        for field in doc.children(schema)? {
+            e.bytes(b",")?;
+            doc.write_name(doc.node(field)?.name.ok_or(Error::Schema)?, e)?;
+            e.bytes(b":")?;
+            doc.write(field, e)?;
+        }
+        e.bytes(b"}")?;
+    }
+    e.bytes(b"}")
+}
