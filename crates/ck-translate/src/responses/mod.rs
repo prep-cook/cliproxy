@@ -12,47 +12,12 @@ mod usage;
 
 const REDACTED_PREFIX: &str = "claude-redacted-thinking:";
 
-use crate::boundary::failure;
+use crate::boundary::{failure, is, mapped, member, object, string};
+use crate::codec::table::Table;
 use crate::codec::{
     Error, Result,
     document::{Document, Value},
-    encode::{self, Encoder},
-    source::Source,
 };
-use ck_stream::Writer;
-
-fn mapped(owner: &mut Writer, write: impl Fn(&mut Encoder<'_, '_>) -> Result<()>) -> Result<Document> {
-    let lease = encode::scratch(owner, write)?;
-    let mut source = Source::new(owner)?;
-    source.push_scratch(lease)?;
-    let len = source.len();
-    Document::parse(owner, source, len)
-}
-
-fn string(doc: &Document, node: usize) -> Result<()> {
-    if matches!(
-        doc.node(node)?.value,
-        Value::String(_) | Value::Text(_) | Value::Id(_) | Value::Fragments | Value::Utf8Media
-    ) {
-        Ok(())
-    } else {
-        Err(Error::Schema)
-    }
-}
-
-fn is(doc: &Document, parent: usize, name: &str, value: &str) -> Result<bool> {
-    doc.member(parent, name)?.map_or(Ok(false), |n| doc.string_is(n, value))
-}
-
-fn member(doc: &Document, parent: usize, name: &str, e: &mut Encoder<'_, '_>) -> Result<()> {
-    if let Some(node) = doc.member(parent, name)? {
-        e.bytes(b",")?;
-        e.string(name)?;
-        e.bytes(b":")?;
-        doc.write(node, e)?;
-    }
-    Ok(())
-}
 
 fn move_field(doc: &mut Document, from: usize, name: &str, to: usize, target: &'static str) -> Result<Option<usize>> {
     let Some(node) = doc.remove(from, name)? else {

@@ -43,16 +43,19 @@ impl Ingress {
             closed: false,
         })
     }
-    fn prepare(&mut self, owner: &mut Writer) -> Result<()> {
-        self.input.pending.finish()?;
+    fn consume(&mut self, owner: &mut Writer, flush: bool) -> Result<()> {
         self.input.consume(
             owner,
             &mut self.media,
             &mut self.emitter,
             &mut self.reader,
             self.operation,
-            true,
-        )?;
+            flush,
+        )
+    }
+    fn prepare(&mut self, owner: &mut Writer) -> Result<()> {
+        self.input.pending.finish()?;
+        self.consume(owner, true)?;
         let document = &mut self.input.pending.document;
         self.media.validate_registrations(document, 0)?;
         normalize(document, owner, self.operation)?;
@@ -93,75 +96,31 @@ impl codec::RequestIngress for Ingress {
     }
 
     fn advance(&mut self, owner: &mut Writer, bytes: &[u8]) -> Result<()> {
-        if owner.id() != self.owner {
-            return Err(Error::Position);
-        }
-        if self.closed {
-            return Err(Error::Closed);
-        }
+        crate::boundary::enter(self.owner, owner, self.closed)?;
         let result = (|| {
-            for bytes in bytes.chunks(8192) {
-                self.input.pending.advance(owner, bytes)?;
-                self.input.consume(
-                    owner,
-                    &mut self.media,
-                    &mut self.emitter,
-                    &mut self.reader,
-                    self.operation,
-                    false,
-                )?;
+            for chunk in bytes.chunks(8192) {
+                self.input.pending.advance(owner, chunk)?;
+                self.consume(owner, false)?;
             }
             if bytes.is_empty() {
-                self.input.consume(
-                    owner,
-                    &mut self.media,
-                    &mut self.emitter,
-                    &mut self.reader,
-                    self.operation,
-                    true,
-                )?;
+                self.consume(owner, true)?;
             }
             Ok(())
         })();
-        if let Err(error) = result {
-            self.closed = true;
-            if !matches!(error, Error::Storage(_)) {
-                super::failure(&mut self.emitter, owner, true)?;
-            }
-            return Err(error);
-        }
-        Ok(())
+        self.closed = result.is_err();
+        crate::boundary::reported(result, &mut self.emitter, owner, true)
     }
     fn finish<'a>(&'a mut self, owner: &mut Writer, destination: &impl Capability) -> Result<ValidatedRequest<'a>> {
-        if owner.id() != self.owner {
-            return Err(Error::Position);
-        }
-        if self.closed {
-            return Err(Error::Closed);
-        }
+        crate::boundary::enter(self.owner, owner, self.closed)?;
         self.closed = true;
-        if let Err(error) = self.prepare(owner) {
-            if !matches!(error, Error::Storage(_)) {
-                super::failure(&mut self.emitter, owner, true)?;
-            }
-            return Err(error);
-        }
+        let prepared = self.prepare(owner);
+        crate::boundary::reported(prepared, &mut self.emitter, owner, true)?;
         let view = RequestView {
             document: &self.input.pending.document,
             media: &self.media,
             operation: self.operation,
         };
-        let ready = match self.fence.end(view, destination) {
-            Ok(v) => v,
-            Err(error) => {
-                super::failure(&mut self.emitter, owner, true)?;
-                return Err(error);
-            }
-        };
-        self.emitter.request_end(owner, &ready)?;
-        self.emitter
-            .emit(owner, Kind::Done, Scope::default(), |_| Ok(()), |_| Ok(()))?;
-        Ok(ready)
+        crate::boundary::end_request(&mut self.fence, view, destination, &mut self.emitter, owner)
     }
 }
 

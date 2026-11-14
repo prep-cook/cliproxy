@@ -41,7 +41,7 @@ impl Ingress {
                     doc.write(mime, e)?;
                 }
                 e.bytes(b",\"attributes\":{\"protocol\":\"responses\",\"field\":\"audio\",\"native\":")?;
-                super::response::write_except(doc, node, e, &["data", "transcript"])?;
+                super::object(doc, node, &["data", "transcript"], e)?;
                 e.bytes(b",\"data_present\":")?;
                 e.bytes(if doc.member(node, "data")?.is_some() {
                     b"true"

@@ -1,4 +1,4 @@
-use super::{is, string, usage::Usage};
+use super::{Table, is, object, string, usage::Usage};
 use crate::codec::{
     self, BodyMode, Error, Operation, Result,
     document::{Document, Value},
@@ -8,7 +8,7 @@ use crate::codec::{
     source::Source,
     sse,
 };
-use ck_stream::{MetadataPermit, Writer};
+use ck_stream::Writer;
 
 #[path = "response_tools.rs"]
 mod tools;
@@ -51,8 +51,7 @@ impl Ingress {
                 identity,
                 operation,
                 base: None,
-                items: Vec::new(),
-                metadata: owner.reserve_metadata(0)?,
+                items: Table::new(owner)?,
                 usage: Usage::default(),
                 terminal: false,
                 next_media: 0,
@@ -75,12 +74,7 @@ impl Ingress {
 }
 impl codec::ResponseIngress for Ingress {
     fn advance(&mut self, owner: &mut Writer, bytes: &[u8]) -> Result<()> {
-        if owner.id() != self.owner {
-            return Err(Error::Position);
-        }
-        if self.failed || self.state.terminal {
-            return Err(Error::Closed);
-        }
+        crate::boundary::enter(self.owner, owner, self.failed || self.state.terminal)?;
         let result = (|| {
             let source = self.source.as_mut().ok_or(Error::Closed)?;
             source.push_bytes(owner, bytes)?;
@@ -96,12 +90,7 @@ impl codec::ResponseIngress for Ingress {
         self.handle(owner, result)
     }
     fn finish(&mut self, owner: &mut Writer) -> Result<()> {
-        if owner.id() != self.owner {
-            return Err(Error::Position);
-        }
-        if self.failed {
-            return Err(Error::Closed);
-        }
+        crate::boundary::enter(self.owner, owner, self.failed)?;
         let result = (|| {
             if let Some(scanner) = &mut self.scanner {
                 let source = self.source.as_ref().ok_or(Error::Closed)?;
@@ -133,8 +122,7 @@ struct Item {
     id: LocalId,
     tool: Option<LocalId>,
     doc: Document,
-    blocks: Vec<Block>,
-    metadata: MetadataPermit,
+    blocks: Table<Block>,
     closed: bool,
     arguments: Option<usize>,
     tool_closed: bool,
@@ -152,8 +140,7 @@ struct State {
     identity: Identity,
     operation: Operation,
     base: Option<Document>,
-    items: Vec<Item>,
-    metadata: MetadataPermit,
+    items: Table<Item>,
     usage: Usage,
     terminal: bool,
     next_media: u64,
@@ -461,11 +448,9 @@ impl State {
         let mut unknown = doc.member(doc.root(), "sequence_number")?.is_some();
         for field in doc.children(doc.root())? {
             let name = doc.node(field)?.name.ok_or(Error::Schema)?;
-            let mut recognized = false;
-            for k in known {
-                recognized |= doc.name_is(name, k)?;
-            }
-            unknown |= !recognized;
+            unknown |= !known
+                .iter()
+                .try_fold(false, |found, k| Ok::<_, Error>(found || doc.name_is(name, k)?))?;
         }
         if unknown
             || event.fields().iter().any(|f| {
@@ -479,25 +464,8 @@ impl State {
                 Kind::Opaque,
                 Scope::default(),
                 |e| {
-                    e.bytes(b",\"name\":\"responses.fields\",\"format\":\"json\",\"value\":{")?;
-                    let mut first = true;
-                    for field in doc.children(doc.root())? {
-                        let name = doc.node(field)?.name.ok_or(Error::Schema)?;
-                        let mut recognized = false;
-                        for k in known {
-                            recognized |= doc.name_is(name, k)?;
-                        }
-                        if !recognized {
-                            if !first {
-                                e.bytes(b",")?;
-                            }
-                            first = false;
-                            doc.write_name(name, e)?;
-                            e.bytes(b":")?;
-                            doc.write(field, e)?;
-                        }
-                    }
-                    e.bytes(b"}")
+                    e.bytes(b",\"name\":\"responses.fields\",\"format\":\"json\",\"value\":")?;
+                    object(doc, doc.root(), known, e)
                 },
                 |e| sse_source(source, event, Some(doc), e),
             )?;
@@ -592,8 +560,7 @@ impl State {
                 None
             },
             doc: native,
-            blocks: Vec::new(),
-            metadata: owner.reserve_metadata(0)?,
+            blocks: Table::new(owner)?,
             closed: false,
             arguments: None,
             arguments_done: false,
@@ -651,9 +618,7 @@ impl State {
                 },
             )?;
         }
-        reserve(&mut self.items, &mut self.metadata)?;
-        let at = self.items.len();
-        self.items.push(item);
+        let at = self.items.push(item)?;
         self.snapshot_item(owner, at, doc, node, false)?;
         Ok(at)
     }
@@ -725,7 +690,7 @@ impl State {
             b
         } else {
             let lease = encode::scratch(owner, |e| {
-                write_except(doc, part, e, &["text", "refusal", "annotations", "logprobs"])
+                object(doc, part, &["text", "refusal", "annotations", "logprobs"], e)
             })?;
             let value = item.doc.import_json(owner, lease)?;
             let scope = item.scope(Some(item.blocks.len() as u64));
@@ -759,15 +724,12 @@ impl State {
                     e.bytes(b"}")
                 },
             )?;
-            reserve(&mut item.blocks, &mut item.metadata)?;
-            let b = item.blocks.len();
             item.blocks.push(Block {
                 index,
                 summary,
                 value,
                 closed: false,
-            });
-            b
+            })?
         };
         let value = item.blocks[block].value;
         for (native, delta) in [
@@ -1043,7 +1005,7 @@ impl State {
         }
         if close && !self.items[at].closed {
             let item = &mut self.items[at];
-            for block in &item.blocks {
+            for block in item.blocks.iter() {
                 if !block.closed {
                     return Err(Error::Truncated);
                 }
@@ -1215,7 +1177,7 @@ impl State {
             Scope::default(),
             |e| {
                 e.bytes(b",\"name\":\"responses.response\",\"format\":\"json\",\"value\":")?;
-                write_except(doc, root, e, &["output", "usage", "audio"])
+                object(doc, root, &["output", "usage", "audio"], e)
             },
             |_| Ok(()),
         )?;
@@ -1244,39 +1206,6 @@ fn validate_arguments(owner: &mut Writer, item: &Item) -> Result<()> {
     let len = source.len();
     Document::parse(owner, source, len)?;
     Ok(())
-}
-pub(super) fn reserve<T>(values: &mut Vec<T>, metadata: &mut MetadataPermit) -> Result<()> {
-    if values.len() == values.capacity() {
-        let capacity = values.capacity().max(4).checked_mul(2).ok_or(Error::Limit)?;
-        metadata.resize(capacity.checked_mul(std::mem::size_of::<T>()).ok_or(Error::Limit)?)?;
-        values
-            .try_reserve_exact(capacity - values.len())
-            .map_err(|_| Error::Limit)?;
-        metadata.resize(values.capacity() * std::mem::size_of::<T>())?;
-    }
-    Ok(())
-}
-pub(super) fn write_except(doc: &Document, node: usize, e: &mut Encoder<'_, '_>, skip: &[&str]) -> Result<()> {
-    e.bytes(b"{")?;
-    let mut first = true;
-    for field in doc.children(node)? {
-        let name = doc.node(field)?.name.ok_or(Error::Schema)?;
-        let mut skipped = false;
-        for s in skip {
-            skipped |= doc.name_is(name, s)?;
-        }
-        if skipped {
-            continue;
-        }
-        if !first {
-            e.bytes(b",")?;
-        }
-        first = false;
-        doc.write_name(name, e)?;
-        e.bytes(b":")?;
-        doc.write(field, e)?;
-    }
-    e.bytes(b"}")
 }
 fn provenance(doc: &Document, node: usize, e: &mut Encoder<'_, '_>) -> Result<()> {
     e.bytes(b",\"source\":{\"protocol\":\"responses\"")?;
@@ -1471,5 +1400,5 @@ fn item_metadata(doc: &Document, node: usize, e: &mut Encoder<'_, '_>) -> Result
     } else {
         &["content", "summary", "arguments", "input", "encrypted_content"]
     };
-    write_except(doc, node, e, fields)
+    object(doc, node, fields, e)
 }

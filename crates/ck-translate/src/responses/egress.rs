@@ -1,4 +1,4 @@
-use super::{is, response::append_fragment};
+use super::{Table, is, response::append_fragment};
 use crate::codec::{
     self, BodyMode, Error, Operation, Result,
     document::{Document, Value},
@@ -15,10 +15,8 @@ pub struct Egress<F: FnMut(&'static str, u64)> {
     terminal: bool,
     sequence: u64,
     diagnostic: F,
-    images: Vec<super::image::Projection>,
-    image_metadata: ck_stream::MetadataPermit,
-    audio: Vec<super::audio::Projection>,
-    audio_metadata: ck_stream::MetadataPermit,
+    images: Table<super::image::Projection>,
+    audio: Table<super::audio::Projection>,
 }
 impl<F: FnMut(&'static str, u64)> Egress<F> {
     pub fn new(
@@ -49,10 +47,8 @@ impl<F: FnMut(&'static str, u64)> Egress<F> {
             terminal: false,
             sequence: 0,
             diagnostic,
-            images: Vec::new(),
-            image_metadata: owner.reserve_metadata(0)?,
-            audio: Vec::new(),
-            audio_metadata: owner.reserve_metadata(0)?,
+            images: Table::new(owner)?,
+            audio: Table::new(owner)?,
         })
     }
     fn emit(
@@ -85,9 +81,6 @@ impl<F: FnMut(&'static str, u64)> Egress<F> {
         incoming: Document,
         output: &mut impl FnMut(ScratchLease) -> Result<()>,
     ) -> Result<()> {
-        if self.terminal {
-            return Err(Error::Closed);
-        }
         let root = incoming.root();
         let x = incoming.required(root, "x_ck")?;
         if let Some(choice) = incoming.member(x, "choice_index")? {
@@ -195,8 +188,7 @@ impl<F: FnMut(&'static str, u64)> Egress<F> {
         let x = doc.required(node, "x_ck")?;
         let output_node = doc.required(doc.root(), "output")?;
         if kind == Kind::MediaStart && is(doc, node, "kind", "audio")? {
-            super::response::reserve(&mut self.audio, &mut self.audio_metadata)?;
-            self.audio.push(super::audio::Projection::start(doc, node)?);
+            self.audio.push(super::audio::Projection::start(doc, node)?)?;
             return Ok(());
         }
         if matches!(kind, Kind::Data | Kind::MediaTranscript | Kind::MediaEnd)
@@ -366,9 +358,8 @@ impl<F: FnMut(&'static str, u64)> Egress<F> {
             return Err(Error::Schema);
         };
         if kind == Kind::MediaStart {
-            super::response::reserve(&mut self.images, &mut self.image_metadata)?;
             self.images
-                .push(super::image::Projection::start(doc, node, item, index)?);
+                .push(super::image::Projection::start(doc, node, item, index)?)?;
             return Ok(());
         }
         if kind == Kind::ToolStart {
@@ -754,9 +745,7 @@ impl<F: FnMut(&'static str, u64)> codec::ResponseEgress for Egress<F> {
         input: ck_stream::Lease,
         mut output: impl FnMut(ScratchLease) -> Result<()>,
     ) -> Result<()> {
-        if owner.id() != self.owner {
-            return Err(Error::Position);
-        }
+        crate::boundary::enter(self.owner, owner, self.terminal)?;
         let (kind, doc) = internal::decode(owner, input)?;
         self.process(owner, kind, doc, &mut output)
     }
@@ -895,11 +884,9 @@ fn order_array(doc: &mut Document, array: usize, field: &str, owner: &mut Writer
     if !unordered {
         return Ok(());
     }
-    let mut order = Vec::new();
-    let mut metadata = owner.reserve_metadata(0)?;
+    let mut order = Table::new(owner)?;
     for (index, node) in doc.children(array)?.enumerate() {
-        super::response::reserve(&mut order, &mut metadata)?;
-        order.push((native_index(doc, node, field, index as u64)?, node));
+        order.push((native_index(doc, node, field, index as u64)?, node))?;
     }
     order.sort_unstable_by_key(|entry| entry.0);
     if order.windows(2).any(|pair| pair[0].0 == pair[1].0) {
@@ -908,7 +895,7 @@ fn order_array(doc: &mut Document, array: usize, field: &str, owner: &mut Writer
     while let Some(node) = doc.node(array)?.first {
         doc.detach(array, node)?;
     }
-    for (_, node) in order {
+    for &(_, node) in order.iter() {
         doc.append(array, node)?;
     }
     Ok(())
