@@ -71,18 +71,21 @@ impl State {
             "opaque"
         };
         let opaque = kind == "opaque";
-        // Empty `annotations` and `logprobs` stay attributes, so their presence survives; content
-        // events append to them.
+        // A supplied `annotations` or `logprobs` array stays an empty attribute, so its presence
+        // survives and native clients get their accumulator; content events carry the elements.
         let mut content = ["text", "refusal", "", ""];
         for (slot, name) in content[2..].iter_mut().zip(["annotations", "logprobs"]) {
             if let Some(array) = doc.member(part, name)?
-                && doc.node(array)?.first.is_some()
+                && matches!(doc.node(array)?.value, Value::Array)
             {
                 *slot = name;
             }
         }
         let lease = encode::scratch(owner, |e| object(doc, part, if opaque { &[] } else { &content }, e))?;
         let value = item.doc.import_json(owner, lease)?;
+        for name in content[2..].iter().filter(|name| !opaque && !name.is_empty()) {
+            item.doc.set(value, name, Value::Array)?;
+        }
         let scope = item.scope(Some(item.blocks.len() as u64));
         self.emitter.emit(
             owner,

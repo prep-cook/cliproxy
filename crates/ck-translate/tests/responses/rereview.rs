@@ -104,3 +104,17 @@ fn opaque_summary_parts_raise_no_text_events() {
         assert_eq!(events[5]["response"]["output"][0], item);
     }
 }
+
+#[test]
+fn announced_text_parts_carry_their_annotations() {
+    let citation = json!({"type":"url_citation","url":"https://e/","title":"t","start_index":0,"end_index":1});
+    let part = json!({"type":"output_text","text":"hi","annotations":[citation]});
+    let item = json!({"id":"i","type":"message","role":"assistant","status":"completed","content":[part]});
+    let events = streamed(&json!({"id":"r","status":"completed","output":[item]}));
+    let added = events
+        .iter()
+        .find(|e| e["type"] == "response.content_part.added")
+        .unwrap();
+    assert_eq!(added["part"], json!({"type":"output_text","text":"","annotations":[]}));
+    assert_eq!(events.last().unwrap()["response"]["output"][0], item);
+}
