@@ -51,6 +51,7 @@ impl Ingress {
             &mut self.emitter,
             &mut self.reader,
             self.operation,
+            true,
         )?;
         let document = &mut self.input.pending.document;
         self.media.validate_registrations(document, 0)?;
@@ -88,8 +89,7 @@ impl Ingress {
 }
 impl codec::RequestIngress for Ingress {
     fn flush_deadline(&self) -> Option<std::time::Instant> {
-        // The request is buffered and published only by finish.
-        None
+        self.input.deadline()
     }
 
     fn advance(&mut self, owner: &mut Writer, bytes: &[u8]) -> Result<()> {
@@ -108,6 +108,7 @@ impl codec::RequestIngress for Ingress {
                     &mut self.emitter,
                     &mut self.reader,
                     self.operation,
+                    false,
                 )?;
             }
             if bytes.is_empty() {
@@ -117,6 +118,7 @@ impl codec::RequestIngress for Ingress {
                     &mut self.emitter,
                     &mut self.reader,
                     self.operation,
+                    true,
                 )?;
             }
             Ok(())

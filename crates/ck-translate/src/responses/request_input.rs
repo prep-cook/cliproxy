@@ -7,6 +7,9 @@ use crate::codec::{
 };
 use std::time::{Duration, Instant};
 
+/// Longest time a collected fragment waits for more input before it is published.
+const FLUSH_DELAY: Duration = Duration::from_millis(100);
+
 pub(super) struct Input {
     pub pending: Pending,
     pub published_media: usize,
@@ -34,6 +37,14 @@ impl Input {
         })
     }
 
+    /// Deadline of the oldest collected fragment; set when collection starts, so later input
+    /// never postpones it.
+    pub fn deadline(&self) -> Option<Instant> {
+        self.active.as_ref()?.pending_since.map(|since| since + FLUSH_DELAY)
+    }
+
+    /// Publishes what the scanner validated; `flush` publishes a collected fragment before its
+    /// deadline.
     pub fn consume(
         &mut self,
         owner: &mut Writer,
@@ -41,6 +52,7 @@ impl Input {
         emitter: &mut Emitter,
         reader: &mut ck_stream::Reader,
         operation: Operation,
+        flush: bool,
     ) -> Result<()> {
         if self.pending.scanner.nodes().is_empty() {
             return Ok(());
@@ -78,14 +90,14 @@ impl Input {
             doc.rebind_keys(&mut self.pending.scanner)?;
         }
         if self.active.is_some() {
-            self.collect(owner, media, emitter, reader)?;
+            self.collect(owner, media, emitter, reader, flush)?;
         }
         if self.active.is_none()
             && let Some(wire) = self.pending.string
         {
             self.begin(owner, media, emitter, reader, wire)?;
             if self.active.is_some() {
-                self.collect(owner, media, emitter, reader)?;
+                self.collect(owner, media, emitter, reader, flush)?;
             }
         }
         Ok(())
@@ -233,6 +245,7 @@ impl Input {
         registry: &mut Registry,
         emitter: &mut Emitter,
         reader: &mut ck_stream::Reader,
+        flush: bool,
     ) -> Result<()> {
         let active = self.active.as_mut().ok_or(Error::Schema)?;
         let wire = self
@@ -241,10 +254,11 @@ impl Input {
             .pending_node(self.pending.document.input(), active.wire)?;
         if wire.validated_end > active.offset {
             let since = active.pending_since.get_or_insert_with(Instant::now);
-            if active.offset != active.start
+            if !flush
+                && active.offset != active.start
                 && wire.span.end == 0
                 && wire.validated_end - active.offset < 8192
-                && since.elapsed() < Duration::from_millis(100)
+                && since.elapsed() < FLUSH_DELAY
             {
                 return Ok(());
             }

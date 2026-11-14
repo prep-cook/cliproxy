@@ -153,3 +153,38 @@ fn unfinished_native_image_has_one_lifetime_and_exact_decoded_bytes() {
         .collect();
     assert_eq!(decoded, payload);
 }
+
+#[test]
+fn buffered_data_fragment_sets_a_fixed_flush_deadline() {
+    let mut mapped = Mapped::new();
+    let mut ingress = responses::request::Ingress::new(
+        &mut mapped.writer,
+        &mapped.store,
+        identity(Direction::Request),
+        Operation::Generate,
+        200_000,
+    )
+    .unwrap();
+    let prefix = r#"{"model":"m","input":[{"role":"user","content":[{"type":"input_image","image_url":"data:image/png;base64,AAAA"#;
+    ingress.advance(&mut mapped.writer, prefix.as_bytes()).unwrap();
+    assert!(
+        ingress.flush_deadline().is_none(),
+        "first fragment is published at once"
+    );
+    ingress.advance(&mut mapped.writer, b"BBBB").unwrap();
+    let deadline = ingress.flush_deadline().expect("buffered fragment needs a deadline");
+    assert!(deadline <= std::time::Instant::now() + std::time::Duration::from_millis(100));
+    ingress.advance(&mut mapped.writer, b"CCCC").unwrap();
+    assert_eq!(
+        ingress.flush_deadline(),
+        Some(deadline),
+        "later input postponed the deadline"
+    );
+    let published = mapped.output(&mapped.writer).len();
+    ingress.flush(&mut mapped.writer).unwrap();
+    assert!(ingress.flush_deadline().is_none());
+    assert!(
+        mapped.output(&mapped.writer).len() > published,
+        "flush published nothing"
+    );
+}
