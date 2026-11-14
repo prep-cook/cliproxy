@@ -386,7 +386,8 @@ pub(super) fn preserve(
 pub(super) fn originals(doc: &Document, parent: usize, carrier: Option<&str>, e: &mut Encoder<'_, '_>) -> Result<()> {
     for entry in doc.origins(parent)? {
         let (_, origin_carrier) = doc.origin(entry)?.ok_or(Error::Schema)?;
-        if origin_carrier != carrier {
+        // Another protocol's originals are its own fields, not Gemini's.
+        if origin_carrier != carrier || !super::is(doc, entry, "protocol", "gemini")? {
             continue;
         }
         let pointer = doc.required(entry, "pointer")?;

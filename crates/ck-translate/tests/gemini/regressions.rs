@@ -135,6 +135,45 @@ fn null_generation_config_is_unset() {
     assert_eq!(out, input);
 }
 
+/// Encodes a Chat request for Gemini.
+fn chat_to_gemini(input: &[u8]) -> Value {
+    let mut mapped = Mapped::new();
+    let mut ingress = codec::chat::request::Ingress::new(
+        &mut mapped.writer,
+        &mapped.store,
+        identity(Direction::Request),
+        Operation::Generate,
+        1024 * 1024,
+    )
+    .unwrap();
+    for chunk in input.chunks(7) {
+        ingress.advance(&mut mapped.writer, chunk).unwrap();
+    }
+    let ready = ingress
+        .finish(&mut mapped.writer, &gemini::request::GeminiCapability)
+        .unwrap();
+    let output = gemini::request::Egress {
+        destination: "gemini",
+        upstream_stream: true,
+    }
+    .encode(&ready, &mut mapped.writer)
+    .unwrap();
+    serde_json::from_slice(&bytes(&output)).unwrap()
+}
+
+/// Members another protocol kept as its own originals are not Gemini fields.
+#[test]
+fn foreign_unknown_members_do_not_reach_gemini() {
+    let out = chat_to_gemini(
+        br#"{"model":"m","future_root":{"a":1},"messages":[{"role":"user","content":[{"type":"text","text":"hi","future_part":2}],"future_message":3}]}"#,
+    );
+    let text = out.to_string();
+    for key in ["future_root", "future_message", "future_part"] {
+        assert!(!text.contains(key), "{key} reached Gemini: {text}");
+    }
+    assert_eq!(out["contents"][0]["parts"][0]["text"], "hi");
+}
+
 fn validate(input: &Value) -> codec::Result<()> {
     let mut mapped = Mapped::new();
     let bytes = serde_json::to_vec(input).unwrap();

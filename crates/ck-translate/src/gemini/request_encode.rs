@@ -335,7 +335,9 @@ fn write_part(view: RequestView<'_>, part: usize, order: Option<usize>, e: &mut 
     }
     // Original members are comma-prefixed; an empty native part needs a separate first member.
     for entry in doc.origins(part)? {
-        if doc.origin(entry)?.is_some_and(|(_, carrier)| carrier.is_none()) {
+        if doc.origin(entry)?.is_some_and(|(_, carrier)| carrier.is_none())
+            && super::is(doc, entry, "protocol", "gemini")?
+        {
             let pointer = doc.required(entry, "pointer")?;
             let Value::String(text) = doc.node(pointer)?.value else {
                 return Err(Error::Schema);
