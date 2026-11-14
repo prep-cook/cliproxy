@@ -406,3 +406,37 @@ fn unknown_event_names_stay_opaque_and_known_names_must_match_the_type() {
         Err(codec::Error::Schema)
     ));
 }
+
+#[test]
+fn undeclared_tool_choice_and_streamed_count_fail_the_request_schema() {
+    for (operation, body) in [
+        (
+            Operation::Generate,
+            json!({"model":"m","max_tokens":1,"messages":[{"role":"user","content":"x"}],"tools":[{"name":"f","input_schema":{"type":"object"}}],"tool_choice":{"type":"tool","name":"g"}}),
+        ),
+        (
+            Operation::CountTokens,
+            json!({"model":"m","stream":true,"messages":[{"role":"user","content":"x"}]}),
+        ),
+    ] {
+        let mut mapped = Mapped::new();
+        let mut ingress = anthropic::request::Ingress::new(
+            &mut mapped.writer,
+            &mapped.store,
+            identity(Direction::Request),
+            operation,
+            1024 * 1024,
+        )
+        .unwrap();
+        ingress
+            .advance(&mut mapped.writer, &serde_json::to_vec(&body).unwrap())
+            .unwrap();
+        assert!(
+            ingress
+                .finish(&mut mapped.writer, &anthropic::request::AnthropicCapability)
+                .is_err(),
+            "{body}"
+        );
+        crate::assert_invalid_input(&mapped.output(&mapped.writer), "client");
+    }
+}
