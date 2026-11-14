@@ -75,14 +75,8 @@ fn chat_incomplete_finish_reports_the_incomplete_reason() {
         )
         .unwrap();
         let mut reader = m.store.reader(m.writer.id(), 0).unwrap();
-        let mut egress = responses::egress::Egress::new(
-            &mut m.writer,
-            identity(Direction::Response),
-            Operation::Generate,
-            BodyMode::Buffered,
-            |_, _| {},
-        )
-        .unwrap();
+        let mut egress =
+            responses::egress::Egress::new(&mut m.writer, Operation::Generate, BodyMode::Buffered, |_, _| {}).unwrap();
         ingress
             .advance(&mut m.writer, &serde_json::to_vec(&input).unwrap())
             .unwrap();

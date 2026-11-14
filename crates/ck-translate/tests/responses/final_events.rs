@@ -180,14 +180,7 @@ fn failure_and_annotation_events_follow_the_native_schemas() {
         )
         .unwrap();
         let mut reader = m.store.reader(m.writer.id(), 0).unwrap();
-        let mut egress = responses::egress::Egress::new(
-            &mut m.writer,
-            identity(Direction::Response),
-            Operation::Generate,
-            mode,
-            |_, _| {},
-        )
-        .unwrap();
+        let mut egress = responses::egress::Egress::new(&mut m.writer, Operation::Generate, mode, |_, _| {}).unwrap();
         let _ = ingress
             .advance(&mut m.writer, wire(&records).as_bytes())
             .and_then(|()| ingress.finish(&mut m.writer));

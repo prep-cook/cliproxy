@@ -119,14 +119,7 @@ fn failing(input: &[u8], mode: BodyMode, downstream: BodyMode) -> (Vec<u8>, Vec<
     )
     .unwrap();
     let mut reader = m.store.reader(m.writer.id(), 0).unwrap();
-    let mut egress = responses::egress::Egress::new(
-        &mut m.writer,
-        identity(Direction::Response),
-        Operation::Generate,
-        downstream,
-        |_, _| {},
-    )
-    .unwrap();
+    let mut egress = responses::egress::Egress::new(&mut m.writer, Operation::Generate, downstream, |_, _| {}).unwrap();
     let ingested = ingress
         .advance(&mut m.writer, input)
         .and_then(|()| ingress.finish(&mut m.writer));

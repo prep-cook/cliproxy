@@ -132,14 +132,7 @@ fn response_in(
     )
     .unwrap();
     let mut reader = m.store.reader(m.writer.id(), 0).unwrap();
-    let mut egress = responses::egress::Egress::new(
-        &mut m.writer,
-        identity(Direction::Response),
-        operation,
-        downstream,
-        |_, _| {},
-    )
-    .unwrap();
+    let mut egress = responses::egress::Egress::new(&mut m.writer, operation, downstream, |_, _| {}).unwrap();
     let mut result = Vec::new();
     for chunk in input.chunks(step) {
         ingress.advance(&mut m.writer, chunk).unwrap();

@@ -173,14 +173,8 @@ pub(crate) fn buffered_ingress(m: &mut Mapped, head: &[u8]) -> responses::respon
 /// Runs the canonical stream through buffered Responses egress; returns the client body.
 pub(crate) fn buffered_egress(m: &mut Mapped) -> Value {
     let mut reader = m.store.reader(m.writer.id(), 0).unwrap();
-    let mut egress = responses::egress::Egress::new(
-        &mut m.writer,
-        identity(Direction::Response),
-        Operation::Generate,
-        BodyMode::Buffered,
-        |_, _| {},
-    )
-    .unwrap();
+    let mut egress =
+        responses::egress::Egress::new(&mut m.writer, Operation::Generate, BodyMode::Buffered, |_, _| {}).unwrap();
     let mut out = Vec::new();
     while let std::task::Poll::Ready(Some(ck_stream::Read::Record(lease))) = reader.try_next() {
         egress

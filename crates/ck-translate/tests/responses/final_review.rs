@@ -255,13 +255,9 @@ pub(super) fn egress_of(
             .unwrap();
     }
     let diagnostics = std::cell::RefCell::new(Vec::new());
-    let mut egress = responses::egress::Egress::new(
-        &mut m.writer,
-        identity(Direction::Response),
-        Operation::Generate,
-        mode,
-        |name, _| diagnostics.borrow_mut().push(name),
-    )
+    let mut egress = responses::egress::Egress::new(&mut m.writer, Operation::Generate, mode, |name, _| {
+        diagnostics.borrow_mut().push(name)
+    })
     .unwrap();
     let mut out = Vec::new();
     while let std::task::Poll::Ready(Some(ck_stream::Read::Record(record))) = reader.try_next() {
@@ -398,13 +394,7 @@ pub(super) fn try_raw(input: &[u8], downstream: BodyMode) -> codec::Result<(Vec<
         1024 * 1024,
     )?;
     let mut reader = m.store.reader(m.writer.id(), 0).unwrap();
-    let mut egress = responses::egress::Egress::new(
-        &mut m.writer,
-        identity(Direction::Response),
-        Operation::Generate,
-        downstream,
-        |_, _| {},
-    )?;
+    let mut egress = responses::egress::Egress::new(&mut m.writer, Operation::Generate, downstream, |_, _| {})?;
     let ingested = ingress
         .advance(&mut m.writer, input)
         .and_then(|()| ingress.finish(&mut m.writer));

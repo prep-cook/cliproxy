@@ -3,7 +3,7 @@ use crate::codec::{
     self, BodyMode, Error, Operation, Result,
     document::{Document, Name, Value},
     encode::{self, Encoder},
-    event::{Identity, Kind},
+    event::Kind,
     internal,
 };
 use ck_stream::{ScratchLease, Writer};
@@ -42,13 +42,7 @@ pub struct Egress<F: FnMut(&'static str, u64)> {
     owed: bool,
 }
 impl<F: FnMut(&'static str, u64)> Egress<F> {
-    pub fn new(
-        owner: &mut Writer,
-        _identity: Identity,
-        operation: Operation,
-        mode: BodyMode,
-        diagnostic: F,
-    ) -> Result<Self> {
+    pub fn new(owner: &mut Writer, operation: Operation, mode: BodyMode, diagnostic: F) -> Result<Self> {
         if operation == Operation::CountTokens || (operation == Operation::Compact && mode == BodyMode::Streaming) {
             return Err(Error::Unsupported);
         }
