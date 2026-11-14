@@ -513,6 +513,26 @@ fn normalize_part(doc: &mut Document, owner: &mut Writer, part: usize, original:
     } else if doc.string_is(kind, "refusal")? {
         move_field(doc, part, "refusal", part, "text")?;
         preserve_unknown(doc, owner, original, part, &["type", "text"])?;
+    } else if doc.string_is(kind, "input_audio")? {
+        doc.set(part, "type", Value::Text("audio"))?;
+        let source = doc.required(part, "input_audio")?;
+        doc.detach(part, source)?;
+        doc.rename(source, "source")?;
+        doc.append(part, source)?;
+        let format = doc.required(source, "format")?;
+        let mime = if doc.string_is(format, "mp3")? {
+            "audio/mpeg"
+        } else if doc.string_is(format, "wav")? {
+            "audio/wav"
+        } else {
+            return Err(Error::Unsupported);
+        };
+        doc.set(part, "mime", Value::Text(mime))?;
+        let data = doc.required(source, "data")?;
+        doc.rename(data, "ref")?;
+        doc.set(source, "kind", Value::Text("data"))?;
+        preserve_unknown(doc, owner, original, source, &["kind", "ref"])?;
+        preserve_unknown(doc, owner, original, part, &["type", "source", "mime"])?;
     } else if doc.string_is(kind, "input_image")? || doc.string_is(kind, "input_file")? {
         let image = doc.string_is(kind, "input_image")?;
         doc.set(part, "type", Value::Text(if image { "image" } else { "document" }))?;
@@ -667,10 +687,23 @@ fn validate(view: RequestView<'_>) -> Result<()> {
                             "encrypted",
                             "redacted",
                             "image",
+                            "audio",
                             "document",
                             "opaque",
                         ] {
                             supported |= doc.string_is(kind, k)?;
+                        }
+                        if doc.string_is(kind, "audio")? {
+                            let source = doc.required(part, "source")?;
+                            let mime = doc.required(part, "mime")?;
+                            if !is(doc, source, "kind", "data")?
+                                || (!doc.string_is(mime, "audio/mpeg")? && !doc.string_is(mime, "audio/wav")?)
+                            {
+                                return Err(Error::Unsupported);
+                            }
+                            view.media
+                                .get(doc, doc.required(source, "ref")?)?
+                                .ok_or(Error::Position)?;
                         }
                         if !supported {
                             return Err(Error::Unsupported);
@@ -1113,6 +1146,29 @@ fn write_part(view: RequestView<'_>, part: usize, assistant: bool, e: &mut Encod
     let doc = view.document;
     if is(doc, part, "type", "opaque")? {
         return doc.write(doc.required(part, "value")?, e);
+    }
+    if is(doc, part, "type", "audio")? {
+        let source = doc.required(part, "source")?;
+        if !is(doc, source, "kind", "data")? {
+            return Err(Error::Unsupported);
+        }
+        let mime = doc.required(part, "mime")?;
+        let format = if doc.string_is(mime, "audio/mpeg")? {
+            "mp3"
+        } else if doc.string_is(mime, "audio/wav")? {
+            "wav"
+        } else {
+            return Err(Error::Unsupported);
+        };
+        e.bytes(b"{\"type\":\"input_audio\",\"input_audio\":{\"data\":")?;
+        // `format` names the media type, so the data stays plain base64.
+        view.media.write_base64(doc, doc.required(source, "ref")?, e)?;
+        e.bytes(b",\"format\":")?;
+        e.string(format)?;
+        originals(doc, source, e, &["format"])?;
+        e.bytes(b"}")?;
+        originals(doc, part, e, &[])?;
+        return e.bytes(b"}");
     }
     if is(doc, part, "type", "image")? || is(doc, part, "type", "document")? {
         let image = is(doc, part, "type", "image")?;

@@ -52,6 +52,7 @@ impl Ingress {
                 usage: Usage::default(),
                 terminal: false,
                 next_media: 0,
+                audio: None,
             },
             failed: false,
         })
@@ -146,6 +147,7 @@ struct State {
     usage: Usage,
     terminal: bool,
     next_media: u64,
+    audio: Option<super::audio::Ingress>,
 }
 impl Item {
     fn scope(&self, block: Option<u64>) -> Scope {
@@ -330,7 +332,7 @@ impl State {
             let index = doc.unsigned(doc.required(root, if summary { "summary_index" } else { "content_index" })?)?;
             let part = doc.required(root, "part")?;
             self.block(owner, at, (index, summary), &doc, part, (true, true))?;
-        } else if self.text_event(owner, &doc)? {
+        } else if self.text_event(owner, &doc)? || self.audio_event(owner, &doc)? {
         } else if is(&doc, root, "type", "response.image_generation_call.partial_image")? {
             let at = self.find_event(&doc)?;
             let data = doc.required(root, "partial_image_b64")?;
@@ -405,6 +407,32 @@ impl State {
             source,
             event,
         )
+    }
+    fn audio_event(&mut self, owner: &mut Writer, doc: &Document) -> Result<bool> {
+        let root = doc.root();
+        let delta = is(doc, root, "type", "response.audio.delta")?;
+        let done = is(doc, root, "type", "response.audio.done")?;
+        let transcript = is(doc, root, "type", "response.audio.transcript.delta")?;
+        let transcript_done = is(doc, root, "type", "response.audio.transcript.done")?;
+        if !delta && !done && !transcript && !transcript_done {
+            return Ok(false);
+        }
+        if self.audio.is_none() {
+            let id = media::local_id(b'm', self.next_media)?;
+            self.next_media = self.next_media.checked_add(1).ok_or(Error::Limit)?;
+            self.audio = Some(super::audio::Ingress::start(owner, &mut self.emitter, id, None)?);
+        }
+        let audio = self.audio.as_mut().ok_or(Error::Schema)?;
+        if delta {
+            audio.data(owner, &mut self.emitter, doc, doc.required(root, "delta")?)?;
+        } else if done {
+            audio.audio_done()?;
+        } else if transcript {
+            audio.transcript(owner, &mut self.emitter, doc, doc.required(root, "delta")?, false)?;
+        } else {
+            audio.transcript_done(owner, &mut self.emitter)?;
+        }
+        Ok(true)
     }
     fn unknown(
         &mut self,
@@ -1053,6 +1081,25 @@ impl State {
         if !matches!(doc.node(output)?.value, Value::Array) {
             return Err(Error::Schema);
         }
+        if let Some(native) = doc.member(root, "audio")? {
+            if self.audio.is_none() {
+                let id = media::local_id(b'm', self.next_media)?;
+                self.next_media = self.next_media.checked_add(1).ok_or(Error::Limit)?;
+                self.audio = Some(super::audio::Ingress::start(
+                    owner,
+                    &mut self.emitter,
+                    id,
+                    Some((doc, native)),
+                )?);
+            }
+            self.audio
+                .as_mut()
+                .ok_or(Error::Schema)?
+                .snapshot(owner, &mut self.emitter, doc, native)?;
+        }
+        if let Some(audio) = &mut self.audio {
+            audio.finish(owner, &mut self.emitter)?;
+        }
         if self.operation == Operation::Compact {
             for item in doc.children(output)? {
                 self.emitter.emit(
@@ -1125,7 +1172,7 @@ impl State {
             Scope::default(),
             |e| {
                 e.bytes(b",\"name\":\"responses.response\",\"format\":\"json\",\"value\":")?;
-                write_except(doc, root, e, &["output", "usage"])
+                write_except(doc, root, e, &["output", "usage", "audio"])
             },
             |_| Ok(()),
         )?;
@@ -1292,7 +1339,7 @@ impl<'a> Logical<'a> {
         }
     }
 }
-fn suffix(
+pub(super) fn suffix(
     owner: &mut Writer,
     old: &Document,
     node: Option<usize>,

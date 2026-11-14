@@ -21,7 +21,8 @@ pub(super) fn register(doc: &mut Document, owner: &mut Writer, registry: &mut Re
         let mut part = doc.node(content)?.first;
         while let Some(p) = part {
             part = doc.node(p)?.next;
-            if !super::is(doc, p, "type", "image")? && !super::is(doc, p, "type", "document")? {
+            let audio = super::is(doc, p, "type", "audio")?;
+            if !audio && !super::is(doc, p, "type", "image")? && !super::is(doc, p, "type", "document")? {
                 continue;
             }
             let source = doc.required(p, "source")?;
@@ -37,6 +38,10 @@ pub(super) fn register(doc: &mut Document, owner: &mut Writer, registry: &mut Re
             {
                 doc.rename(data, "ref")?;
                 doc.set(source, "kind", Value::Text("data"))?;
+                if audio {
+                    registry.update_mime(data, doc.member(p, "mime")?);
+                    continue;
+                }
                 if let Some(mime) = media.mime {
                     doc.rename(mime, "mime")?;
                     doc.append(p, mime)?;
@@ -99,7 +104,9 @@ pub(super) fn register(doc: &mut Document, owner: &mut Writer, registry: &mut Re
             let Value::String(text) = doc.node(data)?.value else {
                 return Err(Error::Schema);
             };
-            let kind = if super::is(doc, p, "type", "image")? {
+            let kind = if audio {
+                "audio"
+            } else if super::is(doc, p, "type", "image")? {
                 "image"
             } else {
                 "document"

@@ -145,6 +145,13 @@ fn go_responses_requests_preserve_sampling_roles_and_unknowns() {
 
 fn invalid_part(part: &Value) -> bool {
     use base64::Engine;
+    if part["type"] == "input_audio" {
+        let audio = &part["input_audio"];
+        return !matches!(audio["format"].as_str(), Some("mp3" | "wav"))
+            || audio["data"]
+                .as_str()
+                .is_none_or(|data| base64::engine::general_purpose::STANDARD.decode(data).is_err());
+    }
     if part["type"] == "input_image" && !part["file_id"].is_string() && !part["image_url"].is_string() {
         return true;
     }

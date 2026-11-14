@@ -1,5 +1,6 @@
 //! Responses HTTP boundary codecs over the canonical mapped stream.
 
+mod audio;
 mod content;
 pub mod egress;
 mod image;

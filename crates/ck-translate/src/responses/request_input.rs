@@ -141,6 +141,27 @@ impl Input {
         let value = doc.node(node)?;
         let mut binary = None;
         if let (Some(parent), Some(name)) = (value.parent, value.name) {
+            if doc.name_is(name, "data")?
+                && let Some(parent_name) = doc.node(parent)?.name
+                && doc.name_is(parent_name, "input_audio")?
+                && let Some(part) = doc.node(parent)?.parent
+                && let Some(content) = doc.node(part)?.parent
+                && matches!(doc.node(content)?.value, Value::Array)
+                && let Some(content_name) = doc.node(content)?.name
+                && doc.name_is(content_name, "content")?
+                && let Some(item) = doc.node(content)?.parent
+                && let Some(input) = doc.node(item)?.parent
+                && doc.node(input)?.parent == Some(doc.root())
+                && let Some(input_name) = doc.node(input)?.name
+                && doc.name_is(input_name, "input")?
+            {
+                let Some(kind) = doc.member(part, "type")? else {
+                    return Ok(None);
+                };
+                if doc.string_is(kind, "input_audio")? {
+                    return Ok(Some((Encoding::Base64, "audio", None)));
+                }
+            }
             let image = doc.name_is(name, "image_url")?;
             let file = doc.name_is(name, "file_data")?;
             if image || file {

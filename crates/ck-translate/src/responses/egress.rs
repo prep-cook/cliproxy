@@ -17,6 +17,8 @@ pub struct Egress<F: FnMut(&'static str, u64)> {
     diagnostic: F,
     images: Vec<super::image::Projection>,
     image_metadata: ck_stream::MetadataPermit,
+    audio: Vec<super::audio::Projection>,
+    audio_metadata: ck_stream::MetadataPermit,
 }
 impl<F: FnMut(&'static str, u64)> Egress<F> {
     pub fn new(
@@ -49,6 +51,8 @@ impl<F: FnMut(&'static str, u64)> Egress<F> {
             diagnostic,
             images: Vec::new(),
             image_metadata: owner.reserve_metadata(0)?,
+            audio: Vec::new(),
+            audio_metadata: owner.reserve_metadata(0)?,
         })
     }
     fn emit(
@@ -132,7 +136,7 @@ impl<F: FnMut(&'static str, u64)> Egress<F> {
             );
         }
         if kind == Kind::Done {
-            if self.images.iter().any(|image| !image.closed) {
+            if self.images.iter().any(|image| !image.closed) || self.audio.iter().any(|audio| !audio.closed) {
                 return Err(Error::Truncated);
             }
             self.terminal = true;
@@ -186,6 +190,64 @@ impl<F: FnMut(&'static str, u64)> Egress<F> {
         let doc = &mut self.document;
         let x = doc.required(node, "x_ck")?;
         let output_node = doc.required(doc.root(), "output")?;
+        if kind == Kind::MediaStart && is(doc, node, "kind", "audio")? {
+            super::response::reserve(&mut self.audio, &mut self.audio_metadata)?;
+            self.audio.push(super::audio::Projection::start(doc, node)?);
+            return Ok(());
+        }
+        if matches!(kind, Kind::Data | Kind::MediaTranscript | Kind::MediaEnd)
+            && let Some(id) = doc.member(x, "media_id")?
+        {
+            let mut found = None;
+            for (index, audio) in self.audio.iter().enumerate() {
+                if super::snapshot::equal(doc, audio.id, doc, id)? {
+                    found = Some(index);
+                    break;
+                }
+            }
+            if let Some(index) = found {
+                let audio = &mut self.audio[index];
+                let (name, payload) = match kind {
+                    Kind::Data => {
+                        let payload = encode::scratch(owner, |e| {
+                            e.bytes(b",\"delta\":")?;
+                            doc.write(doc.required(node, "bytes")?, e)
+                        })?;
+                        audio.append(doc, node)?;
+                        ("response.audio.delta", payload)
+                    }
+                    Kind::MediaTranscript => {
+                        let final_value = matches!(doc.node(doc.required(node, "final")?)?.value, Value::Bool(true));
+                        let text = doc.required(node, "text")?;
+                        let nonempty = doc.chars(text)?.next_scalar()?.is_some();
+                        let payload = encode::scratch(owner, |e| {
+                            e.bytes(b",\"delta\":")?;
+                            doc.write(text, e)?;
+                            super::member(doc, node, "timing", e)
+                        })?;
+                        audio.transcript(doc, node)?;
+                        if final_value {
+                            if nonempty {
+                                self.emit(
+                                    owner,
+                                    "response.audio.transcript.delta",
+                                    |e| write_lease(&payload, e),
+                                    output,
+                                )?;
+                            }
+                            return self.emit(owner, "response.audio.transcript.done", |_| Ok(()), output);
+                        }
+                        ("response.audio.transcript.delta", payload)
+                    }
+                    Kind::MediaEnd => {
+                        audio.end(doc, node)?;
+                        return self.emit(owner, "response.audio.done", |_| Ok(()), output);
+                    }
+                    _ => return Err(Error::Schema),
+                };
+                return self.emit(owner, name, |e| write_lease(&payload, e), output);
+            }
+        }
         if matches!(kind, Kind::Data | Kind::MediaEnd) {
             let id = doc.required(x, "media_id")?;
             let mut found = None;
