@@ -284,6 +284,9 @@ impl State {
             .iter()
             .position(|b| b.index == index && !b.summary)
             .ok_or(Error::Schema)?;
+        if item.blocks[local].closed || item.closed {
+            return Err(Error::Schema);
+        }
         self.emitter.emit(
             owner,
             Kind::Annotation,

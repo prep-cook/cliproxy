@@ -153,6 +153,9 @@ impl State {
         string(doc, encrypted)?;
         let item = &mut self.items[at];
         if !item.encrypted {
+            if item.closed {
+                return Err(Error::Schema);
+            }
             let mut chars = doc.chars(encrypted)?;
             let mut redacted = true;
             for c in super::super::REDACTED_PREFIX.chars() {

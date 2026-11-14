@@ -386,3 +386,39 @@ fn unknown_events_are_preserved_not_failed() {
         assert!(result.is_err(), "{input}");
     }
 }
+
+/// Runs streamed `records` through Responses ingress alone; returns the outcome.
+fn ingest(records: &[Value]) -> codec::Result<()> {
+    let mut m = Mapped::new();
+    let mut ingress = responses::response::Ingress::new(
+        &mut m.writer,
+        identity(Direction::Response),
+        Operation::Generate,
+        BodyMode::Streaming,
+        1024 * 1024,
+    )
+    .unwrap();
+    ingress
+        .advance(&mut m.writer, wire(records).as_bytes())
+        .and_then(|()| ingress.finish(&mut m.writer))
+}
+
+#[test]
+fn closed_blocks_and_items_take_no_new_payload() {
+    let message = |content: Value| json!({"id":"i","type":"message","role":"assistant","content":content});
+    let annotation = json!({"type":"url_citation","url":"u","start_index":0,"end_index":2,"title":"t"});
+    let text = json!({"type":"output_text","text":"hi"});
+    let late_annotation = [
+        json!({"type":"response.output_item.added","output_index":0,"item":message(json!([]))}),
+        json!({"type":"response.content_part.done","output_index":0,"item_id":"i","content_index":0,"part":text}),
+        json!({"type":"response.output_text.annotation.added","output_index":0,"item_id":"i","content_index":0,"annotation_index":0,"annotation":annotation}),
+        json!({"type":"response.completed","response":{"id":"r","status":"completed","output":[message(json!([{"type":"output_text","text":"hi","annotations":[annotation]}]))]}}),
+    ];
+    assert!(ingest(&late_annotation).is_err());
+    let reasoning = json!({"id":"i","type":"reasoning","summary":[]});
+    let late_encryption = [
+        json!({"type":"response.output_item.done","output_index":0,"item":reasoning}),
+        json!({"type":"response.completed","response":{"id":"r","status":"completed","output":[{"id":"i","type":"reasoning","summary":[],"encrypted_content":"sig"}]}}),
+    ];
+    assert!(ingest(&late_encryption).is_err());
+}
