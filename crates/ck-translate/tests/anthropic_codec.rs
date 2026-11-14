@@ -13,6 +13,8 @@ mod golden;
 // Test-only inclusion until the framework owner declares the production module.
 #[path = "../src/anthropic/mod.rs"]
 pub mod anthropic;
+#[path = "../src/boundary.rs"]
+pub mod boundary;
 #[path = "../src/codec/mod.rs"]
 pub mod codec;
 #[path = "semantic/mod.rs"]

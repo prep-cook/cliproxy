@@ -217,12 +217,7 @@ impl Egress {
                 }
                 let item = local(&doc, doc.required(x, "item_id")?)?;
                 let canonical = doc.unsigned(doc.required(x, "block_index")?)?;
-                if self
-                    .blocks
-                    .rows
-                    .iter()
-                    .any(|b| b.item == item && b.canonical == canonical)
-                {
+                if self.blocks.iter().any(|b| b.item == item && b.canonical == canonical) {
                     return Err(Error::Schema);
                 }
                 let native = if super::is(&doc, root, "kind", "text")? {
@@ -262,7 +257,7 @@ impl Egress {
                         body.set(body_root, field, Value::Fragments)?;
                     }
                 }
-                let index = self.blocks.rows.len() as u64;
+                let index = self.blocks.len() as u64;
                 self.blocks.push(Block {
                     item,
                     canonical,
@@ -280,7 +275,7 @@ impl Egress {
             }
             Kind::ToolStart => {
                 let index = self.find_or_tool(owner, &doc, x)?;
-                let block = &mut self.blocks.rows[index];
+                let block = &mut self.blocks[index];
                 if block.tool.is_some() {
                     return Err(Error::Schema);
                 }
@@ -362,7 +357,6 @@ impl Egress {
                             let tool = doc.unsigned(doc.required(call, "index")?)?;
                             let index = self
                                 .blocks
-                                .rows
                                 .iter()
                                 .position(|b| b.tool == Some(tool) && b.open)
                                 .ok_or(Error::Schema)?;
@@ -376,7 +370,7 @@ impl Egress {
                         && !matches!(doc.node(reason)?.value, Value::Null)
                     {
                         finished = true;
-                        if self.finish.is_some() || self.blocks.rows.iter().any(|b| b.open) {
+                        if self.finish.is_some() || self.blocks.iter().any(|b| b.open) {
                             return Err(Error::Schema);
                         }
                         self.finish = Some(super::mapped(owner, |e| {
@@ -462,7 +456,7 @@ impl Egress {
             }
             Kind::ToolResult => {
                 let index = self.find(&doc, x)?;
-                let body = &mut self.blocks.rows[index].document;
+                let body = &mut self.blocks[index].document;
                 let from = body.absorb(doc)?;
                 copy_value(body, body.root(), "content", body.required(from, "value")?)?;
                 if let Some(error) = body.member(from, "is_error")? {
@@ -476,7 +470,7 @@ impl Egress {
             }
             Kind::ReasoningRedacted => {
                 let index = self.find(&doc, x)?;
-                let body = &mut self.blocks.rows[index].document;
+                let body = &mut self.blocks[index].document;
                 let from = body.absorb(doc)?;
                 copy_value(body, body.root(), "data", body.required(from, "data")?)?;
                 self.start_block(owner, index, output)?;
@@ -491,7 +485,7 @@ impl Egress {
                 }
                 if many {
                     if self.mode == BodyMode::Buffered {
-                        let body = &mut self.blocks.rows[index].document;
+                        let body = &mut self.blocks[index].document;
                         if body.member(body.root(), "citations")?.is_none() {
                             body.set(body.root(), "citations", Value::Array)?;
                         }
@@ -505,7 +499,7 @@ impl Egress {
             }
             Kind::ToolEnd => {
                 let index = self.find(&doc, x)?;
-                let body = &mut self.blocks.rows[index].document;
+                let body = &mut self.blocks[index].document;
                 if let Some(fragments) = body.remove(body.root(), "partial_json")? {
                     let raw = encode::scratch(owner, |e| {
                         for fragment in body.children(fragments)? {
@@ -520,7 +514,7 @@ impl Egress {
                     body.rename(input, "input")?;
                     body.append(body.root(), input)?;
                 }
-                if !self.blocks.rows[index].explicit_block {
+                if !self.blocks[index].explicit_block {
                     self.close_block(owner, index, None, output)?;
                 }
             }
@@ -546,8 +540,7 @@ impl Egress {
                     .unwrap_or(false);
                 if native && source.is_some_and(|s| super::is(&doc, s, "event", "content_block").unwrap_or(false)) {
                     let index = self.find(&doc, x)?;
-                    self.blocks.rows[index].document =
-                        super::mapped(owner, |e| doc.write(doc.required(root, "value")?, e))?;
+                    self.blocks[index].document = super::mapped(owner, |e| doc.write(doc.required(root, "value")?, e))?;
                     self.start_block(owner, index, output)?;
                 } else if native && self.mode == BodyMode::Streaming {
                     let value = doc.required(root, "value")?;
@@ -557,7 +550,7 @@ impl Egress {
                         let index = self.find(&doc, x)?;
                         output(native_event(owner, "content_block_delta", Some(&doc), |e| {
                             e.bytes(b",\"index\":")?;
-                            e.unsigned(self.blocks.rows[index].index)?;
+                            e.unsigned(self.blocks[index].index)?;
                             for field in doc.children(value)? {
                                 let name = doc.node(field)?.name.ok_or(Error::Schema)?;
                                 if doc.name_is(name, "type")? || doc.name_is(name, "index")? {
@@ -587,7 +580,7 @@ impl Egress {
                         e.bytes(b"}")
                     })?)?;
                 } else {
-                    if self.finish.is_none() || self.blocks.rows.iter().any(|b| b.open) {
+                    if self.finish.is_none() || self.blocks.iter().any(|b| b.open) {
                         return Err(Error::Truncated);
                     }
                     self.begin(owner, output)?;
@@ -625,14 +618,12 @@ impl Egress {
         if let Some(index) = doc.member(x, "block_index")? {
             let index = doc.unsigned(index)?;
             self.blocks
-                .rows
                 .iter()
                 .position(|b| b.item == item && b.canonical == index && b.open)
                 .ok_or(Error::Schema)
         } else if let Some(tool) = doc.member(x, "tool_index")? {
             let tool = doc.unsigned(tool)?;
             self.blocks
-                .rows
                 .iter()
                 .position(|b| b.item == item && b.tool == Some(tool) && b.open)
                 .ok_or(Error::Schema)
@@ -644,7 +635,7 @@ impl Egress {
         if doc.member(x, "block_index")?.is_some() {
             return self.find(doc, x);
         }
-        let index = self.blocks.rows.len();
+        let index = self.blocks.len();
         self.blocks.push(Block {
             item: local(doc, doc.required(x, "item_id")?)?,
             canonical: u64::MAX - index as u64,
@@ -670,12 +661,12 @@ impl Egress {
             return self.find(doc, x);
         }
         let item = local(doc, doc.required(x, "item_id")?)?;
-        if let Some(index) = self.blocks.rows.iter().position(|b| {
+        if let Some(index) = self.blocks.iter().position(|b| {
             b.item == item && b.open && super::is(&b.document, b.document.root(), "type", native).unwrap_or(false)
         }) {
             return Ok(index);
         }
-        let index = self.blocks.rows.len();
+        let index = self.blocks.len();
         let mut body = super::mapped(owner, |e| e.bytes(b"{}"))?;
         body.set(body.root(), "type", Value::Text(native))?;
         body.set(body.root(), native, Value::Fragments)?;
@@ -700,7 +691,7 @@ impl Egress {
         output: &mut impl FnMut(ScratchLease) -> Result<()>,
     ) -> Result<()> {
         self.begin(owner, output)?;
-        let block = &mut self.blocks.rows[index];
+        let block = &mut self.blocks[index];
         if block.started {
             return Ok(());
         }
@@ -728,7 +719,7 @@ impl Egress {
         output: &mut impl FnMut(ScratchLease) -> Result<()>,
     ) -> Result<()> {
         self.start_block(owner, index, output)?;
-        let block = &mut self.blocks.rows[index];
+        let block = &mut self.blocks[index];
         if !block.open {
             return Err(Error::Schema);
         }
@@ -756,7 +747,7 @@ impl Egress {
     ) -> Result<()> {
         super::string(doc, value)?;
         self.start_block(owner, index, output)?;
-        let block = &mut self.blocks.rows[index];
+        let block = &mut self.blocks[index];
         if self.mode == BodyMode::Streaming {
             output(native_event(owner, "content_block_delta", Some(doc), |e| {
                 e.bytes(b",\"index\":")?;
@@ -795,7 +786,7 @@ impl Egress {
         output: &mut impl FnMut(ScratchLease) -> Result<()>,
     ) -> Result<()> {
         if self.mode == BodyMode::Streaming {
-            let block = &self.blocks.rows[index];
+            let block = &self.blocks[index];
             output(event(owner, "content_block_delta", |e| {
                 e.bytes(b",\"index\":")?;
                 e.unsigned(block.index)?;
@@ -805,7 +796,7 @@ impl Egress {
             })?)?;
         } else {
             let incoming = super::mapped(owner, |e| doc.write(value, e))?;
-            let body = &mut self.blocks.rows[index].document;
+            let body = &mut self.blocks[index].document;
             let value = body.absorb(incoming)?;
             let array = match body.member(body.root(), "citations")? {
                 Some(n) => n,
@@ -819,7 +810,7 @@ impl Egress {
         e.bytes(b"{")?;
         write_base(self.base.as_ref().ok_or(Error::Schema)?, e)?;
         e.bytes(b",\"content\":[")?;
-        for (index, block) in self.blocks.rows.iter().enumerate() {
+        for (index, block) in self.blocks.iter().enumerate() {
             if index != 0 {
                 e.bytes(b",")?;
             }

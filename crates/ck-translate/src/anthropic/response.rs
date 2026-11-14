@@ -320,7 +320,7 @@ impl State {
             }
             // A leading heartbeat may have created synthetic identity; replace it with supplied metadata.
             if self.base.is_some() {
-                if self.blocks.rows.iter().any(|b| b.open) || self.finished {
+                if self.blocks.iter().any(|b| b.open) || self.finished {
                     return Err(Error::Schema);
                 }
                 self.base = Some(super::mapped(owner, |e| {
@@ -485,7 +485,7 @@ impl State {
         whole: bool,
         origin: Origin<'_>,
     ) -> Result<()> {
-        if self.blocks.rows.iter().any(|b| b.index == index) {
+        if self.blocks.iter().any(|b| b.index == index) {
             return Err(Error::Schema);
         }
         let kind = if super::is(doc, node, "type", "text")? {
@@ -507,7 +507,7 @@ impl State {
         let result_scope = if kind == "tool_result" {
             let id = doc.required(node, "tool_use_id")?;
             let mut matched = None;
-            for block in &self.blocks.rows {
+            for block in self.blocks.iter() {
                 if let Some(source) = &block.source_id
                     && super::equal_text(source, source.root(), doc, id)?
                 {
@@ -697,7 +697,6 @@ impl State {
     ) -> Result<()> {
         let block = self
             .blocks
-            .rows
             .iter()
             .find(|b| b.index == index && b.open)
             .ok_or(Error::Schema)?;
@@ -803,7 +802,6 @@ impl State {
         super::string(doc, value)?;
         let block = self
             .blocks
-            .rows
             .iter_mut()
             .find(|block| block.scope.block_index == scope.block_index)
             .ok_or(Error::Schema)?;
@@ -836,7 +834,6 @@ impl State {
     ) -> Result<()> {
         let block = self
             .blocks
-            .rows
             .iter_mut()
             .find(|b| b.index == index && b.open)
             .ok_or(Error::Schema)?;
@@ -881,16 +878,15 @@ impl State {
     fn block_stop(&mut self, owner: &mut Writer, index: u64, origin: Origin<'_>) -> Result<()> {
         let position = self
             .blocks
-            .rows
             .iter()
             .position(|b| b.index == index && b.open)
             .ok_or(Error::Schema)?;
-        if !self.blocks.rows[position].fragments
-            && let Some(initial) = self.blocks.rows[position].initial.take()
+        if !self.blocks[position].fragments
+            && let Some(initial) = self.blocks[position].initial.take()
         {
             self.arguments(owner, index, &initial, initial.root(), false, None)?;
         }
-        let block = &mut self.blocks.rows[position];
+        let block = &mut self.blocks[position];
         if let Some((source, parser)) = &mut block.arguments {
             if block.fragments {
                 parser.finish(source)?;
@@ -949,7 +945,7 @@ impl State {
     }
     fn finish_choice(&mut self, owner: &mut Writer, doc: &Document, parent: usize, origin: Origin<'_>) -> Result<()> {
         self.require_active()?;
-        if self.blocks.rows.iter().any(|b| b.open) {
+        if self.blocks.iter().any(|b| b.open) {
             return Err(Error::Truncated);
         }
         let reason = doc.required(parent, "stop_reason")?;
@@ -1013,7 +1009,7 @@ impl State {
         Ok(())
     }
     fn done(&mut self, owner: &mut Writer, origin: Origin<'_>) -> Result<()> {
-        if self.base.is_none() || !self.finished || self.blocks.rows.iter().any(|b| b.open) {
+        if self.base.is_none() || !self.finished || self.blocks.iter().any(|b| b.open) {
             return Err(Error::Truncated);
         }
         if self.usage.seen() {

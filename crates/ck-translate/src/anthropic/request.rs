@@ -101,12 +101,7 @@ impl codec::RequestIngress for Ingress {
     }
 
     fn advance(&mut self, owner: &mut Writer, bytes: &[u8]) -> Result<()> {
-        if owner.id() != self.owner {
-            return Err(Error::Position);
-        }
-        if self.closed {
-            return Err(Error::Closed);
-        }
+        crate::boundary::enter(self.owner, owner, self.closed)?;
         let result = (|| {
             if bytes.is_empty() {
                 self.flush_pending(owner)?;
@@ -117,45 +112,20 @@ impl codec::RequestIngress for Ingress {
             }
             Ok(())
         })();
-        if let Err(error) = result {
-            self.closed = true;
-            if !matches!(error, Error::Storage(_)) {
-                super::failure(&mut self.emitter, owner, true)?;
-            }
-            return Err(error);
-        }
-        Ok(())
+        self.closed = result.is_err();
+        crate::boundary::reported(result, &mut self.emitter, owner, true)
     }
     fn finish<'a>(&'a mut self, owner: &mut Writer, destination: &impl Capability) -> Result<ValidatedRequest<'a>> {
-        if owner.id() != self.owner {
-            return Err(Error::Position);
-        }
-        if self.closed {
-            return Err(Error::Closed);
-        }
+        crate::boundary::enter(self.owner, owner, self.closed)?;
         self.closed = true;
-        if let Err(error) = self.prepare(owner) {
-            if !matches!(error, Error::Storage(_)) {
-                super::failure(&mut self.emitter, owner, true)?;
-            }
-            return Err(error);
-        }
+        let prepared = self.prepare(owner);
+        crate::boundary::reported(prepared, &mut self.emitter, owner, true)?;
         let view = RequestView {
             document: self.document.as_ref().ok_or(Error::Schema)?,
             media: &self.media,
             operation: self.operation,
         };
-        let ready = match self.fence.end(view, destination) {
-            Ok(r) => r,
-            Err(error) => {
-                super::failure(&mut self.emitter, owner, true)?;
-                return Err(error);
-            }
-        };
-        self.emitter.request_end(owner, &ready)?;
-        self.emitter
-            .emit(owner, Kind::Done, Scope::default(), |_| Ok(()), |_| Ok(()))?;
-        Ok(ready)
+        crate::boundary::end_request(&mut self.fence, view, destination, &mut self.emitter, owner)
     }
 }
 pub struct AnthropicCapability;
