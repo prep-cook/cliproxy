@@ -7,6 +7,7 @@ use crate::codec::{
     document::{Document, Value},
     encode::{self, Encoder},
     event::{Identity, Kind, LocalId},
+    identity::ResponseId,
     internal,
 };
 use ck_stream::{Lease, ScratchLease, Writer};
@@ -48,6 +49,7 @@ pub struct Egress {
     mode: BodyMode,
     sequence: u64,
     base: Option<Document>,
+    id: ResponseId,
     blocks: Table<Block>,
     /// `blocks` positions by (item, block index) and by tool index, and `text_lists` positions
     /// by (item, kind).
@@ -84,6 +86,7 @@ impl Egress {
             mode,
             sequence: 0,
             base: None,
+            id: ResponseId::new("msg_", owner.id())?,
             blocks: Table::new(owner)?,
             named: Index::new(owner)?,
             tools: Index::new(owner)?,
@@ -213,7 +216,7 @@ impl Egress {
         if self.terminal || self.failed {
             return Err(Error::Closed);
         }
-        let (kind, doc) = internal::decode(owner, lease)?;
+        let (kind, mut doc) = internal::decode(owner, lease)?;
         let root = doc.root();
         let x = doc.required(root, "x_ck")?;
         if doc.unsigned(doc.required(x, "seq")?)? != self.sequence
@@ -235,6 +238,10 @@ impl Egress {
             Kind::ResponseStart => {
                 if self.base.is_some() {
                     return Err(Error::Schema);
+                }
+                let root = doc.root();
+                if self.id.start(&doc, root)?.is_none() {
+                    doc.set_id(root, "id", self.id.issued().ok_or(Error::Schema)?)?;
                 }
                 self.base = Some(doc);
             }
@@ -510,8 +517,8 @@ fn raw_string(doc: &Document, node: usize, e: &mut Encoder<'_, '_>, multiline: b
     Ok(())
 }
 
-fn metadata_changed(base: &Document, incoming: &Document) -> Result<bool> {
-    for key in ["id", "model", "created"] {
+fn metadata_changed(base: &Document, incoming: &Document, keys: &[&str]) -> Result<bool> {
+    for &key in keys {
         let Some(next) = incoming.member(incoming.root(), key)? else {
             continue;
         };

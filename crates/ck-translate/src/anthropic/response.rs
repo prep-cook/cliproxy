@@ -175,6 +175,11 @@ impl State {
         if self.base.is_some() {
             return Ok(());
         }
+        // Without a message id the stream id stands in, marked generated.
+        let generated = match doc {
+            Some((d, n)) => d.member(n, "id")?.is_none(),
+            None => true,
+        };
         let base = mapped(owner, |e| {
             e.bytes(b"{\"id\":")?;
             if let Some((d, n)) = doc {
@@ -201,7 +206,8 @@ impl State {
                 Ok(())
             },
             |e| {
-                e.bytes(b",\"source\":{\"protocol\":\"anthropic\"},\"synthetic\":[\"created\"]")?;
+                e.bytes(b",\"source\":{\"protocol\":\"anthropic\"},\"synthetic\":[\"created\"")?;
+                e.bytes(if generated { b",\"id\"]" } else { b"]" })?;
                 if let Some((d, n)) = doc {
                     unknown(d, n, MESSAGE_FIELDS, e)?;
                 }

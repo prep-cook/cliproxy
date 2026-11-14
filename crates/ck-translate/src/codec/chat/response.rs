@@ -336,12 +336,14 @@ impl State {
             e.bytes(b"}")
         })?;
         if self.base.is_none() {
+            // Without a source id the stream id stands in, marked generated.
+            let generated = doc.map_or(Ok(None), |doc| doc.member(doc.root(), "id"))?.is_none();
             self.emitter.emit(
                 owner,
                 Kind::ResponseStart,
                 Scope::default(),
                 |e| members(&base, base.root(), e, &[]),
-                |_| Ok(()),
+                |e| e.bytes(if generated { b",\"synthetic\":[\"id\"]" } else { b"" }),
             )?;
         }
         self.base = Some(base);

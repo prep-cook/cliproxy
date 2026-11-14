@@ -27,6 +27,7 @@ pub struct Egress<F: FnMut(&'static str, u64)> {
     owner: u64,
     mode: BodyMode,
     document: Document,
+    id: codec::identity::ResponseId,
     terminal: bool,
     sequence: u64,
     diagnostic: F,
@@ -46,12 +47,11 @@ impl<F: FnMut(&'static str, u64)> Egress<F> {
         if operation == Operation::CountTokens || (operation == Operation::Compact && mode == BodyMode::Streaming) {
             return Err(Error::Unsupported);
         }
-        // The response id when the source supplies none: generated here, never a source value.
-        let id = codec::media::local_id(b's', owner.id())?;
+        let id = codec::identity::ResponseId::new("resp_", owner.id())?;
         let document = super::mapped(owner, |e| {
-            e.bytes(b"{\"id\":\"resp_")?;
-            e.bytes(id.as_str().as_bytes())?;
-            e.bytes(b"\",\"object\":")?;
+            e.bytes(b"{\"id\":")?;
+            e.string(id.issued().ok_or(Error::Schema)?.as_str())?;
+            e.bytes(b",\"object\":")?;
             e.string(if operation == Operation::Compact {
                 "response.compaction"
             } else {
@@ -63,6 +63,7 @@ impl<F: FnMut(&'static str, u64)> Egress<F> {
             owner: owner.id(),
             mode,
             document,
+            id,
             terminal: false,
             sequence: 0,
             diagnostic,
@@ -132,7 +133,7 @@ impl<F: FnMut(&'static str, u64)> Egress<F> {
             (self.diagnostic)("unsupported event", 0);
             return Ok(());
         }
-        let node = self.document.absorb(incoming)?;
+        let node = self.absorb(kind, incoming)?;
         if kind == Kind::MediaStart && is(&self.document, node, "kind", "audio")? {
             return self.audio_start(node);
         }

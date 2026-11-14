@@ -40,6 +40,7 @@ impl<F: FnMut(&'static str, u64)> Egress<F> {
         let doc = &mut self.document;
         let target = doc.root();
         let node = doc.absorb(incoming)?;
+        self.id.start(doc, node)?;
         for (from, to) in [
             ("id", "id"),
             ("model", "model"),
@@ -47,7 +48,7 @@ impl<F: FnMut(&'static str, u64)> Egress<F> {
             ("status", "status"),
         ] {
             if let Some(value) = doc.remove(node, from)?
-                && !synthetic(doc, node, from)?
+                && !codec::identity::synthetic(doc, node, from)?
             {
                 let target = doc.set(target, to, Value::Null)?;
                 doc.transplant(target, value)?;
@@ -55,6 +56,28 @@ impl<F: FnMut(&'static str, u64)> Egress<F> {
         }
         self.owed = true;
         Ok(())
+    }
+
+    /// Absorbs a canonical record. A chunk's root `model` replaces the response's, and its `id`
+    /// does under [`codec::identity::ResponseId`]'s rule.
+    pub(super) fn absorb(&mut self, kind: Kind, incoming: Document) -> Result<usize> {
+        let node = self.document.absorb(incoming)?;
+        if kind != Kind::Chunk {
+            return Ok(node);
+        }
+        let doc = &mut self.document;
+        let root = doc.root();
+        if let Some(id) = doc.member(node, "id")?
+            && self.id.adopts(doc, id, self.sequence > 0)?
+        {
+            let target = doc.set(root, "id", Value::Null)?;
+            doc.transplant(target, id)?;
+        }
+        if let Some(model) = doc.member(node, "model")? {
+            let target = doc.set(root, "model", Value::Null)?;
+            doc.transplant(target, model)?;
+        }
+        Ok(node)
     }
 
     /// Publishes the owed `response.created` with the response as it stands. Every event other
@@ -139,8 +162,9 @@ impl<F: FnMut(&'static str, u64)> Egress<F> {
             let node = doc.absorb(incoming)?;
             let value = doc.required(node, "value")?;
             super::super::opaque::preserve_carrier_collision(doc, value)?;
-            // A client that has seen the response keeps its id for the whole response.
-            if self.sequence > 0 {
+            if let Some(id) = doc.member(value, "id")?
+                && !self.id.adopts(doc, id, self.sequence > 0)?
+            {
                 doc.remove(value, "id")?;
             }
             super::super::merge(doc, doc.root(), value)?;
@@ -194,20 +218,4 @@ impl<F: FnMut(&'static str, u64)> Egress<F> {
         doc.append(output_node, item)?;
         Ok(())
     }
-}
-
-/// Whether the canonical start `node` names `field` as generated rather than supplied.
-fn synthetic(doc: &Document, node: usize, field: &str) -> Result<bool> {
-    let Some(x) = doc.member(node, "x_ck")? else {
-        return Ok(false);
-    };
-    let Some(names) = doc.member(x, "synthetic")? else {
-        return Ok(false);
-    };
-    for name in doc.children(names)? {
-        if doc.string_is(name, field)? {
-            return Ok(true);
-        }
-    }
-    Ok(false)
 }

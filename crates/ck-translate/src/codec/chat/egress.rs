@@ -4,6 +4,7 @@ use crate::codec::{
     document::{Document, Value},
     encode::{self, Encoder},
     event::{Identity, Kind},
+    identity::ResponseId,
     internal,
     table::Table,
 };
@@ -24,6 +25,9 @@ pub struct Egress {
     terminal: bool,
     failed: bool,
     reduction: Reduction,
+    id: ResponseId,
+    /// A streamed record has shown the client the response id.
+    shown: bool,
     /// Streamed choice indexes and whether each delivered its finish.
     finishes: Table<(u64, bool)>,
     /// Choice and tool indexes of every started tool call without its end.
@@ -51,6 +55,8 @@ impl Egress {
             terminal: false,
             failed: false,
             reduction: Reduction::new(owner)?,
+            id: ResponseId::new("chatcmpl-", owner.id())?,
+            shown: false,
             finishes: Table::new(owner)?,
             open_tools: Table::new(owner)?,
             include_usage,
@@ -119,11 +125,12 @@ impl Egress {
         &mut self,
         owner: &mut Writer,
         kind: Kind,
-        doc: Document,
+        mut doc: Document,
         x: usize,
         output: &mut impl FnMut(ScratchLease) -> Result<()>,
     ) -> Result<()> {
         let root = doc.root();
+        self.response_id(owner, kind, &mut doc)?;
         let deliverable = if kind == Kind::Chunk {
             if self.mode == BodyMode::Streaming {
                 self.reduction.refresh_metadata(owner, &doc)?;
@@ -159,9 +166,44 @@ impl Egress {
                     projection.write(projection.root(), e)?;
                     e.bytes(b"\n\n")
                 })?)?;
+                self.shown = true;
             }
         }
         Ok(())
+    }
+
+    /// Gives the start and each chunk the id the client sees under [`ResponseId`]'s rule. A chunk
+    /// whose id the rule rejects, or that has none, carries the selected id, issued or adopted.
+    fn response_id(&mut self, owner: &mut Writer, kind: Kind, doc: &mut Document) -> Result<()> {
+        let root = doc.root();
+        match kind {
+            Kind::ResponseStart => {
+                if self.id.start(doc, root)?.is_none() {
+                    doc.set_id(root, "id", self.id.issued().ok_or(Error::Schema)?)?;
+                }
+                return Ok(());
+            }
+            Kind::Chunk => {}
+            _ => return Ok(()),
+        }
+        let current = self.reduction.document.as_ref().ok_or(Error::Schema)?;
+        let selected = current.required(current.root(), "id")?;
+        if let Some(id) = doc.member(root, "id")?
+            && (super::response::equal(current, selected, doc, id)? || self.id.adopts(doc, id, self.shown)?)
+        {
+            return Ok(());
+        }
+        if let Some(issued) = self.id.issued() {
+            return doc.set_id(root, "id", issued).map(drop);
+        }
+        let copy = super::response::mapped_document(owner, |e| {
+            e.bytes(b"{\"id\":")?;
+            current.write(selected, e)?;
+            e.bytes(b"}")
+        })?;
+        let copy = doc.absorb(copy)?;
+        let target = doc.set(root, "id", Value::Null)?;
+        doc.transplant(target, doc.required(copy, "id")?)
     }
 
     /// Delivers a media attributes record as a native field, or another opaque record as its

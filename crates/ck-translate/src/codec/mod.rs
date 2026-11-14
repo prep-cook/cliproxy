@@ -53,6 +53,7 @@ pub mod chat;
 pub mod document;
 pub mod encode;
 pub mod event;
+pub mod identity;
 pub mod internal;
 pub mod json;
 pub mod media;

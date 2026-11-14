@@ -176,6 +176,9 @@ impl State {
                 }
                 // The synthetic response.start could not carry the message's unknown members.
                 provenance_as(origin.1, origin.2, Some("message_start"), e)?;
+                if doc.member(message, "id")?.is_none() {
+                    e.bytes(b",\"synthetic\":[\"id\"]")?;
+                }
                 unknown_at(
                     doc,
                     &[
