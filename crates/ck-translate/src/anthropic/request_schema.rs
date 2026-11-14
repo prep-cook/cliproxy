@@ -98,7 +98,7 @@ pub(super) fn validate(view: RequestView<'_>) -> Result<()> {
             }
         }
         if doc.string_is(role, "tool")? {
-            linked(doc, messages, message, doc.required(message, "tool_call_id")?)?;
+            linked(doc, messages, message, None, doc.required(message, "tool_call_id")?)?;
         }
         if let Some(calls) = doc.member(message, "tool_calls")? {
             if !doc.string_is(role, "assistant")? || !matches!(doc.node(calls)?.value, Value::Array) {
@@ -106,6 +106,12 @@ pub(super) fn validate(view: RequestView<'_>) -> Result<()> {
             }
             for call in doc.children(calls)? {
                 super::string(doc, doc.required(call, "id")?)?;
+                if !super::is(doc, call, "type", "function")? && !super::is(doc, call, "type", "server")? {
+                    return Err(Error::Unsupported);
+                }
+                if let Some(namespace) = doc.member(call, "namespace")? {
+                    super::string(doc, namespace)?;
+                }
                 if !super::is(doc, call, "arguments_format", "json")? {
                     return Err(Error::Unsupported);
                 }
@@ -238,6 +244,7 @@ fn validate_part(view: RequestView<'_>, message: usize, part: usize) -> Result<(
             doc,
             doc.required(doc.root(), "messages")?,
             message,
+            Some(part),
             doc.required(part, "tool_call_id")?,
         )?;
         if let Some(content) = doc.member(part, "content")? {
@@ -262,18 +269,44 @@ fn validate_part(view: RequestView<'_>, message: usize, part: usize) -> Result<(
     }
     Ok(())
 }
-fn linked(doc: &Document, messages: usize, message: usize, id: usize) -> Result<()> {
+fn linked(doc: &Document, messages: usize, message: usize, result: Option<usize>, id: usize) -> Result<()> {
     super::string(doc, id)?;
+    let result_order = result
+        .map(|part| super::content::history(doc, part))
+        .transpose()?
+        .flatten();
+    let server = result_order
+        .map(|entry| doc.member(entry, "server_result"))
+        .transpose()?
+        .flatten()
+        .map(|node| doc.node(node))
+        .transpose()?
+        .is_some_and(|node| matches!(node.value, Value::Bool(true)));
     for prior in doc.children(messages)? {
-        if prior == message {
+        if prior == message && !server {
             break;
         }
         if let Some(calls) = doc.member(prior, "tool_calls")? {
             for call in doc.children(calls)? {
                 if doc.equal_strings(id, doc.required(call, "id")?)? {
+                    if server != super::is(doc, call, "type", "server")? {
+                        return Err(Error::Schema);
+                    }
+                    if prior == message {
+                        let before = super::content::history(doc, call)?.ok_or(Error::Schema)?;
+                        let after = result_order.ok_or(Error::Schema)?;
+                        if doc.unsigned(doc.required(before, "block_index")?)?
+                            >= doc.unsigned(doc.required(after, "block_index")?)?
+                        {
+                            return Err(Error::Schema);
+                        }
+                    }
                     return Ok(());
                 }
             }
+        }
+        if prior == message {
+            break;
         }
     }
     Err(Error::Schema)

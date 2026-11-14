@@ -25,16 +25,20 @@ pub(super) fn normalize(owner: &mut Writer, doc: &mut Document, message: usize, 
             let mut call_index = 0;
             while let Some(part) = next {
                 next = doc.node(part)?.next;
-                if super::is(doc, part, "type", "tool_use")? || super::is(doc, part, "type", "server_tool_use")? {
+                if super::is(doc, part, "type", "tool_use")?
+                    || super::is(doc, part, "type", "server_tool_use")?
+                    || super::is(doc, part, "type", "mcp_tool_use")?
+                {
                     if !doc.string_is(role, "assistant")? {
                         return Err(Error::Schema);
                     }
-                    let server = super::is(doc, part, "type", "server_tool_use")?;
+                    let mcp = super::is(doc, part, "type", "mcp_tool_use")?;
+                    let server = mcp || super::is(doc, part, "type", "server_tool_use")?;
                     super::request::capture(
                         owner,
                         doc,
                         part,
-                        &["type", "id", "name", "input", "cache_control"],
+                        &["type", "id", "name", "input", "cache_control", "server_name"],
                         original,
                     )?;
                     doc.detach(content, part)?;
@@ -44,6 +48,8 @@ pub(super) fn normalize(owner: &mut Writer, doc: &mut Document, message: usize, 
                     };
                     doc.append(calls, part)?;
                     let kind = doc.required(part, "type")?;
+                    let native_type = doc.clone_tree(kind)?;
+                    doc.rename(native_type, "native_type")?;
                     doc.replace(kind, Value::Text(if server { "server" } else { "function" }))?;
                     let function = doc.set(part, "function", Value::Object)?;
                     let name = doc.remove(part, "name")?.ok_or(Error::Schema)?;
@@ -52,6 +58,12 @@ pub(super) fn normalize(owner: &mut Writer, doc: &mut Document, message: usize, 
                         doc.rename(input, "arguments")?;
                         doc.append(function, input)?;
                     }
+                    if mcp {
+                        let namespace = doc.remove(part, "server_name")?.ok_or(Error::Schema)?;
+                        super::string(doc, namespace)?;
+                        doc.rename(namespace, "namespace")?;
+                        doc.append(part, namespace)?;
+                    }
                     doc.set(part, "arguments_format", Value::Text("json"))?;
                     let order = doc.required(x, "anthropic_order")?;
                     let entry = doc.add(None, Value::Object)?;
@@ -59,13 +71,14 @@ pub(super) fn normalize(owner: &mut Writer, doc: &mut Document, message: usize, 
                     doc.set(entry, "message_index", Value::Unsigned(message_index))?;
                     doc.set(entry, "block_index", Value::Unsigned(block_index))?;
                     doc.set(entry, "call_index", Value::Unsigned(call_index))?;
+                    doc.append(entry, native_type)?;
                     doc.bind_origin(entry, part, None)?;
                     cache(owner, doc, part)?;
                     super::request::capture(
                         owner,
                         doc,
                         part,
-                        &["id", "type", "function", "arguments_format"],
+                        &["id", "type", "function", "arguments_format", "namespace"],
                         original,
                     )?;
                     call_index += 1;
@@ -99,7 +112,7 @@ fn normalize_part(
         Some(&["type", "data"])
     } else if doc.string_is(kind, "image")? || doc.string_is(kind, "document")? {
         Some(&["type", "source"])
-    } else if doc.string_is(kind, "tool_result")? {
+    } else if doc.string_is(kind, "tool_result")? || super::server_result(doc, part)? {
         Some(&["type", "tool_use_id", "content", "is_error"])
     } else {
         None
@@ -169,7 +182,19 @@ fn normalize_part(
             &["kind", "ref", "uri", "file_id", "anthropic_text"],
             original,
         )?;
-    } else if doc.string_is(kind, "tool_result")? {
+    } else if doc.string_is(kind, "tool_result")? || super::server_result(doc, part)? {
+        let server = super::server_result(doc, part)?;
+        let native_type = doc.clone_tree(kind)?;
+        doc.rename(native_type, "native_type")?;
+        let order = doc.required(x, "anthropic_order")?;
+        let entry = doc.add(None, Value::Object)?;
+        doc.append(order, entry)?;
+        doc.append(entry, native_type)?;
+        doc.set(entry, "message_index", Value::Unsigned(message_index))?;
+        doc.set(entry, "block_index", Value::Unsigned(block_index))?;
+        doc.set(entry, "server_result", Value::Bool(server))?;
+        doc.bind_origin(entry, part, None)?;
+        doc.replace(kind, Value::Text("tool_result"))?;
         let id = doc.required(part, "tool_use_id")?;
         doc.rename(id, "tool_call_id")?;
         if let Some(content) = doc.member(part, "content")? {
@@ -189,6 +214,17 @@ fn normalize_part(
                     next = doc.node(child)?.next;
                     normalize_part(owner, doc, child, message_index, block_index)?;
                 }
+            } else if server && matches!(doc.node(content)?.value, Value::Object) {
+                doc.detach(part, content)?;
+                doc.rename(content, "value")?;
+                let array = doc.set(part, "content", Value::Array)?;
+                let item = doc.add(None, Value::Object)?;
+                doc.append(array, item)?;
+                doc.set(item, "type", Value::Text("opaque"))?;
+                doc.set(item, "protocol", Value::Text("anthropic"))?;
+                doc.append(item, content)?;
+                let marker = doc.add(Some(Name::Static("content_shape")), Value::Text("object"))?;
+                super::request::preserve(owner, doc, original, part, marker, Some("shape"))?;
             } else {
                 return Err(Error::Schema);
             }
@@ -363,4 +399,17 @@ struct MediaRegistration<'a> {
     emitter: &'a mut crate::codec::event::Emitter,
     reader: &'a mut ck_stream::Reader,
     published: &'a mut usize,
+}
+
+pub(super) fn history(doc: &Document, node: usize) -> Result<Option<usize>> {
+    let x = doc.required(doc.root(), "x_ck")?;
+    let Some(order) = doc.member(x, "anthropic_order")? else {
+        return Ok(None);
+    };
+    for entry in doc.origins(node)? {
+        if doc.node(entry)?.parent == Some(order) {
+            return Ok(Some(entry));
+        }
+    }
+    Ok(None)
 }

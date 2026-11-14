@@ -176,3 +176,46 @@ fn long_signed_history_and_tool_results_survive_incremental_normalization() {
     let output = finish(&mut mapped, &mut codec);
     assert_eq!(output["messages"], input["messages"]);
 }
+
+#[test]
+fn empty_advance_flushes_idle_payload_without_closing_media() {
+    use base64::Engine;
+    let mut mapped = Mapped::new();
+    let mut input = ingress(&mut mapped);
+    input.advance(&mut mapped.writer, br#"{"model":"m","max_tokens":1,"messages":[{"role":"user","content":[{"type":"image","source":{"type":"base64","data":"AAEC"#).unwrap();
+    input.advance(&mut mapped.writer, b"AwQF").unwrap();
+    input.advance(&mut mapped.writer, b"").unwrap();
+    let raw = mapped.output(&mapped.writer);
+    let decoded: Vec<_> = events(&raw)
+        .iter()
+        .filter_map(|event| event["bytes"].as_str())
+        .flat_map(|s| base64::engine::general_purpose::STANDARD.decode(s).unwrap())
+        .collect();
+    assert_eq!(decoded, [0, 1, 2, 3, 4, 5]);
+    let raw = std::str::from_utf8(&raw).unwrap();
+    assert!(!raw.contains("event: x_ck.media.end\n"));
+    assert!(!raw.contains("event: x_ck.request.end\n"));
+    input.advance(&mut mapped.writer, br#""}}]}]}"#).unwrap();
+    assert_eq!(
+        finish(&mut mapped, &mut input)["messages"][0]["content"][0]["source"]["data"],
+        "AAECAwQF"
+    );
+}
+
+#[test]
+fn malformed_streamed_tails_never_close_media_successfully() {
+    for (prefix, tail) in [
+        (br#"{"model":"m","max_tokens":1,"messages":[{"role":"user","content":[{"type":"image","source":{"type":"base64","data":"AAEC"#.as_slice(), br#"A"}}]}]}"#.as_slice()),
+        (br#"{"model":"m","max_tokens":1,"messages":[{"role":"user","content":[{"type":"image","source":{"type":"base64","data":"AAEC"#.as_slice(), br#"!"}}]}]}"#.as_slice()),
+    ] {
+        let mut mapped = Mapped::new();
+        let mut input = ingress(&mut mapped);
+        input.advance(&mut mapped.writer, prefix).unwrap();
+        assert!(input.advance(&mut mapped.writer, tail).is_err());
+        let raw = mapped.output(&mapped.writer);
+        let raw = std::str::from_utf8(&raw).unwrap();
+        assert!(raw.contains("event: x_ck.error\n"));
+        assert!(!raw.contains("event: x_ck.media.end\n"));
+        assert!(!raw.contains("event: x_ck.request.end\n"));
+    }
+}

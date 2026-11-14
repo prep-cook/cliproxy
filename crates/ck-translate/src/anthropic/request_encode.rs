@@ -277,23 +277,27 @@ fn message_value(view: RequestView<'_>, message: usize, message_index: u64, e: &
     e.bytes(b"}")
 }
 fn call_position(doc: &Document, call: usize) -> Result<Option<u64>> {
-    let x = doc.required(doc.root(), "x_ck")?;
-    if let Some(order) = doc.member(x, "anthropic_order")? {
-        for entry in doc.children(order)? {
-            if doc.origin(entry)?.is_some_and(|(parent, _)| parent == call) {
-                return Ok(Some(doc.unsigned(doc.required(entry, "block_index")?)?));
-            }
-        }
-    }
-    Ok(None)
+    super::content::history(doc, call)?
+        .map(|entry| doc.unsigned(doc.required(entry, "block_index")?))
+        .transpose()
 }
 fn tool_call(doc: &Document, call: usize, e: &mut Encoder<'_, '_>) -> Result<()> {
     e.bytes(b"{\"type\":")?;
-    e.string(if super::is(doc, call, "type", "server")? {
-        "server_tool_use"
+    if let Some(entry) = super::content::history(doc, call)?
+        && let Some(native) = doc.member(entry, "native_type")?
+    {
+        doc.write(native, e)?;
     } else {
-        "tool_use"
-    })?;
+        e.string(if super::is(doc, call, "type", "server")? {
+            "server_tool_use"
+        } else {
+            "tool_use"
+        })?;
+    }
+    if let Some(namespace) = doc.member(call, "namespace")? {
+        e.bytes(b",\"server_name\":")?;
+        doc.write(namespace, e)?;
+    }
     super::member(doc, call, "id", e)?;
     let function = doc.required(call, "function")?;
     super::member(doc, function, "name", e)?;
@@ -376,14 +380,23 @@ fn part_value(
         originals(doc, source, e)?;
         e.bytes(b"}")?;
     } else if doc.string_is(kind, "tool_result")? {
-        e.string("tool_result")?;
+        if let Some(entry) = super::content::history(doc, part)?
+            && let Some(native) = doc.member(entry, "native_type")?
+        {
+            doc.write(native, e)?;
+        } else {
+            e.string("tool_result")?;
+        }
         e.bytes(b",\"tool_use_id\":")?;
         doc.write(doc.required(part, "tool_call_id")?, e)?;
         if let Some(value) = doc.member(part, "content")? {
             e.bytes(b",\"content\":")?;
-            if shape_string(doc, part)? {
+            if shape(doc, part, "string")? {
                 let text = doc.node(value)?.first.ok_or(Error::Schema)?;
                 doc.write(doc.required(text, "text")?, e)?;
+            } else if shape(doc, part, "object")? {
+                let item = doc.node(value)?.first.ok_or(Error::Schema)?;
+                doc.write(doc.required(item, "value")?, e)?;
             } else {
                 content(view, value, message_index, e)?;
             }
@@ -396,12 +409,12 @@ fn part_value(
     originals(doc, part, e)?;
     e.bytes(b"}")
 }
-fn shape_string(doc: &Document, parent: usize) -> Result<bool> {
+fn shape(doc: &Document, parent: usize, expected: &str) -> Result<bool> {
     let x = doc.required(doc.root(), "x_ck")?;
     if let Some(original) = doc.member(x, "original")? {
         for entry in doc.children(original)? {
             if doc.origin(entry)? == Some((parent, Some("shape"))) {
-                return Ok(true);
+                return doc.string_is(doc.required(entry, "value")?, expected);
             }
         }
     }

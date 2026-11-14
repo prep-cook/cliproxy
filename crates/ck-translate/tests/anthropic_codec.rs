@@ -1,3 +1,6 @@
+#[path = "anthropic/history.rs"]
+mod history;
+
 #[path = "anthropic/incremental.rs"]
 mod incremental;
 
