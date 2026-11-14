@@ -789,6 +789,8 @@ fn publish_field(
     Ok(())
 }
 
+/// Writes the Responses fields of `target` that normalization kept in `x_ck.original`; fields
+/// another protocol kept there mean nothing to a Responses upstream.
 fn originals(doc: &Document, target: usize, e: &mut Encoder<'_, '_>, skip: &[&str]) -> Result<()> {
     let Some(x) = doc.member(doc.root(), "x_ck")? else {
         return Ok(());
@@ -797,7 +799,7 @@ fn originals(doc: &Document, target: usize, e: &mut Encoder<'_, '_>, skip: &[&st
         return Ok(());
     };
     for entry in doc.children(original)? {
-        if doc.origin(entry)?.map(|(node, _)| node) != Some(target) {
+        if doc.origin(entry)?.map(|(node, _)| node) != Some(target) || !is(doc, entry, "protocol", "responses")? {
             continue;
         }
         let pointer = doc.required(entry, "pointer")?;

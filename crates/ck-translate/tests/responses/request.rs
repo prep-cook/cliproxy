@@ -66,3 +66,13 @@ fn assistant_text_and_reasoning_survive_next_to_tool_calls() {
     );
     assert_eq!(output["input"][3]["call_id"], "c");
 }
+
+#[test]
+fn chat_fields_without_a_responses_mapping_stay_out_of_the_request() {
+    let output =
+        from_chat(&json!({"model":"m","messages":[{"role":"user","content":"q","extra":1}],"vendor_field":true}));
+    assert_eq!(
+        output,
+        json!({"input":[{"type":"message","role":"user","content":"q"}],"stream":false,"model":"m"})
+    );
+}
