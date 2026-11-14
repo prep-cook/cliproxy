@@ -54,6 +54,9 @@ fn validate_message(view: RequestView<'_>, messages: usize, message: usize) -> R
     if !valid {
         return Err(Error::Unsupported);
     }
+    // ponytail: the linkage scan is quadratic in history; the 1 MiB metadata default bounds a
+    // request to about 10 call turns. Replace it with a metadata-charged call-id index when
+    // that bound rises (docs/DEFERRED-OPTIONS.md).
     if is(doc, message, "role", "tool")? {
         let id = doc.required(message, "tool_call_id")?;
         string(doc, id)?;
