@@ -356,6 +356,13 @@ fn write_usage(doc: &Document, e: &mut Encoder<'_, '_>) -> Result<()> {
     }
     e.bytes(b"{")?;
     let mut first = true;
+    if doc.member(root, "input_uncached_tokens")?.is_none()
+        && let Some(uncached) = derived_uncached(doc, root)?
+    {
+        e.bytes(b"\"input_tokens\":")?;
+        e.unsigned(uncached)?;
+        first = false;
+    }
     for (from, to) in [
         ("input_uncached_tokens", "input_tokens"),
         ("cache_read_tokens", "cache_read_input_tokens"),
@@ -373,6 +380,25 @@ fn write_usage(doc: &Document, e: &mut Encoder<'_, '_>) -> Result<()> {
         }
     }
     e.bytes(b"}")
+}
+/// Claude's uncached input, when inclusive input and both cache components are known and consistent.
+fn derived_uncached(doc: &Document, root: usize) -> Result<Option<u64>> {
+    let mut counts = [0; 3];
+    for (count, key) in counts
+        .iter_mut()
+        .zip(["input_tokens", "cache_read_tokens", "cache_write_tokens"])
+    {
+        let Some(node) = doc.member(root, key)? else {
+            return Ok(None);
+        };
+        let Ok(value) = doc.unsigned(node) else {
+            return Ok(None);
+        };
+        *count = value;
+    }
+    Ok(counts[1]
+        .checked_add(counts[2])
+        .and_then(|cached| counts[0].checked_sub(cached)))
 }
 fn original_members(doc: &Document, x: usize, e: &mut Encoder<'_, '_>) -> Result<()> {
     original_members_at(doc, x, "", e)

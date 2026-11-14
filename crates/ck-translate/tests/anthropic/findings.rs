@@ -1,5 +1,9 @@
 //! Regression tests for the Anthropic codec review findings.
-use crate::{BodyMode, Operation, Value, events, json, request, request_fragmented, response, sse};
+use crate::{
+    BodyMode, Direction, Mapped, Operation, ResponseEgress, ResponseIngress, Value, anthropic, bytes, codec, events,
+    identity, json, request, request_fragmented, response, sse,
+};
+use std::task::Poll;
 
 #[test]
 fn media_whose_type_follows_its_data_publishes_one_lifetime() {
@@ -133,4 +137,55 @@ fn citation_delta_keeps_envelope_unknowns() {
     let native = events(&out);
     let citation = native.iter().find(|v| v["delta"]["type"] == "citations_delta").unwrap();
     assert_eq!(citation, &rows[2]);
+}
+
+/// Projects one buffered Chat response body through Anthropic response egress.
+fn chat_to_anthropic(body: &[u8]) -> Value {
+    let mut mapped = Mapped::new();
+    let mut reader = mapped.store.reader(mapped.writer.id(), 0).unwrap();
+    let mut ingress = codec::chat::response::Ingress::new(
+        &mut mapped.writer,
+        &mapped.store,
+        identity(Direction::Response),
+        Operation::Generate,
+        BodyMode::Buffered,
+        10000,
+    )
+    .unwrap();
+    let mut egress = anthropic::egress::Egress::new(
+        &mut mapped.writer,
+        identity(Direction::Response),
+        Operation::Generate,
+        BodyMode::Buffered,
+        |_| {},
+    )
+    .unwrap();
+    ingress.advance(&mut mapped.writer, body).unwrap();
+    ingress.finish(&mut mapped.writer).unwrap();
+    let mut out = Vec::new();
+    while let Poll::Ready(Some(ck_stream::Read::Record(lease))) = reader.try_next() {
+        egress
+            .advance(&mut mapped.writer, lease, |part| {
+                out.extend_from_slice(&bytes(&part));
+                Ok(())
+            })
+            .unwrap();
+    }
+    serde_json::from_slice(&out).unwrap()
+}
+
+#[test]
+fn chat_usage_with_known_cache_components_projects_uncached_input() {
+    for (details, expected) in [
+        (json!({"cached_tokens":2,"cache_write_tokens":0}), json!(10)),
+        (json!({"cached_tokens":2,"cache_write_tokens":4}), json!(6)),
+        // Inconsistent operands are not projected.
+        (json!({"cached_tokens":20,"cache_write_tokens":0}), Value::Null),
+    ] {
+        let body = json!({"id":"r","model":"m","choices":[{"index":0,"message":{"role":"assistant","content":"x"},"finish_reason":"stop"}],"usage":{"prompt_tokens":12,"completion_tokens":3,"prompt_tokens_details":details}});
+        let out = chat_to_anthropic(&serde_json::to_vec(&body).unwrap());
+        assert_eq!(out["usage"]["input_tokens"], expected, "out={out}");
+        assert_eq!(out["usage"]["cache_read_input_tokens"], details["cached_tokens"]);
+        assert_eq!(out["usage"]["output_tokens"], 3);
+    }
 }
