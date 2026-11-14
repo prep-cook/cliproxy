@@ -176,6 +176,51 @@ fn buffered_native_recordings_keep_parts_signatures_usage_and_unknowns() {
     assert!(checked > 100, "{checked}");
 }
 
+/// Recordings with tools, a system instruction or non-text parts belong to other rows.
+fn text_only(contents: &[Value]) -> bool {
+    contents.iter().all(|m| {
+        matches!(m.get("role").and_then(Value::as_str), None | Some("user" | "model"))
+            && m["parts"].as_array().is_some_and(|p| {
+                p.iter().all(|p| {
+                    p["text"].is_string()
+                        && !["functionCall", "inlineData", "fileData"]
+                            .iter()
+                            .any(|k| p.get(*k).is_some())
+                })
+            })
+    })
+}
+
+/// Whether the request fence must refuse a recorded text request's controls or thoughts.
+fn fence_refuses(input: &Value) -> bool {
+    let config = &input["generationConfig"];
+    let contents = input["contents"].as_array().unwrap();
+    !(config.is_null() || config.is_object())
+        || ["maxOutputTokens", "candidateCount", "seed"]
+            .iter()
+            .any(|k| config.get(k).is_some_and(|v| v.as_u64().is_none()))
+        || config.get("thinkingConfig").is_some_and(|v| !v.is_object())
+        || config.get("responseModalities").is_some_and(|v| {
+            !v.as_array().is_some_and(|a| {
+                a.iter()
+                    .all(|m| m.as_str().is_some_and(|m| ["TEXT", "IMAGE", "AUDIO"].contains(&m)))
+            })
+        })
+        || ["temperature", "topP", "topK"]
+            .iter()
+            .any(|k| config.get(k).is_some_and(|v| !v.is_number()))
+        || config
+            .get("stopSequences")
+            .is_some_and(|v| !v.as_array().is_some_and(|a| a.iter().all(Value::is_string)))
+        || contents.iter().any(|m| {
+            m["parts"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|p| p.get("thought").is_some_and(|v| !v.is_boolean()))
+        })
+}
+
 #[test]
 fn recorded_text_requests_keep_native_controls_and_unknown_fields() {
     let mut checked = 0;
@@ -187,19 +232,7 @@ fn recorded_text_requests_keep_native_controls_and_unknown_fields() {
         let Some(contents) = input["contents"].as_array() else {
             continue;
         };
-        // Recordings with tools, a system instruction or non-text parts belong to other rows.
-        let text_only = contents.iter().all(|m| {
-            matches!(m.get("role").and_then(Value::as_str), None | Some("user" | "model"))
-                && m["parts"].as_array().is_some_and(|p| {
-                    p.iter().all(|p| {
-                        p["text"].is_string()
-                            && !["functionCall", "inlineData", "fileData"]
-                                .iter()
-                                .any(|k| p.get(*k).is_some())
-                    })
-                })
-        });
-        if input.get("tools").is_some() || input.get("systemInstruction").is_some() || !text_only {
+        if input.get("tools").is_some() || input.get("systemInstruction").is_some() || !text_only(contents) {
             continue;
         }
         let mut mapped = Mapped::new();
@@ -215,31 +248,7 @@ fn recorded_text_requests_keep_native_controls_and_unknown_fields() {
         ingress
             .advance(&mut mapped.writer, raw.as_bytes())
             .unwrap_or_else(|e| panic!("{id}: {e}"));
-        let config = &input["generationConfig"];
-        let invalid = !(config.is_null() || config.is_object())
-            || ["maxOutputTokens", "candidateCount", "seed"]
-                .iter()
-                .any(|k| config.get(k).is_some_and(|v| v.as_u64().is_none()))
-            || config.get("thinkingConfig").is_some_and(|v| !v.is_object())
-            || config.get("responseModalities").is_some_and(|v| {
-                !v.as_array().is_some_and(|a| {
-                    a.iter()
-                        .all(|m| m.as_str().is_some_and(|m| ["TEXT", "IMAGE", "AUDIO"].contains(&m)))
-                })
-            })
-            || ["temperature", "topP", "topK"]
-                .iter()
-                .any(|k| config.get(k).is_some_and(|v| !v.is_number()))
-            || config
-                .get("stopSequences")
-                .is_some_and(|v| !v.as_array().is_some_and(|a| a.iter().all(Value::is_string)))
-            || contents.iter().any(|m| {
-                m["parts"]
-                    .as_array()
-                    .unwrap()
-                    .iter()
-                    .any(|p| p.get("thought").is_some_and(|v| !v.is_boolean()))
-            });
+        let invalid = fence_refuses(&input);
         let ready = ingress.finish(&mut mapped.writer, &gemini::request::GeminiCapability);
         if invalid {
             assert!(ready.is_err(), "{id}");

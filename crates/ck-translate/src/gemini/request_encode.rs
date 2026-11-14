@@ -38,29 +38,7 @@ pub(super) fn write(view: RequestView<'_>, e: &mut Encoder<'_, '_>) -> Result<()
         }
     }
     let native = super::request_schema::native(doc)?;
-    let mut native_config = native.map(|n| doc.member(n, "generationConfig")).transpose()?.flatten();
-    // A native null config returns as null unless mapped controls now fill the config.
-    let null_config = match native_config {
-        Some(n) => matches!(doc.node(n)?.value, Value::Null),
-        None => false,
-    };
-    if null_config {
-        native_config = None;
-    }
-    let thinking = x.map(|x| doc.member(x, "thinking")).transpose()?.flatten();
-    let config_present = native_config.is_some()
-        || thinking.is_some()
-        || doc.member(root, "response_format")?.is_some()
-        || super::request::config().iter().try_fold(false, |yes, (_, key)| {
-            Ok::<_, Error>(yes || doc.member(root, key)?.is_some())
-        })?;
-    if config_present {
-        e.bytes(b",\"generationConfig\":{")?;
-        generation_config(doc, thinking, native_config, e)?;
-        e.bytes(b"}")?;
-    } else if null_config {
-        e.bytes(b",\"generationConfig\":null")?;
-    }
+    config(doc, x, native, e)?;
     tool_declarations(doc, x, e)?;
     if let Some(native) = native {
         super::members(doc, native, &["generationConfig"], e)?;
@@ -84,6 +62,34 @@ pub(super) fn write(view: RequestView<'_>, e: &mut Encoder<'_, '_>) -> Result<()
     if wrapper {
         originals(doc, root, None, e)?;
         e.bytes(b"}")?;
+    }
+    Ok(())
+}
+/// Writes `,"generationConfig":{...}` when mapped controls or a native config exist.
+fn config(doc: &Document, x: Option<usize>, native: Option<usize>, e: &mut Encoder<'_, '_>) -> Result<()> {
+    let root = doc.root();
+    let mut native_config = native.map(|n| doc.member(n, "generationConfig")).transpose()?.flatten();
+    // A native null config returns as null unless mapped controls now fill the config.
+    let null_config = match native_config {
+        Some(n) => matches!(doc.node(n)?.value, Value::Null),
+        None => false,
+    };
+    if null_config {
+        native_config = None;
+    }
+    let thinking = x.map(|x| doc.member(x, "thinking")).transpose()?.flatten();
+    let config_present = native_config.is_some()
+        || thinking.is_some()
+        || doc.member(root, "response_format")?.is_some()
+        || super::request::config().iter().try_fold(false, |yes, (_, key)| {
+            Ok::<_, Error>(yes || doc.member(root, key)?.is_some())
+        })?;
+    if config_present {
+        e.bytes(b",\"generationConfig\":{")?;
+        generation_config(doc, thinking, native_config, e)?;
+        e.bytes(b"}")?;
+    } else if null_config {
+        e.bytes(b",\"generationConfig\":null")?;
     }
     Ok(())
 }
