@@ -157,7 +157,7 @@ fn transcript_only_buffered_audio_does_not_invent_data() {
 /// Asserts that a streamed client response carries the audio bytes and one done event each
 /// for the audio and its transcript.
 /// Opens a buffered Responses ingress and sends `head` of its body.
-fn buffered_ingress(m: &mut Mapped, head: &[u8]) -> responses::response::Ingress {
+pub(crate) fn buffered_ingress(m: &mut Mapped, head: &[u8]) -> responses::response::Ingress {
     let mut ingress = responses::response::Ingress::new(
         &mut m.writer,
         identity(Direction::Response),
@@ -170,8 +170,32 @@ fn buffered_ingress(m: &mut Mapped, head: &[u8]) -> responses::response::Ingress
     ingress
 }
 
+/// Runs the canonical stream through buffered Responses egress; returns the client body.
+pub(crate) fn buffered_egress(m: &mut Mapped) -> Value {
+    let mut reader = m.store.reader(m.writer.id(), 0).unwrap();
+    let mut egress = responses::egress::Egress::new(
+        &mut m.writer,
+        identity(Direction::Response),
+        Operation::Generate,
+        BodyMode::Buffered,
+        |_, _| {},
+    )
+    .unwrap();
+    let mut out = Vec::new();
+    while let std::task::Poll::Ready(Some(ck_stream::Read::Record(lease))) = reader.try_next() {
+        egress
+            .advance(&mut m.writer, lease, |chunk| {
+                out.extend_from_slice(&bytes(&chunk));
+                Ok(())
+            })
+            .unwrap();
+    }
+    egress.finish().unwrap();
+    serde_json::from_slice(&out).unwrap()
+}
+
 /// Data events in order: each offset follows the previous chunk; returns the decoded total.
-fn data_bytes(canonical: &[Value]) -> u64 {
+pub(crate) fn data_bytes(canonical: &[Value]) -> u64 {
     let mut offset = 0;
     for event in canonical.iter().filter(|e| e["bytes"].is_string()) {
         let encoded = event["bytes"].as_str().unwrap();
@@ -205,26 +229,7 @@ fn buffered_audio_publishes_chunks_before_the_body_ends() {
         .iter()
         .find(|e| e["status"] == "completed" && e["bytes"].is_u64());
     assert_eq!(end.unwrap()["bytes"], 73_728);
-    let mut reader = m.store.reader(m.writer.id(), 0).unwrap();
-    let mut egress = responses::egress::Egress::new(
-        &mut m.writer,
-        identity(Direction::Response),
-        Operation::Generate,
-        BodyMode::Buffered,
-        |_, _| {},
-    )
-    .unwrap();
-    let mut out = Vec::new();
-    while let std::task::Poll::Ready(Some(ck_stream::Read::Record(lease))) = reader.try_next() {
-        egress
-            .advance(&mut m.writer, lease, |chunk| {
-                out.extend_from_slice(&bytes(&chunk));
-                Ok(())
-            })
-            .unwrap();
-    }
-    egress.finish().unwrap();
-    let out: Value = serde_json::from_slice(&out).unwrap();
+    let out = buffered_egress(&mut m);
     let expected = json!({"id":"a","data":payload,"transcript":"hi","expires_at":12});
     assert_eq!(out["audio"], expected);
     // A payload that ends inside a base64 quartet is refused when its string closes.

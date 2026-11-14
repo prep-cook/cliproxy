@@ -103,6 +103,17 @@ fn request(input: &Value, operation: Operation) -> (Value, Vec<Value>) {
     (serde_json::from_slice(&bytes(&output)).unwrap(), events(&m))
 }
 fn response(input: &[u8], mode: BodyMode, downstream: BodyMode, operation: Operation) -> (Vec<u8>, Vec<Value>) {
+    response_in(input, mode, downstream, operation, 13)
+}
+/// Feeds `input` in `step`-byte advances. Each advance inside a buffered media payload publishes
+/// a short data chunk on its own frame (§3.4, §6.1), so large payloads need larger steps.
+fn response_in(
+    input: &[u8],
+    mode: BodyMode,
+    downstream: BodyMode,
+    operation: Operation,
+    step: usize,
+) -> (Vec<u8>, Vec<Value>) {
     let mut m = Mapped::new();
     let mut ingress = responses::response::Ingress::new(
         &mut m.writer,
@@ -122,7 +133,7 @@ fn response(input: &[u8], mode: BodyMode, downstream: BodyMode, operation: Opera
     )
     .unwrap();
     let mut result = Vec::new();
-    for chunk in input.chunks(13) {
+    for chunk in input.chunks(step) {
         ingress.advance(&mut m.writer, chunk).unwrap();
     }
     ingress.finish(&mut m.writer).unwrap();

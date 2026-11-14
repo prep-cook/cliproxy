@@ -38,14 +38,7 @@ pub(super) fn publish(
     partial: Option<u64>,
 ) -> Result<[u8; 32]> {
     scope.media_id = Some(id);
-    let mut publisher = media::Publisher::start(emitter, owner, scope, |e| {
-        e.bytes(b",\"kind\":\"image\",\"encoding\":\"base64\",\"attributes\":{\"protocol\":\"responses\",\"field\":\"result\"")?;
-        if let Some(index) = partial {
-            e.bytes(b",\"partial_image_index\":")?;
-            e.unsigned(index)?;
-        }
-        e.bytes(b"}")
-    })?;
+    let mut publisher = start(owner, emitter, scope, partial)?;
     let mut hash = Sha256::new();
     let mut chunk = [0; 36_864];
     let (mut used, mut index, mut offset) = (0, 0, 0);
@@ -70,6 +63,22 @@ pub(super) fn publish(
     }
     publisher.end(emitter, owner)?;
     Ok(hash.finalize().into())
+}
+/// Opens the media lifetime of a generated image or preview; `scope` names its media id.
+pub(super) fn start(
+    owner: &mut Writer,
+    emitter: &mut Emitter,
+    scope: Scope,
+    partial: Option<u64>,
+) -> Result<media::Publisher> {
+    media::Publisher::start(emitter, owner, scope, |e| {
+        e.bytes(b",\"kind\":\"image\",\"encoding\":\"base64\",\"attributes\":{\"protocol\":\"responses\",\"field\":\"result\"")?;
+        if let Some(index) = partial {
+            e.bytes(b",\"partial_image_index\":")?;
+            e.unsigned(index)?;
+        }
+        e.bytes(b"}")
+    })
 }
 
 pub(super) struct Projection {
