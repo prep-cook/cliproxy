@@ -119,6 +119,14 @@ impl State {
         string(doc, name)?;
         let id = doc.required(node, "id")?;
         string(doc, id)?;
+        // An MCP server name is the call's namespace, as in request history.
+        let namespace = if is(doc, node, "type", "mcp_tool_use")? {
+            let namespace = doc.required(node, "server_name")?;
+            string(doc, namespace)?;
+            Some(namespace)
+        } else {
+            None
+        };
         self.emitter.emit(
             owner,
             Kind::ToolStart,
@@ -127,7 +135,12 @@ impl State {
                 e.bytes(b",\"kind\":")?;
                 e.string(if kind == "server" { "server" } else { "function" })?;
                 e.bytes(b",\"arguments_format\":\"json\",\"name\":")?;
-                doc.write(name, e)
+                doc.write(name, e)?;
+                if let Some(namespace) = namespace {
+                    e.bytes(b",\"namespace\":")?;
+                    doc.write(namespace, e)?;
+                }
+                Ok(())
             },
             |e| {
                 e.bytes(b",\"source\":{\"protocol\":\"anthropic\",\"ids\":{\"id\":")?;

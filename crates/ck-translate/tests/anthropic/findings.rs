@@ -189,3 +189,21 @@ fn chat_usage_with_known_cache_components_projects_uncached_input() {
         assert_eq!(out["usage"]["output_tokens"], 3);
     }
 }
+
+#[test]
+fn mcp_tool_use_publishes_its_server_as_namespace() {
+    let body = json!({"id":"r","model":"m","type":"message","role":"assistant","content":[{"type":"mcp_tool_use","id":"c","name":"lookup","server_name":"catalog","input":{}},{"type":"server_tool_use","id":"s","name":"web_search","input":{}}],"stop_reason":"end_turn"});
+    let (out, canonical) = response(
+        &serde_json::to_vec(&body).unwrap(),
+        BodyMode::Buffered,
+        BodyMode::Buffered,
+        Operation::Generate,
+        7,
+    );
+    let start = canonical.iter().find(|v| v["name"] == "lookup").unwrap();
+    assert_eq!(start["namespace"], "catalog", "start={start}");
+    let start = canonical.iter().find(|v| v["name"] == "web_search").unwrap();
+    assert!(start.get("namespace").is_none(), "start={start}");
+    let out: Value = serde_json::from_slice(&out).unwrap();
+    assert_eq!(out["content"], body["content"]);
+}
