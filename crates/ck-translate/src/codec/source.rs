@@ -152,6 +152,24 @@ impl Source {
         Ok(Span { start, end: self.len })
     }
 
+    /// Moves every segment of `other`, an unreleased contiguous source of the same stream, after
+    /// this source's end. Returns the offset that maps `other`'s spans into this source.
+    pub(crate) fn append(&mut self, mut other: Source) -> Result<u64> {
+        self.check_live()?;
+        other.check_live()?;
+        if other.stream_id() != self.stream_id() || other.base != 0 {
+            return Err(Error::Position);
+        }
+        let offset = self.len;
+        for segment in std::mem::take(&mut other.segments) {
+            if self.len != offset + segment.start {
+                return Err(Error::Position);
+            }
+            self.insert(segment.storage, segment.end - segment.start)?;
+        }
+        Ok(offset)
+    }
+
     fn insert(&mut self, storage: Storage, bytes: u64) -> Result<Span> {
         let end = self.len.checked_add(bytes).ok_or(Error::Limit)?;
         if bytes != 0 {

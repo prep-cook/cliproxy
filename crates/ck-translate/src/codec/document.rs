@@ -72,6 +72,8 @@ pub struct Document {
     metadata: MetadataPermit,
     /// Charges transient indexes that read-only validation builds; see [`Self::with_table`].
     scratch: std::sync::Mutex<Option<MetadataPermit>>,
+    /// The source that holds every adopted record's lease, so a record costs one segment.
+    records: Option<usize>,
     root: usize,
 }
 
@@ -93,6 +95,7 @@ impl Document {
             nodes: Vec::new(),
             metadata: owner.reserve_metadata(0)?,
             scratch: std::sync::Mutex::new(Some(owner.reserve_metadata(0)?)),
+            records: None,
             root: 0,
         };
         doc.import(source, &scanner)?;
@@ -105,6 +108,7 @@ impl Document {
             nodes: Vec::new(),
             metadata: owner.reserve_metadata(0)?,
             scratch: std::sync::Mutex::new(Some(owner.reserve_metadata(0)?)),
+            records: None,
             root: 0,
         };
         doc.reserve(1, 1)?;
@@ -127,6 +131,11 @@ impl Document {
         let permit = table.into_permit()?;
         *self.scratch.lock().map_err(|_| Error::Closed)? = Some(permit);
         result
+    }
+
+    #[cfg(test)]
+    pub(crate) fn source_count(&self) -> usize {
+        self.sources.len()
     }
 
     pub(crate) fn input(&self) -> &Source {

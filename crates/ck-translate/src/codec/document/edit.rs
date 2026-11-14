@@ -1,20 +1,43 @@
 //! Document mutations: node edits, adopted sources and provenance bindings.
 
 use super::{Document, Name, Node, Text, Value};
-use crate::codec::{Error, Result};
+use crate::codec::{Error, Result, source::Span};
+
+/// Where an adopted record's texts now live.
+#[derive(Clone, Copy)]
+pub(crate) struct Adopted {
+    source: usize,
+    offset: u64,
+}
+
+impl Adopted {
+    /// Maps a text of the adopted record, which has a single source.
+    pub(crate) fn text(self, text: Text) -> Result<Text> {
+        if text.source != 0 {
+            return Err(Error::Position);
+        }
+        Ok(Text {
+            source: self.source,
+            span: Span {
+                start: self.offset + text.span.start,
+                end: self.offset + text.span.end,
+            },
+        })
+    }
+}
 
 impl Document {
     pub(crate) fn bind_field(&mut self, node: usize, mut event: Document) -> Result<()> {
         let pointer = event.required(event.root(), "pointer")?;
         let value = event.required(event.root(), "value")?;
-        let Value::String(mut pointer) = event.node(pointer)?.value else {
+        let Value::String(pointer) = event.node(pointer)?.value else {
             return Err(Error::Schema);
         };
         let mut value = event.node(value)?.value;
-        let base = self.adopt_sources(&mut event)?;
-        pointer.source += base;
+        let adopted = self.adopt_record(&mut event)?;
+        let pointer = adopted.text(pointer)?;
         if let Value::String(text) | Value::Number(text) = &mut value {
-            text.source += base;
+            *text = adopted.text(*text)?;
         }
         if self.nodes[node].name.is_some() {
             self.nodes[node].name = Some(Name::Pointer(pointer));
@@ -25,19 +48,31 @@ impl Document {
         Ok(())
     }
 
-    pub(crate) fn retain_text(&mut self, mut event: Document, mut text: Text) -> Result<Text> {
-        text.source += self.adopt_sources(&mut event)?;
-        Ok(text)
+    pub(crate) fn retain_text(&mut self, mut event: Document, text: Text) -> Result<Text> {
+        self.adopt_record(&mut event)?.text(text)
     }
 
-    fn adopt_sources(&mut self, event: &mut Document) -> Result<usize> {
-        if self.stream_id() != event.stream_id() {
+    /// Moves a decoded record's lease into this document's records source. The record's nodes
+    /// stay behind; [`Adopted::text`] maps their texts.
+    pub(crate) fn adopt_record(&mut self, event: &mut Document) -> Result<Adopted> {
+        if self.stream_id() != event.stream_id() || event.sources.len() != 1 {
             return Err(Error::Position);
         }
-        self.reserve(0, event.sources.len())?;
-        let base = self.sources.len();
-        self.sources.append(&mut event.sources);
-        Ok(base)
+        let source = event.sources.pop().ok_or(Error::Position)?;
+        if let Some(records) = self.records {
+            let offset = self.sources[records].append(source)?;
+            return Ok(Adopted {
+                source: records,
+                offset,
+            });
+        }
+        self.reserve(0, 1)?;
+        self.records = Some(self.sources.len());
+        self.sources.push(source);
+        Ok(Adopted {
+            source: self.sources.len() - 1,
+            offset: 0,
+        })
     }
 
     pub(crate) fn retire_scratch(&mut self) -> Result<()> {

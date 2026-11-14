@@ -329,4 +329,35 @@ mod tests {
         store.shutdown().unwrap();
         std::fs::remove_dir(directory).unwrap();
     }
+
+    /// Published fields' records share one source rather than adding a source each.
+    #[test]
+    fn published_fields_share_one_records_source() {
+        let directory = std::env::temp_dir().join(format!("ck-request-records-{}", uuid::Uuid::new_v4()));
+        let mut config = ck_stream::Config::new(directory.clone());
+        config.pool_bytes = Some(48 * ck_stream::FRAME_BYTES);
+        config.workers = 1;
+        let mut store =
+            ck_stream::Store::with_clock(config, std::sync::Arc::new(ck_stream::ManualClock::default())).unwrap();
+        let mut owner = store.create().unwrap();
+        let identity = Identity {
+            request_id: LocalId::new("request").unwrap(),
+            stream_id: LocalId::new("stream").unwrap(),
+            attempt: 1,
+            direction: Direction::Request,
+        };
+        let mut ingress = Ingress::new(&mut owner, &store, identity, Operation::Generate, 100_000).unwrap();
+        let messages = vec![r#"{"role":"user","content":"hi"}"#; 32].join(",");
+        let input = format!(r#"{{"model":"m","messages":[{messages}]}}"#);
+        ingress.advance(&mut owner, input.as_bytes()).unwrap();
+        ingress.finish(&mut owner, &ChatCapability).unwrap();
+        assert!(
+            ingress.document.source_count() <= 2,
+            "{}",
+            ingress.document.source_count()
+        );
+        drop(ingress);
+        store.shutdown().unwrap();
+        std::fs::remove_dir(directory).unwrap();
+    }
 }
