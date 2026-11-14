@@ -25,27 +25,7 @@ impl Ingress {
             return Ok(());
         }
         if !self.started {
-            self.emitter.request_start(
-                owner,
-                RequestView {
-                    document: &input.document,
-                    media: &self.media,
-                    operation: self.operation,
-                },
-            )?;
-            codec::internal::next(owner, &mut self.reader)?;
-            self.emitter.emit(
-                owner,
-                Kind::RequestField,
-                Scope::default(),
-                |e| e.bytes(b",\"pointer\":\"\",\"value\":{}"),
-                |_| Ok(()),
-            )?;
-            let (_, event) = codec::internal::next(owner, &mut self.reader)?;
-            let root = input.document.root();
-            input.document.bind_field(root, event)?;
-            input.document.mark_published(root);
-            self.started = true;
+            self.start(owner)?;
         }
         if self.active.is_some() {
             self.collect(owner)?;
@@ -105,6 +85,33 @@ impl Ingress {
             .document
             .raw_floor(input.document.root(), input.scanner.raw_floor())?;
         input.document.release_input_before(floor)
+    }
+
+    /// Publishes `request.start` and the root object field once the first node is scanned.
+    fn start(&mut self, owner: &mut Writer) -> Result<()> {
+        let input = self.input.as_mut().ok_or(Error::Closed)?;
+        self.emitter.request_start(
+            owner,
+            RequestView {
+                document: &input.document,
+                media: &self.media,
+                operation: self.operation,
+            },
+        )?;
+        codec::internal::next(owner, &mut self.reader)?;
+        self.emitter.emit(
+            owner,
+            Kind::RequestField,
+            Scope::default(),
+            |e| e.bytes(b",\"pointer\":\"\",\"value\":{}"),
+            |_| Ok(()),
+        )?;
+        let (_, event) = codec::internal::next(owner, &mut self.reader)?;
+        let root = input.document.root();
+        input.document.bind_field(root, event)?;
+        input.document.mark_published(root);
+        self.started = true;
+        Ok(())
     }
 
     fn begin(&mut self, owner: &mut Writer, wire: usize) -> Result<()> {
@@ -192,30 +199,14 @@ impl Ingress {
                     .retain_record(&mut input.document, pending.media, owner, &mut self.reader)?;
                 pending.first = false;
             } else {
-                let mut remaining = &chunk[..used];
-                while !remaining.is_empty() {
-                    if pending.buffer.is_none() {
-                        pending.buffer = Some(owner.begin_scratch(pending.capacity)?);
-                        pending.since = Some(std::time::Instant::now());
-                    }
-                    let count = remaining.len().min(pending.capacity - pending.buffered);
-                    pending
-                        .buffer
-                        .as_mut()
-                        .ok_or(Error::Schema)?
-                        .write(&remaining[..count])?;
-                    pending.buffered += count;
-                    remaining = &remaining[count..];
-                    if pending.buffered == pending.capacity {
-                        pending.flush(
-                            &mut input.document,
-                            &mut self.media,
-                            &mut self.emitter,
-                            owner,
-                            &mut self.reader,
-                        )?;
-                    }
-                }
+                pending.stage(
+                    &chunk[..used],
+                    &mut input.document,
+                    &mut self.media,
+                    &mut self.emitter,
+                    owner,
+                    &mut self.reader,
+                )?;
             }
         }
         pending.offset = scanned.validated_end;
@@ -285,6 +276,31 @@ impl StringState {
         }
         self.buffered = 0;
         self.since = None;
+        Ok(())
+    }
+    /// Buffers decoded bytes in scratch, flushing whenever the buffer reaches one record.
+    fn stage(
+        &mut self,
+        mut remaining: &[u8],
+        doc: &mut Document,
+        registry: &mut Registry,
+        emitter: &mut Emitter,
+        owner: &mut Writer,
+        reader: &mut ck_stream::Reader,
+    ) -> Result<()> {
+        while !remaining.is_empty() {
+            if self.buffer.is_none() {
+                self.buffer = Some(owner.begin_scratch(self.capacity)?);
+                self.since = Some(std::time::Instant::now());
+            }
+            let count = remaining.len().min(self.capacity - self.buffered);
+            self.buffer.as_mut().ok_or(Error::Schema)?.write(&remaining[..count])?;
+            self.buffered += count;
+            remaining = &remaining[count..];
+            if self.buffered == self.capacity {
+                self.flush(doc, registry, emitter, owner, reader)?;
+            }
+        }
         Ok(())
     }
 }
