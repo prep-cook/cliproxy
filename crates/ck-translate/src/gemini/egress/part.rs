@@ -220,25 +220,23 @@ impl Egress {
         let part = body.absorb(document)?;
         body.append(parts, part)
     }
-    /// Writes a streamed part as one candidate record.
+    /// Holds a streamed part as its choice's next record, first writing the part held before
+    /// it. A finished choice keeps its members for the last record.
     fn write_part(
         &mut self,
         owner: &mut Writer,
         block: usize,
         output: &mut impl FnMut(ScratchLease) -> Result<()>,
     ) -> Result<()> {
-        let choice = self.blocks[block].choice;
+        let slot = self.choice(self.blocks[block].choice)?;
         let document = std::mem::replace(&mut self.blocks[block].document, empty_part(owner, false)?);
-        let result = self.record(owner, output, |first, e| {
-            *first = false;
-            e.bytes(b"\"candidates\":[{\"index\":")?;
-            e.unsigned(choice)?;
-            e.bytes(b",\"content\":{\"role\":\"model\",\"parts\":[")?;
-            document.write(document.root(), e)?;
-            e.bytes(b"]}}]")
-        });
         self.blocks[block].held = false;
-        result
+        if self.choices[slot].part.is_some() {
+            let fields = !self.choices[slot].finished;
+            self.flush(owner, slot, fields, output)?;
+        }
+        self.choices[slot].part = Some(document);
+        Ok(())
     }
 }
 fn empty_part(owner: &mut Writer, thought: bool) -> Result<Document> {

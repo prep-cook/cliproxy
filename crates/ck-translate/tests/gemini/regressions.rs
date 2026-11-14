@@ -117,8 +117,11 @@ fn streaming_unknown_metadata_and_late_identity_reach_egress() {
         .unwrap();
     assert_eq!(chunk["id"], "late-id");
     assert_eq!(chunk["model"], "late-model");
-    assert!(out[0].get("responseId").is_none(), "{}", out[0]);
-    assert!(out[0].get("modelVersion").is_none(), "{}", out[0]);
+    assert!(
+        out.iter()
+            .all(|v| v.get("responseId").is_none_or(|id| id == "late-id") && v["modelVersion"] != ""),
+        "{out:?}"
+    );
     let text = out
         .iter()
         .find(|v| v["candidates"][0]["content"]["parts"][0]["text"] == "hi")

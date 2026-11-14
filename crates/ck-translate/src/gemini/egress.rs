@@ -7,7 +7,7 @@ mod part;
 use super::{Table, mapped, response::Framing};
 use crate::codec::{
     self, BodyMode, Error, Operation, Result,
-    document::{Document, Value},
+    document::{Document, Name, Value},
     encode::{self, Encoder},
     event::{Identity, Kind, LocalId},
     internal,
@@ -28,6 +28,8 @@ pub struct Egress {
     identity: Option<Document>,
     /// The buffered response body; streamed output writes each record as it completes.
     body: Option<Document>,
+    /// Streamed response members (usage, prompt feedback, extras), written with the last record.
+    top: Option<Document>,
     choices: Table<Choice>,
     /// Open parts only; a part leaves the table when its block ends.
     blocks: Table<Block>,
@@ -41,6 +43,10 @@ struct Choice {
     /// The candidate object in the buffered body.
     node: Option<usize>,
     finished: bool,
+    /// Streamed output holds the last completed part and the candidate members that follow it,
+    /// so every record carries content and the last one also carries the finish.
+    part: Option<Document>,
+    fields: Option<Document>,
 }
 struct Block {
     item: LocalId,
@@ -91,6 +97,7 @@ impl Egress {
                 Framing::Json => Some(mapped(owner, |e| e.bytes(b"{\"candidates\":[]}"))?),
                 Framing::Sse | Framing::JsonArray => None,
             },
+            top: None,
             choices: Table::new(owner)?,
             blocks: Table::new(owner)?,
             terminal: false,
@@ -122,9 +129,9 @@ impl Egress {
             Kind::Data => self.data(event)?,
             Kind::BlockEnd => self.block_end(owner, &event, output)?,
             Kind::Grounding | Kind::UrlContext | Kind::Annotation => self.annotation(owner, kind, &event, output)?,
-            Kind::Usage => self.usage(owner, &event, output)?,
+            Kind::Usage => self.usage(owner, &event)?,
             Kind::CountTokens => self.count(owner, &event)?,
-            Kind::Opaque => self.opaque(owner, &event, output)?,
+            Kind::Opaque => self.opaque(owner, &event)?,
             Kind::Done => self.done(owner, output)?,
             Kind::Error | Kind::Cancelled => self.error(owner, output)?,
             _ => (self.diagnostic)(Diagnostic::UnsupportedEvent(kind)),
@@ -288,6 +295,8 @@ impl Egress {
             index,
             node,
             finished: false,
+            part: None,
+            fields: None,
         })
     }
     /// The open choice of a record's `choice_index`.
@@ -314,15 +323,64 @@ impl Egress {
                 }
             }
             Framing::JsonArray => {
+                self.last(owner, output)?;
                 let close: &[u8] = if self.array_started { b"]" } else { b"[]" };
                 output(encode::scratch(owner, |e| e.bytes(close))?)?;
             }
-            Framing::Sse => (),
+            Framing::Sse => self.last(owner, output)?,
         }
         self.terminal = true;
         Ok(())
     }
+    /// Writes a streamed choice's held part, with its candidate members when `fields` is set.
+    fn flush(
+        &mut self,
+        owner: &mut Writer,
+        slot: usize,
+        fields: bool,
+        output: &mut impl FnMut(ScratchLease) -> Result<()>,
+    ) -> Result<()> {
+        let choice = &mut self.choices[slot];
+        let (index, part) = (choice.index, choice.part.take());
+        let members = if fields { choice.fields.take() } else { None };
+        self.record(owner, output, |first, e| {
+            *first = false;
+            e.bytes(b"\"candidates\":[")?;
+            candidate(e, index, part.as_ref(), members.as_ref())?;
+            e.bytes(b"]")
+        })
+    }
+    /// Writes the last streamed record: every held candidate with its finish, and the response
+    /// members, as Gemini sends them together in its final chunk.
+    fn last(&mut self, owner: &mut Writer, output: &mut impl FnMut(ScratchLease) -> Result<()>) -> Result<()> {
+        let held = |c: &Choice| c.part.is_some() || c.fields.is_some();
+        if self.identity.is_none() || (self.top.is_none() && !self.choices.iter().any(held)) {
+            return Ok(());
+        }
+        let choices = std::mem::replace(&mut self.choices, Table::new(owner)?);
+        let top = self.top.take();
+        self.record(owner, output, |first, e| {
+            for c in choices.iter().filter(|c| held(c)) {
+                e.bytes(if std::mem::replace(first, false) {
+                    b"\"candidates\":["
+                } else {
+                    b","
+                })?;
+                candidate(e, c.index, c.part.as_ref(), c.fields.as_ref())?;
+            }
+            if !*first {
+                e.bytes(b"]")?;
+            }
+            match &top {
+                Some(top) => fields(top, top.root(), &[], first, e),
+                None => Ok(()),
+            }
+        })
+    }
     fn error(&mut self, owner: &mut Writer, output: &mut impl FnMut(ScratchLease) -> Result<()>) -> Result<()> {
+        if self.body.is_none() {
+            self.last(owner, output)?;
+        }
         self.emit(owner, output, |e| {
             e.bytes(b"{\"error\":{\"code\":502,\"message\":\"Incomplete upstream response\",\"status\":\"INTERNAL\"}}")
         })?;
@@ -378,6 +436,74 @@ fn fields(doc: &Document, parent: usize, skip: &[&str], first: &mut bool, e: &mu
         doc.write(node, e)?;
     }
     Ok(())
+}
+/// Writes a streamed candidate: its held part and its members.
+fn candidate(e: &mut Encoder<'_, '_>, index: u64, part: Option<&Document>, members: Option<&Document>) -> Result<()> {
+    e.bytes(b"{\"index\":")?;
+    e.unsigned(index)?;
+    if let Some(part) = part {
+        e.bytes(b",\"content\":{\"role\":\"model\",\"parts\":[")?;
+        part.write(part.root(), e)?;
+        e.bytes(b"]}")?;
+    }
+    if let Some(members) = members {
+        fields(members, members.root(), &[], &mut false, e)?;
+    }
+    e.bytes(b"}")
+}
+/// A copy of object `old` with the members of `parent` in `doc` not named in `skip`; they
+/// replace same-named members. Rebuilding keeps a repeatedly updated object bounded.
+fn merged(
+    owner: &mut Writer,
+    old: Option<&Document>,
+    doc: &Document,
+    parent: usize,
+    skip: &[&str],
+) -> Result<Document> {
+    let skipped = |name| {
+        skip.iter()
+            .try_fold(false, |found, key| Ok::<_, Error>(found || doc.name_is(name, key)?))
+    };
+    mapped(owner, |e| {
+        e.bytes(b"{")?;
+        let mut first = true;
+        for node in old
+            .map(|old| old.children(old.root()))
+            .transpose()?
+            .into_iter()
+            .flatten()
+        {
+            let old = old.ok_or(Error::Schema)?;
+            let name = old.node(node)?.name.ok_or(Error::Schema)?;
+            let mut replaced = false;
+            for other in doc.children(parent)? {
+                let other = doc.node(other)?.name.ok_or(Error::Schema)?;
+                replaced = replaced || (!skipped(other)? && same_name(old, name, doc, other)?);
+            }
+            if !replaced {
+                if !std::mem::replace(&mut first, false) {
+                    e.bytes(b",")?;
+                }
+                old.write_name(name, e)?;
+                e.bytes(b":")?;
+                old.write(node, e)?;
+            }
+        }
+        fields(doc, parent, skip, &mut first, e)?;
+        e.bytes(b"}")
+    })
+}
+fn same_name(a: &Document, x: Name, b: &Document, y: Name) -> Result<bool> {
+    let (mut left, mut right) = (a.name_chars(x)?, b.name_chars(y)?);
+    loop {
+        let c = left.next_scalar()?;
+        if c != right.next_scalar()? {
+            return Ok(false);
+        }
+        if c.is_none() {
+            return Ok(true);
+        }
+    }
 }
 fn local(doc: &Document, node: usize) -> Result<LocalId> {
     let mut buffer = [0; 64];

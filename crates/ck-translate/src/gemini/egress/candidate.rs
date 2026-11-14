@@ -1,6 +1,6 @@
 //! Candidate and response members: finish reasons, metadata, usage, counts and native extras.
 
-use super::{Diagnostic, Egress, fields, mapped, native};
+use super::{Diagnostic, Egress, mapped, merged, native};
 use crate::codec::{
     Error, Operation, Result,
     document::{Document, Value},
@@ -80,8 +80,9 @@ impl Egress {
         }
         Ok(())
     }
-    /// Sets candidate member `name`: a streamed record of its own, or a member of the buffered
-    /// candidate, replacing an earlier value.
+    /// Sets candidate member `name`: a member held for the choice's next streamed record, or a
+    /// member of the buffered candidate, replacing an earlier value. A repeated member of an
+    /// unfinished streamed choice first writes the part it followed.
     pub(super) fn candidate_field(
         &mut self,
         owner: &mut Writer,
@@ -90,41 +91,42 @@ impl Egress {
         name: &'static str,
         value: impl Fn(&mut Encoder<'_, '_>) -> Result<()>,
     ) -> Result<()> {
-        let index = self.choices[slot].index;
-        match self.choices[slot].node {
-            Some(candidate) => set_copy(owner, self.body.as_mut().ok_or(Error::Schema)?, candidate, name, value),
-            None => self.record(owner, output, |first, e| {
-                *first = false;
-                e.bytes(b"\"candidates\":[{\"index\":")?;
-                e.unsigned(index)?;
-                e.bytes(b",")?;
-                e.string(name)?;
-                e.bytes(b":")?;
-                value(e)?;
-                e.bytes(b"}]")
-            }),
+        if let Some(candidate) = self.choices[slot].node {
+            return set_copy(owner, self.body.as_mut().ok_or(Error::Schema)?, candidate, name, value);
         }
+        let choice = &self.choices[slot];
+        if !choice.finished
+            && choice.part.is_some()
+            && let Some(fields) = &choice.fields
+            && fields.member(fields.root(), name)?.is_some()
+        {
+            self.flush(owner, slot, true, output)?;
+        }
+        let value = named(owner, name, value)?;
+        self.choices[slot].fields = Some(merged(
+            owner,
+            self.choices[slot].fields.as_ref(),
+            &value,
+            value.root(),
+            &[],
+        )?);
+        Ok(())
     }
-    /// Sets response member `name`, as `candidate_field` does for a candidate.
+    /// Sets response member `name`, as `candidate_field` does for a candidate; streamed output
+    /// keeps the latest value for the last record.
     fn top_field(
         &mut self,
         owner: &mut Writer,
-        output: &mut impl FnMut(ScratchLease) -> Result<()>,
         name: &'static str,
         value: impl Fn(&mut Encoder<'_, '_>) -> Result<()>,
     ) -> Result<()> {
-        match &mut self.body {
-            Some(body) => {
-                let root = body.root();
-                set_copy(owner, body, root, name, value)
-            }
-            None => self.record(owner, output, |first, e| {
-                *first = false;
-                e.string(name)?;
-                e.bytes(b":")?;
-                value(e)
-            }),
+        if let Some(body) = &mut self.body {
+            let root = body.root();
+            return set_copy(owner, body, root, name, value);
         }
+        let value = named(owner, name, value)?;
+        self.top = Some(merged(owner, self.top.as_ref(), &value, value.root(), &[])?);
+        Ok(())
     }
     /// Writes Gemini's own grounding, citation, safety and URL-context metadata; another
     /// protocol's native payload has no Gemini shape and is dropped.
@@ -156,23 +158,18 @@ impl Egress {
                 let slot = self.choice(event.unsigned(index)?)?;
                 self.candidate_field(owner, output, slot, name, |e| event.write(value, e))
             }
-            None => self.top_field(owner, output, name, |e| event.write(value, e)),
+            None => self.top_field(owner, name, |e| event.write(value, e)),
         }
     }
-    pub(super) fn usage(
-        &mut self,
-        owner: &mut Writer,
-        event: &Document,
-        output: &mut impl FnMut(ScratchLease) -> Result<()>,
-    ) -> Result<()> {
+    pub(super) fn usage(&mut self, owner: &mut Writer, event: &Document) -> Result<()> {
         let usage = event.required(event.root(), "usage")?;
         if let Some(native) = event.member(usage, "native")?
             && super::super::is(event, native, "protocol", "gemini")?
         {
             let value = event.required(native, "value")?;
-            return self.top_field(owner, output, "usageMetadata", |e| event.write(value, e));
+            return self.top_field(owner, "usageMetadata", |e| event.write(value, e));
         }
-        self.top_field(owner, output, "usageMetadata", |e| project_usage(event, usage, e))
+        self.top_field(owner, "usageMetadata", |e| project_usage(event, usage, e))
     }
     pub(super) fn count(&mut self, owner: &mut Writer, event: &Document) -> Result<()> {
         if self.operation != Operation::CountTokens {
@@ -197,12 +194,7 @@ impl Egress {
         Ok(())
     }
     /// Restores the response and candidate members the Gemini source had no mapping for.
-    pub(super) fn opaque(
-        &mut self,
-        owner: &mut Writer,
-        event: &Document,
-        output: &mut impl FnMut(ScratchLease) -> Result<()>,
-    ) -> Result<()> {
+    pub(super) fn opaque(&mut self, owner: &mut Writer, event: &Document) -> Result<()> {
         let root = event.root();
         let candidate = super::super::is(event, root, "name", "gemini.candidate")?;
         if !candidate && !super::super::is(event, root, "name", "gemini.response")? {
@@ -223,26 +215,16 @@ impl Egress {
             None
         };
         if self.body.is_none() {
-            if event.children(value)?.all(|n| {
-                event
-                    .node(n)
-                    .ok()
-                    .and_then(|n| n.name)
-                    .is_some_and(|name| skip.iter().any(|key| event.name_is(name, key).unwrap_or(false)))
-            }) {
-                return Ok(());
+            let held = match target {
+                Some(slot) => self.choices[slot].fields.take(),
+                None => self.top.take(),
+            };
+            let held = Some(merged(owner, held.as_ref(), event, value, skip)?);
+            match target {
+                Some(slot) => self.choices[slot].fields = held,
+                None => self.top = held,
             }
-            let index = target.map(|slot| self.choices[slot].index);
-            return self.record(owner, output, |first, e| match index {
-                Some(index) => {
-                    *first = false;
-                    e.bytes(b"\"candidates\":[{\"index\":")?;
-                    e.unsigned(index)?;
-                    fields(event, value, skip, &mut false, e)?;
-                    e.bytes(b"}]")
-                }
-                None => fields(event, value, skip, first, e),
-            });
+            return Ok(());
         }
         let body = self.body.as_mut().ok_or(Error::Schema)?;
         let parent = match target {
@@ -279,6 +261,16 @@ fn present(doc: &Document, parent: usize, name: &str) -> Result<Option<usize>> {
         Some(node) if !matches!(doc.node(node)?.value, Value::Null) => Ok(Some(node)),
         _ => Ok(None),
     }
+}
+/// The one-member object `{name: value}`.
+fn named(owner: &mut Writer, name: &str, value: impl Fn(&mut Encoder<'_, '_>) -> Result<()>) -> Result<Document> {
+    mapped(owner, |e| {
+        e.bytes(b"{")?;
+        e.string(name)?;
+        e.bytes(b":")?;
+        value(e)?;
+        e.bytes(b"}")
+    })
 }
 /// Replaces member `name` of `parent` with a copy of the JSON `value` writes.
 fn set_copy(
