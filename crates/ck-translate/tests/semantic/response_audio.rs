@@ -71,7 +71,8 @@ fn streamed_audio_deltas_share_data_records() {
     assert_eq!(completed(&mapped).unwrap()["bytes"], raw.len());
 }
 
-/// Held audio publishes once it fills a record, before the stream ends.
+/// Held audio publishes once a delta brings it to a record's worth, before the stream ends:
+/// the tenth 3,000-byte delta reaches the threshold, and all ten publish together.
 #[test]
 fn held_audio_publishes_when_it_fills_a_record() {
     let raw = sample(12 * 3000);
@@ -80,13 +81,9 @@ fn held_audio_publishes_when_it_fills_a_record() {
     let stream: String = raw.chunks(3000).map(|piece| audio(&encode(piece))).collect();
     feed(&mut ingress, &mut mapped, &stream);
     let (records, bytes) = data_records(&mapped);
-    assert_eq!(records, 1);
-    assert!(
-        (THRESHOLD..THRESHOLD + 3).contains(&bytes.len()),
-        "{} bytes",
-        bytes.len()
-    );
-    assert_eq!(bytes, raw[..bytes.len()]);
+    assert_eq!(THRESHOLD.div_ceil(3000) * 3000, 30_000);
+    assert_eq!((records, bytes.len()), (1, 30_000));
+    assert_eq!(bytes, raw[..30_000]);
     feed(&mut ingress, &mut mapped, &end());
     ingress.finish(&mut mapped.writer).unwrap();
     assert_eq!(data_records(&mapped), (2, raw));
@@ -222,4 +219,44 @@ fn held_audio_keeps_its_order_with_transcript_and_text() {
             "transcript ",
         ]
     );
+}
+
+/// A delta whose base64 fails after its first quartets adds no bytes, even when those quartets
+/// would cross the threshold: only the earlier delta's bytes publish before the error.
+#[test]
+fn rejected_delta_adds_no_bytes_across_the_threshold() {
+    let mut mapped = Mapped::new();
+    let mut ingress = streamed(&mut mapped);
+    feed(&mut ingress, &mut mapped, &audio(&"AQID".repeat(9557)));
+    assert_eq!(data_records(&mapped).0, 0);
+    let result = ingress.advance(&mut mapped.writer, audio("BAUG!!!!").as_bytes());
+    assert!(matches!(result, Err(codec::Error::Schema)), "{result:?}");
+    let (records, bytes) = data_records(&mapped);
+    assert_eq!((records, bytes.len()), (1, 28_671));
+    assert!(bytes == [1, 2, 3].repeat(9557));
+    assert!(completed(&mapped).is_none());
+    assert!(ingress.flush_deadline().is_none());
+}
+
+/// A storage failure disarms the held audio's deadline; the failed ingress is not flushed.
+#[test]
+fn storage_failure_disarms_the_audio_deadline() {
+    let mut mapped = Mapped::configured(std::sync::Arc::new(ck_stream::ManualClock::default()), 16);
+    let mut ingress = streamed(&mut mapped);
+    let content = json!({"choices":[{"index":1,"delta":{"content":"x".repeat(500_000)}}]});
+    ingress
+        .advance(
+            &mut mapped.writer,
+            b"data: {\"choices\":[{\"index\":0,\"delta\":{\"audio\":{\"data\":\"AQID\"}}}]}\n\n",
+        )
+        .unwrap();
+    assert!(ingress.flush_deadline().is_some());
+    let result = ingress.advance(&mut mapped.writer, format!("data: {content}\n\n").as_bytes());
+    assert!(
+        matches!(result, Err(codec::Error::Storage(ck_stream::Error::StorageExhausted))),
+        "{result:?}"
+    );
+    assert!(ingress.flush_deadline().is_none());
+    assert!(ingress.flush(&mut mapped.writer).is_err());
+    assert!(ingress.flush_deadline().is_none());
 }

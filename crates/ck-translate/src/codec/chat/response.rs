@@ -84,6 +84,10 @@ impl Ingress {
 }
 impl codec::ResponseIngress for Ingress {
     fn flush_deadline(&self) -> Option<std::time::Instant> {
+        // A failed ingress publishes nothing more, whatever it still holds.
+        if self.failed {
+            return None;
+        }
         match &self.buffered {
             Some(buffered) => buffered.flush_deadline(&self.state),
             None => self.state.audio_deadline(),

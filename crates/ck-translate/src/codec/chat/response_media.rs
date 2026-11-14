@@ -1,6 +1,7 @@
 use super::super::{FLUSH_DELAY, HELD_BYTES};
 use super::*;
 use crate::codec::{
+    document::Text,
     media::{Encoding, Media},
     source::Span,
 };
@@ -37,13 +38,24 @@ impl Audio {
         })
     }
 
-    /// Holds decoded bytes, publishing them once they fill a data record. A record then holds
-    /// at most `HELD_BYTES` plus one quartet's bytes.
-    fn hold(&mut self, emitter: &mut Emitter, owner: &mut Writer, bytes: &[u8]) -> Result<()> {
-        self.since.get_or_insert_with(Instant::now);
-        self.held.push_bytes(owner, bytes)?;
-        if self.held.len() - self.published >= HELD_BYTES {
-            self.complete = self.held.len();
+    /// Holds a delta's decoded bytes and publishes the held bytes once they fill a data record.
+    /// The bytes count only after the whole delta decodes, so a rejected delta adds none; the
+    /// hold can therefore exceed the threshold by one delta's bytes.
+    fn push(
+        &mut self,
+        emitter: &mut Emitter,
+        owner: &mut Writer,
+        fragments: &mut media::Base64Fragments,
+        input: &Document,
+        data: Text,
+    ) -> Result<()> {
+        let held = &mut self.held;
+        fragments.push(input, data, |bytes| held.push_bytes(owner, bytes).map(drop))?;
+        if self.held.len() > self.complete {
+            self.since.get_or_insert_with(Instant::now);
+        }
+        self.complete = self.held.len();
+        if self.complete - self.published >= HELD_BYTES {
             self.publish(emitter, owner)?;
         }
         Ok(())
@@ -333,11 +345,7 @@ impl State {
         let choice = &mut self.choices[position];
         let audio = choice.audio_output.as_mut().ok_or(Error::Schema)?;
         if let Some(data) = data {
-            let emitter = &mut self.emitter;
-            choice
-                .audio
-                .push(input, data, |bytes| audio.hold(emitter, owner, bytes))?;
-            audio.complete = audio.held.len();
+            audio.push(&mut self.emitter, owner, &mut choice.audio, input, data)?;
         }
         if let Some(text) = transcript {
             self.audio_transcript(owner, input, text, position, scope)?;
