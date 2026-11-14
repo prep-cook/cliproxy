@@ -130,6 +130,52 @@ impl Egress {
         self.started = true;
         Ok(())
     }
+    fn buffered_envelope_loss(&self, doc: &Document, x: usize, kind: Kind, choice: Option<u64>) -> Result<()> {
+        if self.mode != BodyMode::Buffered
+            || !matches!(
+                kind,
+                Kind::Chunk
+                    | Kind::BlockStart
+                    | Kind::BlockEnd
+                    | Kind::Done
+                    | Kind::ReasoningSignature
+                    | Kind::Heartbeat
+            )
+        {
+            return Ok(());
+        }
+        let Some(source) = doc.member(x, "source")? else {
+            return Ok(());
+        };
+        if !super::is(doc, source, "protocol", "anthropic")? {
+            return Ok(());
+        }
+        let Some(fields) = doc.member(source, "sse")? else {
+            return Ok(());
+        };
+        let mut lost = doc.node(fields)?.first.is_some();
+        if !lost && let Some(original) = doc.member(x, "original")? {
+            let finish = doc.member(x, "native_finish_reason")?.is_some();
+            for entry in doc.children(original)? {
+                if !super::is(doc, entry, "protocol", "anthropic")? {
+                    continue;
+                }
+                let mut pointer = doc.chars(doc.required(entry, "pointer")?)?;
+                let retained = finish
+                    && "/delta/".chars().try_fold(true, |same, c| {
+                        Ok::<_, Error>(same && pointer.next_scalar()? == Some(c))
+                    })?;
+                if !retained {
+                    lost = true;
+                    break;
+                }
+            }
+        }
+        if lost {
+            self.drop_event(kind, choice, "native SSE metadata has no buffered carrier");
+        }
+        Ok(())
+    }
     fn accept(
         &mut self,
         owner: &mut Writer,
@@ -156,6 +202,7 @@ impl Egress {
             self.drop_event(kind, choice, "single-choice destination selects index zero");
             return Ok(());
         }
+        self.buffered_envelope_loss(&doc, x, kind, choice)?;
         match kind {
             Kind::ResponseStart => {
                 if self.base.is_some() {
@@ -371,9 +418,11 @@ impl Egress {
                     && super::is(&doc, source, "protocol", "anthropic")?
                 {
                     if super::is(&doc, source, "event", "message_start")? {
-                        self.start_origin = Some(doc);
+                        if self.mode == BodyMode::Streaming {
+                            self.start_origin = Some(doc);
+                        }
                     } else if super::is(&doc, source, "event", "message_delta")? {
-                        if finished {
+                        if finished && self.mode == BodyMode::Streaming {
                             self.finish_origin = Some(doc);
                             self.finish_delta(owner, output)?;
                         } else if self.mode == BodyMode::Streaming {
@@ -388,12 +437,6 @@ impl Egress {
                                 }
                                 original_members(&doc, x, e)
                             })?)?;
-                        } else {
-                            self.drop_event(
-                                kind,
-                                choice,
-                                "intermediate message delta has no buffered envelope carrier",
-                            );
                         }
                     }
                 }

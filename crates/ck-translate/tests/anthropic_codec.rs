@@ -83,6 +83,16 @@ fn response(
     operation: Operation,
     fragment: usize,
 ) -> (Vec<u8>, Vec<Value>) {
+    response_with_diagnostic(input, upstream, downstream, operation, fragment, |_| {})
+}
+fn response_with_diagnostic(
+    input: &[u8],
+    upstream: BodyMode,
+    downstream: BodyMode,
+    operation: Operation,
+    fragment: usize,
+    diagnostic: fn(anthropic::egress::Diagnostic),
+) -> (Vec<u8>, Vec<Value>) {
     let mut mapped = Mapped::new();
     let mut reader = mapped.store.reader(mapped.writer.id(), 0).unwrap();
     let mut ingress = anthropic::response::Ingress::new(
@@ -98,7 +108,7 @@ fn response(
         identity(Direction::Response),
         operation,
         downstream,
-        |_| {},
+        diagnostic,
     )
     .unwrap();
     let mut output = Vec::new();

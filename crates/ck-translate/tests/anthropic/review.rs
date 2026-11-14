@@ -287,3 +287,50 @@ fn lifecycle_records_restore_native_metadata_at_its_original_level() {
         rows.len()
     );
 }
+
+#[test]
+fn buffered_conversion_reports_only_unrepresentable_native_metadata() {
+    static LOSSES: std::sync::Mutex<Vec<codec::event::Kind>> = std::sync::Mutex::new(Vec::new());
+    fn record(diagnostic: anthropic::egress::Diagnostic) {
+        LOSSES.lock().unwrap().push(diagnostic.kind);
+    }
+    let mut rows = vec![
+        json!({"type":"message_start","message":{"id":"r","model":"m"},"vendor":1}),
+        json!({"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}),
+        json!({"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"x","vendor":7}}),
+        json!({"type":"content_block_stop","index":0}),
+        json!({"type":"message_delta","delta":{"stop_reason":"end_turn","future_finish":9}}),
+        json!({"type":"message_stop"}),
+    ];
+    LOSSES.lock().unwrap().clear();
+    let input = super::sse(&rows);
+    let (output, _) = super::response_with_diagnostic(
+        &input,
+        BodyMode::Streaming,
+        BodyMode::Buffered,
+        Operation::Generate,
+        1,
+        record,
+    );
+    let body: Value = serde_json::from_slice(&output).unwrap();
+    assert_eq!(body["content"][0]["text"], "x");
+    assert_eq!(body["future_finish"], 9);
+    assert_eq!(
+        *LOSSES.lock().unwrap(),
+        [codec::event::Kind::Chunk, codec::event::Kind::Chunk]
+    );
+
+    rows[0].as_object_mut().unwrap().remove("vendor");
+    rows[2]["delta"].as_object_mut().unwrap().remove("vendor");
+    LOSSES.lock().unwrap().clear();
+    let (output, _) = super::response_with_diagnostic(
+        &super::sse(&rows),
+        BodyMode::Streaming,
+        BodyMode::Buffered,
+        Operation::Generate,
+        1,
+        record,
+    );
+    assert_eq!(serde_json::from_slice::<Value>(&output).unwrap()["future_finish"], 9);
+    assert!(LOSSES.lock().unwrap().is_empty());
+}
