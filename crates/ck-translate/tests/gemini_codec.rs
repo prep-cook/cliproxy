@@ -13,6 +13,8 @@ pub mod gemini;
 mod incremental;
 #[path = "gemini/media.rs"]
 mod media;
+#[path = "gemini/regressions.rs"]
+mod regressions;
 #[path = "semantic/mod.rs"]
 mod semantic;
 #[path = "gemini/streams.rs"]

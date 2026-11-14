@@ -1,3 +1,4 @@
+use super::Table;
 use super::request::{capture, preserve};
 use crate::codec::{
     Error, Result,
@@ -6,8 +7,18 @@ use crate::codec::{
     source::Span,
 };
 use ck_stream::Writer;
+use std::{
+    collections::hash_map::RandomState,
+    hash::{BuildHasher, Hasher},
+};
 
-pub(super) fn normalize(owner: &mut Writer, doc: &mut Document, message: usize, message_index: u64) -> Result<()> {
+pub(super) fn normalize(
+    owner: &mut Writer,
+    doc: &mut Document,
+    message: usize,
+    message_index: u64,
+    calls: &mut Calls,
+) -> Result<()> {
     super::object(doc, message)?;
     if let Some(role) = doc.member(message, "role")? {
         if doc.string_is(role, "model")? {
@@ -44,7 +55,7 @@ pub(super) fn normalize(owner: &mut Writer, doc: &mut Document, message: usize, 
             message_index,
             index,
         };
-        normalize_part(owner, doc, part, place)?;
+        normalize_part(owner, doc, part, place, calls)?;
         doc.bind_origin(entry, part, Some("part"))?;
         index += 1;
     }
@@ -60,7 +71,7 @@ struct Place {
     index: u64,
 }
 /// Moves one native part to its canonical home: a tool call, a tool result or a content part.
-fn normalize_part(owner: &mut Writer, doc: &mut Document, part: usize, place: Place) -> Result<()> {
+fn normalize_part(owner: &mut Writer, doc: &mut Document, part: usize, place: Place, calls: &mut Calls) -> Result<()> {
     let mut payloads = 0;
     for key in [
         "text",
@@ -80,10 +91,10 @@ fn normalize_part(owner: &mut Writer, doc: &mut Document, part: usize, place: Pl
         replay(doc, part, signature, place)?;
     }
     if let Some(call) = doc.remove(part, "functionCall")? {
-        return tool_call(doc, part, call, place);
+        return tool_call(doc, part, call, place, calls);
     }
     if let Some(result) = doc.remove(part, "functionResponse")? {
-        return tool_result(doc, part, result, place);
+        return tool_result(doc, part, result, place, calls);
     }
     doc.append(place.content, part)?;
     doc.set(place.entry, "kind", Value::Text("content"))?;
@@ -143,7 +154,7 @@ fn replay(doc: &mut Document, part: usize, signature: usize, place: Place) -> Re
     doc.set(source, "protocol", Value::Text("gemini"))?;
     doc.bind_origin(binding, part, Some("signature"))
 }
-fn tool_call(doc: &mut Document, part: usize, call: usize, place: Place) -> Result<()> {
+fn tool_call(doc: &mut Document, part: usize, call: usize, place: Place, turn: &mut Calls) -> Result<()> {
     let calls = match doc.member(place.message, "tool_calls")? {
         Some(n) => n,
         None => doc.set(place.message, "tool_calls", Value::Array)?,
@@ -165,12 +176,13 @@ fn tool_call(doc: &mut Document, part: usize, call: usize, place: Place) -> Resu
     if let Some(args) = doc.member(call, "args")? {
         doc.rename(args, "arguments")?;
     }
+    turn.record(doc, place.message, part, doc.required(call, "name")?)?;
     doc.rename(call, "function")?;
     doc.append(part, call)?;
     doc.set(place.entry, "kind", Value::Text("call"))?;
     Ok(())
 }
-fn tool_result(doc: &mut Document, part: usize, result: usize, place: Place) -> Result<()> {
+fn tool_result(doc: &mut Document, part: usize, result: usize, place: Place, calls: &mut Calls) -> Result<()> {
     doc.append(place.content, part)?;
     doc.set(part, "type", Value::Text("tool_result"))?;
     let name = doc.required(result, "name")?;
@@ -179,7 +191,7 @@ fn tool_result(doc: &mut Document, part: usize, result: usize, place: Place) -> 
         doc.rename(id, "tool_call_id")?;
         doc.append(part, id)?;
     } else {
-        let linked = find_call(doc, place.message, name)?.ok_or(Error::Schema)?;
+        let linked = calls.answer(doc, name)?.ok_or(Error::Schema)?;
         let id = doc.node(doc.required(linked, "id")?)?.value;
         doc.set(part, "tool_call_id", id)?;
         doc.set(place.entry, "synthetic_id", Value::Bool(true))?;
@@ -189,23 +201,84 @@ fn tool_result(doc: &mut Document, part: usize, result: usize, place: Place) -> 
     doc.set(place.entry, "kind", Value::Text("result"))?;
     Ok(())
 }
-fn find_call(doc: &Document, message: usize, name: usize) -> Result<Option<usize>> {
-    let messages = doc.required(doc.root(), "messages")?;
-    let mut found = None;
-    for previous in doc.children(messages)? {
-        if previous == message {
-            break;
+/// The calls of the latest model turn, for function responses that omit the call id. Gemini
+/// answers a turn's calls in order, so a response takes the first unanswered call of its name.
+/// Calls sort by a keyed hash of their name: a lookup is a binary search, and the answered
+/// calls of a run stay its prefix, which `taken` skips, so matching stays O(n log n).
+pub(super) struct Calls {
+    turn: Option<usize>,
+    entries: Table<Call>,
+    sorted: bool,
+    hasher: RandomState,
+}
+#[derive(Clone, Copy)]
+struct Call {
+    key: u64,
+    order: usize,
+    part: usize,
+    name: usize,
+    /// On the first call of a run: how many leading calls of the run are answered.
+    taken: usize,
+}
+impl Calls {
+    pub(super) fn new(owner: &mut Writer) -> Result<Self> {
+        Ok(Self {
+            turn: None,
+            entries: Table::new(owner)?,
+            sorted: true,
+            hasher: RandomState::new(),
+        })
+    }
+    fn key(&self, doc: &Document, name: usize) -> Result<u64> {
+        let mut hasher = self.hasher.build_hasher();
+        let mut chars = doc.chars(name)?;
+        while let Some(c) = chars.next_scalar()? {
+            hasher.write_u32(u32::from(c));
         }
-        if let Some(calls) = doc.member(previous, "tool_calls")? {
-            for call in doc.children(calls)? {
-                let function = doc.required(call, "function")?;
-                if doc.equal_strings(doc.required(function, "name")?, name)? {
-                    found = Some(call);
-                }
+        Ok(hasher.finish())
+    }
+    /// Adds a call; the first call of a new model turn drops the previous turn's calls.
+    fn record(&mut self, doc: &Document, message: usize, part: usize, name: usize) -> Result<()> {
+        super::string(doc, name)?;
+        if self.turn != Some(message) {
+            while let Some(last) = self.entries.len().checked_sub(1) {
+                self.entries.swap_remove(last);
+            }
+            self.turn = Some(message);
+        }
+        let call = Call {
+            key: self.key(doc, name)?,
+            order: self.entries.len(),
+            part,
+            name,
+            taken: 0,
+        };
+        self.entries.push(call)?;
+        self.sorted = false;
+        Ok(())
+    }
+    /// The first unanswered call named `name`, now answered.
+    fn answer(&mut self, doc: &Document, name: usize) -> Result<Option<usize>> {
+        if !self.sorted {
+            self.entries.sort_unstable_by_key(|c| (c.key, c.order));
+            self.sorted = true;
+        }
+        let key = self.key(doc, name)?;
+        let start = self.entries.partition_point(|c| c.key < key);
+        let end = start + self.entries[start..].partition_point(|c| c.key == key);
+        let taken = self.entries.get(start).map_or(0, |c| c.taken);
+        let first = start + taken;
+        for index in first..end {
+            if doc.equal_strings(self.entries[index].name, name)? {
+                // Only a hash collision puts another name first; moving the match to the
+                // front keeps the answered calls a prefix and the others in order.
+                self.entries[first..=index].rotate_right(1);
+                self.entries[start].taken = taken + 1;
+                return Ok(Some(self.entries[first].part));
             }
         }
+        Ok(None)
     }
-    Ok(found)
 }
 fn media_part(owner: &mut Writer, doc: &mut Document, part: usize, data: usize, inline: bool) -> Result<()> {
     let mime = doc.member(data, "mimeType")?;

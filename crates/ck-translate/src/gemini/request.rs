@@ -293,9 +293,10 @@ fn messages(owner: &mut Writer, doc: &mut Document) -> Result<()> {
     }
     let mut message = doc.node(messages)?.first;
     let mut index = 0;
+    let mut calls = super::request_content::Calls::new(owner)?;
     while let Some(n) = message {
         message = doc.node(n)?.next;
-        super::request_content::normalize(owner, doc, n, index)?;
+        super::request_content::normalize(owner, doc, n, index, &mut calls)?;
         index += 1;
     }
     Ok(())
