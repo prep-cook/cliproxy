@@ -54,24 +54,34 @@ impl State {
         part: usize,
     ) -> Result<usize> {
         let item = &mut self.items[at];
+        let typed = doc.member(part, "type")?.is_some();
         let kind = if summary {
-            "reasoning_summary"
+            if !typed || is(doc, part, "type", "summary_text")? {
+                "reasoning_summary"
+            } else {
+                "opaque"
+            }
         } else if is(doc, part, "type", "reasoning_text")? {
             "thinking"
         } else if is(doc, part, "type", "refusal")? {
             "refusal"
-        } else if doc.member(part, "type")?.is_none() || is(doc, part, "type", "output_text")? {
+        } else if !typed || is(doc, part, "type", "output_text")? {
             "text"
         } else {
             "opaque"
         };
         let opaque = kind == "opaque";
-        let content: &[&str] = if opaque {
-            &[]
-        } else {
-            &["text", "refusal", "annotations", "logprobs"]
-        };
-        let lease = encode::scratch(owner, |e| object(doc, part, content, e))?;
+        // Empty `annotations` and `logprobs` stay attributes, so their presence survives; content
+        // events append to them.
+        let mut content = ["text", "refusal", "", ""];
+        for (slot, name) in content[2..].iter_mut().zip(["annotations", "logprobs"]) {
+            if let Some(array) = doc.member(part, name)?
+                && doc.node(array)?.first.is_some()
+            {
+                *slot = name;
+            }
+        }
+        let lease = encode::scratch(owner, |e| object(doc, part, if opaque { &[] } else { &content }, e))?;
         let value = item.doc.import_json(owner, lease)?;
         let scope = item.scope(Some(item.blocks.len() as u64));
         self.emitter.emit(
@@ -324,8 +334,8 @@ impl State {
     }
 }
 
-/// The members of snapshot `part` that the published block value lacks, other than its text,
-/// refusal, annotations and logprobs.
+/// The members of snapshot `part` that the published block value lacks or holds with another
+/// value, other than its text, refusal, annotations and logprobs.
 fn late_attributes(
     owner: &mut Writer,
     stored: &Document,
@@ -342,7 +352,12 @@ fn late_attributes(
             for content in ["text", "refusal", "annotations", "logprobs"] {
                 known |= doc.name_is(name, content)?;
             }
-            if known || has_member(stored, value, doc, name)? {
+            if known {
+                continue;
+            }
+            if let Some(started) = stored_member(stored, value, doc, name)?
+                && super::super::snapshot::equal(stored, started, doc, field)?
+            {
                 continue;
             }
             if !first {
@@ -357,8 +372,8 @@ fn late_attributes(
     })
 }
 
-/// Whether object `parent` of `stored` has a member named `name` of `doc`.
-fn has_member(stored: &Document, parent: usize, doc: &Document, name: Name) -> Result<bool> {
+/// The member of object `parent` of `stored` named `name` of `doc`.
+fn stored_member(stored: &Document, parent: usize, doc: &Document, name: Name) -> Result<Option<usize>> {
     for child in stored.children(parent)? {
         let mut a = stored.name_chars(stored.node(child)?.name.ok_or(Error::Schema)?)?;
         let mut b = doc.name_chars(name)?;
@@ -368,9 +383,9 @@ fn has_member(stored: &Document, parent: usize, doc: &Document, name: Name) -> R
                 break;
             }
             if x.is_none() {
-                return Ok(true);
+                return Ok(Some(child));
             }
         }
     }
-    Ok(false)
+    Ok(None)
 }

@@ -87,3 +87,67 @@ fn a_shorter_terminal_array_contradicts_published_parts() {
     let body: Value = serde_json::from_slice(&out).unwrap();
     assert_eq!(body["output"][0]["summary"], summary);
 }
+
+/// Buffered Responses `output` replayed to a buffered client; returns the client's output.
+fn buffered_output(output: Value) -> Value {
+    let body = json!({"id":"r","status":"completed","output":output});
+    let (out, _) = response(
+        body.to_string().as_bytes(),
+        BodyMode::Buffered,
+        BodyMode::Buffered,
+        Operation::Generate,
+    );
+    serde_json::from_slice::<Value>(&out).unwrap()["output"].clone()
+}
+
+#[test]
+fn unknown_and_empty_members_survive() {
+    // An unknown item type keeps members that other item types consume.
+    let future = json!([{"id":"i","type":"future_tool","status":"completed","input":"payload","arguments":"unknown"}]);
+    assert_eq!(buffered_output(future.clone()), future);
+    // An unknown summary kind stays opaque instead of readable reasoning.
+    let summary = json!([{"id":"i","type":"reasoning","status":"completed","summary":[
+        {"type":"future_summary","text":"opaque-text","payload":7}]}]);
+    let body = json!({"id":"r","status":"completed","output":summary});
+    let (out, canonical) = response(
+        body.to_string().as_bytes(),
+        BodyMode::Buffered,
+        BodyMode::Buffered,
+        Operation::Generate,
+    );
+    assert!(
+        !canonical.iter().any(|e| e["kind"] == "reasoning_summary"),
+        "{canonical:?}"
+    );
+    assert!(
+        !canonical
+            .iter()
+            .any(|e| e["choices"][0]["delta"]["reasoning_content"].is_string())
+    );
+    assert_eq!(serde_json::from_slice::<Value>(&out).unwrap()["output"], summary);
+    // Empty collections keep their presence.
+    let text = json!([{"id":"i","type":"message","role":"assistant","status":"completed","content":[
+        {"type":"output_text","text":"hi","annotations":[],"logprobs":[]}]}]);
+    assert_eq!(buffered_output(text.clone()), text);
+}
+
+#[test]
+fn closing_parts_reconcile_nested_members() {
+    let part = |text: &str, vendor: Value| json!({"type":"output_text","text":text,"annotations":[],"vendor":vendor});
+    let done = part("hi", json!({"a":1,"b":2}));
+    let item = json!({"id":"i","type":"message","role":"assistant","status":"completed","content":[done]});
+    let records = [
+        json!({"type":"response.output_item.added","output_index":0,
+            "item":{"id":"i","type":"message","role":"assistant","content":[]}}),
+        json!({"type":"response.content_part.added","output_index":0,"item_id":"i","content_index":0,
+            "part":part("", json!({"a":1}))}),
+        json!({"type":"response.output_text.delta","output_index":0,"item_id":"i","content_index":0,"delta":"hi"}),
+        json!({"type":"response.content_part.done","output_index":0,"item_id":"i","content_index":0,"part":done}),
+        json!({"type":"response.output_item.done","output_index":0,"item":item}),
+        json!({"type":"response.completed","response":{"id":"r","status":"completed","output":[item]}}),
+    ];
+    let (out, _) = try_streamed(&records, BodyMode::Buffered).unwrap();
+    assert_eq!(serde_json::from_slice::<Value>(&out).unwrap()["output"][0], item);
+    // The later value replaces the started one rather than adding a duplicate key.
+    assert_eq!(String::from_utf8_lossy(&out).matches("\"vendor\"").count(), 1);
+}

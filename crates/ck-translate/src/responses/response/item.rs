@@ -329,66 +329,24 @@ fn tool_start(emitter: &mut Emitter, owner: &mut Writer, item: &Item, server: Op
 }
 
 fn item_metadata(doc: &Document, node: usize, e: &mut Encoder<'_, '_>) -> Result<()> {
-    let fields: &[&str] = if let Some(server) = Server::from_item(doc, node)? {
-        match server {
-            Server::Code => &[
-                "content",
-                "summary",
-                "arguments",
-                "input",
-                "encrypted_content",
-                "outputs",
-                "code",
-            ],
-            Server::Web => &[
-                "content",
-                "summary",
-                "arguments",
-                "input",
-                "encrypted_content",
-                "action",
-                "results",
-            ],
-            Server::File => &[
-                "content",
-                "summary",
-                "arguments",
-                "input",
-                "encrypted_content",
-                "results",
-            ],
-            Server::Mcp => &[
-                "content",
-                "summary",
-                "arguments",
-                "input",
-                "encrypted_content",
-                "output",
-                "error",
-            ],
-        }
-    } else if is(doc, node, "type", "image_generation_call")? {
-        &[
-            "content",
-            "summary",
-            "arguments",
-            "input",
-            "encrypted_content",
-            "result",
-        ]
-    } else {
-        &["content", "summary", "arguments", "input", "encrypted_content"]
+    // Members the item's type consumes; any other member stays a native attribute.
+    let consumed: &[&str] = match Server::from_item(doc, node)? {
+        Some(Server::Code) => &["arguments", "input", "outputs", "code"],
+        Some(Server::Web) => &["arguments", "input", "action", "results"],
+        Some(Server::File) => &["arguments", "input", "results"],
+        Some(Server::Mcp) => &["arguments", "input", "output", "error"],
+        None if is(doc, node, "type", "function_call")? => &["arguments"],
+        None if is(doc, node, "type", "custom_tool_call")? => &["input"],
+        None if is(doc, node, "type", "image_generation_call")? => &["result"],
+        None => &[],
     };
     // A null `encrypted_content` publishes no block, so it stays an attribute.
     let null = match doc.member(node, "encrypted_content")? {
         Some(value) => matches!(doc.node(value)?.value, Value::Null),
         None => false,
     };
-    let mut kept = [""; 8];
-    let mut count = 0;
-    for field in fields.iter().filter(|field| !null || **field != "encrypted_content") {
-        kept[count] = field;
-        count += 1;
-    }
-    object(doc, node, &kept[..count], e)
+    let mut kept = ["content", "summary", "encrypted_content", "", "", "", ""];
+    let count = if null { 2 } else { 3 };
+    kept[count..count + consumed.len()].copy_from_slice(consumed);
+    object(doc, node, &kept[..count + consumed.len()], e)
 }
