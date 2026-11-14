@@ -85,7 +85,7 @@ S1 fixes this configuration contract; `ck-stream::Config` implements it for the 
 | `stream.startup_reserve_bytes` | Deploy-only; restart required | Prebacked warm frames within the pool cap, preserved by decay, §6.4–6.5 |
 | `stream.max_frames` | Deploy-only; restart required | Derived capped-pool default and combined exchange quota, §6.4 |
 | `stream.max_event_bytes` | Deploy-only; restart required | Provisional event limit and startup validation, §6.4 |
-| `stream.max_metadata_bytes` | Deploy-only; restart required | Provisional metadata limit and checked capacity validation, §6.4 |
+| `stream.max_metadata_bytes` | Deploy-only; restart required | Metadata limit (8 MiB default, owner number) and checked capacity validation, §6.4 |
 | `stream.cache_ttl` | Deploy-only; restart required | Last-read expiry, §6.4 |
 
 These values need no live-editable admin page or page exception under `crates/AGENTS.md`, Admin panel. Later hot-change support must include its admin page in the same change. Owner-approved codec/pipeline tolerances in `docs/INTERNAL-STREAM.md`, §9.2, allow at most 5% regression per metric and 0% for memory/storage (2026-11-14 morning, option B); they do not change the existing budgets above or the §9.3 storage gate.
