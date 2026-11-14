@@ -151,6 +151,9 @@ fn closing_parts_reconcile_nested_members() {
     assert_eq!(serde_json::from_slice::<Value>(&out).unwrap()["output"][0], item);
     // The later value replaces the started one rather than adding a duplicate key.
     assert_eq!(String::from_utf8_lossy(&out).matches("\"vendor\"").count(), 1);
+    // The terminal response alone closes the part the same way.
+    let (out, _) = try_streamed(&[&records[..3], &records[5..]].concat(), BodyMode::Buffered).unwrap();
+    assert_eq!(serde_json::from_slice::<Value>(&out).unwrap()["output"][0], item);
 }
 
 #[test]
