@@ -36,15 +36,38 @@ pub(super) fn validate(view: RequestView<'_>) -> Result<()> {
     if !matches!(doc.node(messages)?.value, Value::Array) {
         return Err(Error::Schema);
     }
+    let x = doc.member(root, "x_ck")?;
+    let continued = match x {
+        Some(x) => continued(doc, x)?,
+        None => false,
+    };
     for message in doc.children(messages)? {
-        validate_message(view, messages, message)?;
+        validate_message(view, messages, message, continued)?;
     }
-    if let Some(x) = doc.member(root, "x_ck")? {
+    if let Some(x) = x {
         validate_extensions(doc, x)?;
     }
     Ok(())
 }
-fn validate_message(view: RequestView<'_>, messages: usize, message: usize) -> Result<()> {
+/// Whether the request continues stored state (`previous_response_id` or `conversation`), whose
+/// calls the upstream links tool outputs to.
+fn continued(doc: &Document, x: usize) -> Result<bool> {
+    if let Some(session) = doc.member(x, "session")?
+        && doc.member(session, "previous_response_id")?.is_some()
+    {
+        return Ok(true);
+    }
+    Ok(match doc.member(x, "provider_parameters")? {
+        Some(providers) => match doc.member(providers, "responses")? {
+            Some(p) => doc.member(p, "conversation")?.is_some(),
+            None => false,
+        },
+        None => false,
+    })
+}
+/// Validates one message; a tool output must follow its call unless `continued` stored state
+/// may own the call.
+fn validate_message(view: RequestView<'_>, messages: usize, message: usize, continued: bool) -> Result<()> {
     let doc = view.document;
     let role = doc.required(message, "role")?;
     let mut valid = false;
@@ -71,7 +94,7 @@ fn validate_message(view: RequestView<'_>, messages: usize, message: usize) -> R
                 }
             }
         }
-        if !found {
+        if !found && !continued {
             return Err(Error::Schema);
         }
     }

@@ -34,3 +34,15 @@ fn json_schema_format_is_flat_in_responses_and_nested_in_chat() {
     let (output, _) = request(&flat, Operation::Generate);
     assert_eq!(output["text"], flat["text"]);
 }
+
+#[test]
+fn continuation_tool_outputs_link_to_the_referenced_state() {
+    let output = json!({"type":"function_call_output","call_id":"c","output":"done"});
+    for (field, value) in [("previous_response_id", json!("prev")), ("conversation", json!("conv"))] {
+        let mut input = json!({"model":"m","input":[output]});
+        input[field] = value;
+        let (encoded, _) = request(&input, Operation::Generate);
+        assert_eq!(encoded[field], input[field]);
+        assert_eq!(encoded["input"][0], output);
+    }
+}
