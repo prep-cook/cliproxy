@@ -207,3 +207,40 @@ fn mcp_tool_use_publishes_its_server_as_namespace() {
     let out: Value = serde_json::from_slice(&out).unwrap();
     assert_eq!(out["content"], body["content"]);
 }
+
+#[test]
+fn non_object_tool_input_never_completes() {
+    let streamed = [
+        json!({"type":"message_start","message":{"id":"r","model":"m"}}),
+        json!({"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"c","name":"f","input":{}}}),
+        json!({"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"[1,"}}),
+        json!({"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"2]"}}),
+        json!({"type":"content_block_stop","index":0}),
+        json!({"type":"message_delta","delta":{"stop_reason":"tool_use"}}),
+        json!({"type":"message_stop"}),
+    ];
+    for (mode, input) in [
+        (
+            BodyMode::Buffered,
+            br#"{"id":"r","model":"m","type":"message","role":"assistant","content":[{"type":"tool_use","id":"c","name":"f","input":[]}],"stop_reason":"tool_use"}"#.to_vec(),
+        ),
+        (BodyMode::Streaming, crate::sse(&streamed)),
+    ] {
+        let mut mapped = Mapped::new();
+        let mut ingress = anthropic::response::Ingress::new(
+            &mut mapped.writer,
+            identity(Direction::Response),
+            Operation::Generate,
+            mode,
+            10000,
+        )
+        .unwrap();
+        let result = ingress.advance(&mut mapped.writer, &input);
+        assert!(result.is_err() || ingress.finish(&mut mapped.writer).is_err());
+        let raw = mapped.output(&mapped.writer);
+        let raw = std::str::from_utf8(&raw).unwrap();
+        assert!(raw.contains("event: x_ck.error\n"));
+        assert!(!raw.contains("event: x_ck.tool.end\n"));
+        assert!(!raw.contains("event: x_ck.done\n"));
+    }
+}

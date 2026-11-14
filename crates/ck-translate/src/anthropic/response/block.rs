@@ -442,6 +442,10 @@ impl State {
         if let Some((source, parser)) = &mut block.arguments {
             if block.fragments {
                 parser.finish(source)?;
+                // Native tool input is an object, as request validation also requires.
+                if !matches!(parser.pending_node(source, 0)?.kind, json::Kind::Object) {
+                    return Err(Error::Schema);
+                }
             }
             self.emitter.emit(
                 owner,
