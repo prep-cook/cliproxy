@@ -321,3 +321,32 @@ fn multi_frame_leases_stay_charged_after_their_reader_drops() {
     let mut reader = store.reader(writer.id(), 0).unwrap();
     assert_eq!(record(&mut reader).record().len(), FRAME_BYTES as u64 + 1);
 }
+
+#[test]
+fn lease_metadata_exhaustion_fails_the_stream_once() {
+    let (_dir, store) = store(4, 4);
+    let mut writer = store.create().unwrap();
+    writer.append(&[7; FRAME_BYTES + 1]).unwrap();
+    let mut spare = store.reader(writer.id(), 0).unwrap();
+    // Each two-frame lease charges its frame list; a reader's own charge ends when it drops,
+    // so the ceiling is reached by a lease, never by attaching.
+    let mut leases = Vec::new();
+    let _exhausted = loop {
+        assert!(leases.len() < 4096 / 8, "leases outgrew the metadata ceiling");
+        let mut reader = store.reader(writer.id(), 0).unwrap();
+        match reader.try_next() {
+            Poll::Ready(Some(Read::Record(lease))) => leases.push(lease),
+            Poll::Ready(Some(Read::Terminal(Terminal::StorageExhausted))) => break reader,
+            _ => panic!("expected a record or storage exhaustion"),
+        }
+    };
+    assert!(matches!(writer.append(b"after"), Err(Error::Closed)));
+    assert_eq!(writer.storage_failure_frames(), Some(2));
+    // A second reader meeting the same ceiling does not count the failure again.
+    terminal(&mut spare, Terminal::StorageExhausted);
+    let stats = store.stats();
+    assert_eq!(
+        (stats.allocation_failures, stats.last_storage_exhausted_frames),
+        (1, Some(2))
+    );
+}

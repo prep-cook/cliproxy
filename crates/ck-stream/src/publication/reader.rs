@@ -94,6 +94,11 @@ impl Reader {
                 })))
             }
             Step::Terminal(terminal) => {
+                // A lease the stream's storage cannot pin fails the stream like any storage
+                // failure. A stream that already ended keeps its terminal and its count.
+                if terminal == Terminal::StorageExhausted {
+                    stream.finish(terminal);
+                }
                 self.terminal_seen = true;
                 Poll::Ready(Some(Read::Terminal(terminal)))
             }

@@ -98,6 +98,8 @@ pub(crate) struct State {
     external_metadata: usize,
     // Taken at invalidation, so an evicted stream frees its header before its last handle drops.
     slot: Option<u32>,
+    /// Frames charged when the stream ended with `StorageExhausted`.
+    failure_frames: Option<u32>,
 }
 
 impl State {
@@ -154,8 +156,26 @@ impl Stream {
                 scratch_frames: 0,
                 external_metadata: 0,
                 slot: Some(slot),
+                failure_frames: None,
             }),
         }
+    }
+
+    pub(crate) fn is_invalidated(&self) -> bool {
+        self.invalidated.load(Ordering::Acquire)
+    }
+
+    /// Frames reader leases keep pinned: owned ones with another reference, and detached ones
+    /// only leases still hold. Every record spans a frame, so this is zero exactly when no lease
+    /// on the stream is outstanding. Counted here rather than per lease: an atomic update on
+    /// every lease drop cost 5% of small-request throughput.
+    pub(crate) fn leased_frames(&self, state: &State) -> u64 {
+        let owned = state
+            .frames
+            .iter()
+            .filter(|frame| frame.pool.is_some_and(|index| self.pool.references(index) > 1))
+            .count();
+        owned as u64 + self.detached.load(Ordering::Acquire)
     }
 
     pub(crate) fn last_read(&self) -> Duration {
@@ -282,6 +302,14 @@ impl Stream {
             return;
         }
         state.terminal = Some(terminal);
+        if terminal == Terminal::StorageExhausted {
+            // Every failing path rolls back its partial reservation before it gets here, so this
+            // is what the stream still holds, by the formula its frame limit uses. Frame counts
+            // are bounded by the pool's u32 capacity.
+            let frames = self.live_frames(&state) as u32;
+            state.failure_frames = Some(frames);
+            self.retention.failures.record(Some(frames));
+        }
         drop(state);
         self.notify.wake();
         self.stopped.wake();

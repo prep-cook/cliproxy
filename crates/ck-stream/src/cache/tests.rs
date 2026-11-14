@@ -1,5 +1,7 @@
 use super::*;
-use crate::FRAME_BYTES;
+use std::task::Poll;
+
+use crate::{FRAME_BYTES, Read};
 
 fn store() -> (tempfile::TempDir, Store) {
     let dir = tempfile::tempdir().unwrap();
@@ -144,4 +146,145 @@ fn maintenance_keeps_the_first_error_and_counts_later_ones() {
     assert!(store.take_reclaim_error().is_none());
     store.inner.record_failure(io::Error::other("fourth"), false);
     assert_eq!(store.take_reclaim_error().unwrap().to_string(), "fourth");
+}
+
+#[test]
+fn refused_admission_counts_as_an_allocation_failure() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut config = Config::new(dir.path().join("pool"));
+    config.pool_bytes = Some(4 * FRAME_BYTES);
+    config.max_event_bytes = FRAME_BYTES;
+    config.header_slots = 1;
+    config.workers = 1;
+    let store = Store::open(config).unwrap();
+    // A racing admission holds the only slot and has not entered the cache yet.
+    let slot = store.inner.pool.claim_slot().unwrap();
+    assert!(matches!(store.create(), Err(Error::StorageExhausted)));
+    let stats = store.stats();
+    assert_eq!(
+        (stats.allocation_failures, stats.last_storage_exhausted_frames),
+        (1, None)
+    );
+    store.inner.pool.release_slot(slot);
+}
+
+#[test]
+fn retired_streams_are_pruned_once_their_handles_drop() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut config = Config::new(dir.path().join("pool"));
+    config.pool_bytes = Some(4 * FRAME_BYTES);
+    config.max_event_bytes = FRAME_BYTES;
+    config.header_slots = 1;
+    config.workers = 1;
+    let store = Store::open(config).unwrap();
+    let mut previous = store.create().unwrap();
+    for _ in 0..64 {
+        // Admission evicts the previous stream while its writer still holds it.
+        let next = store.create().unwrap();
+        drop(std::mem::replace(&mut previous, next));
+    }
+    // Checked before `stats`, which prunes too.
+    assert!(store.inner.cache.lock().orphans.len() <= 4);
+    assert_eq!(store.stats().evictions, 64);
+}
+
+#[test]
+fn orphan_pruning_stays_amortized_when_one_orphan_dies_per_retirement() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut config = Config::new(dir.path().join("pool"));
+    config.pool_bytes = Some(4 * FRAME_BYTES);
+    config.max_event_bytes = FRAME_BYTES;
+    config.header_slots = 1;
+    config.workers = 1;
+    let store = Store::open(config).unwrap();
+    let orphans = || store.inner.cache.lock().orphans.len();
+    let (mut retirements, mut scanned) = (0, 0);
+    let mut admit = || {
+        let before = orphans();
+        let writer = store.create().unwrap();
+        // Each admission retires one stream; a list no longer than before means it pruned.
+        if orphans() <= before {
+            scanned += before;
+        }
+        retirements += 1;
+        writer
+    };
+    // 4,095 retired streams stay referenced, filling a 4,096-entry list but one; from then
+    // on each retired stream dies before the next retirement.
+    let live: Vec<Writer> = (0..4095).map(|_| admit()).collect();
+    let mut previous = admit();
+    for _ in 0..1000 {
+        let next = admit();
+        drop(std::mem::replace(&mut previous, next));
+    }
+    drop(admit);
+    assert!(
+        scanned <= 4 * retirements,
+        "{scanned} orphan checks for {retirements} retirements"
+    );
+    drop(live);
+}
+
+#[test]
+fn stats_waits_for_a_stream_without_holding_the_cache_lock() {
+    let (_dir, store) = store();
+    let writer = store.create().unwrap();
+    let mut ending = store.create().unwrap();
+    ending.append(b"leased").unwrap();
+    let Poll::Ready(Some(Read::Record(lease))) = store.reader(ending.id(), 0).unwrap().try_next() else {
+        panic!("expected a record");
+    };
+    let stream = store.inner.cache.lock().get(writer.id()).unwrap();
+    let state = stream.state.lock();
+    std::thread::scope(|scope| {
+        let scrape = scope.spawn(|| store.stats());
+        std::thread::sleep(Duration::from_millis(100));
+        // Admission and attachment proceed while the scrape waits for one stream's state.
+        let free = store.inner.cache.try_lock_for(Duration::from_secs(1)).is_some();
+        // A stream retired meanwhile joins the retired list the scrape puts back. Ending it
+        // takes the cache lock, so it runs only if the scrape left that lock free.
+        if free {
+            ending.finish(Terminal::Gone);
+        }
+        drop(state);
+        assert_eq!(scrape.join().unwrap().cached_streams, 2);
+        assert!(free, "stats held the cache lock while waiting for stream state");
+    });
+    assert_eq!(store.stats().leased_frames, 1);
+    drop(lease);
+}
+
+#[test]
+fn overlapping_scrapes_all_see_leases_on_forgotten_streams() {
+    const STREAMS: u64 = 32;
+    let dir = tempfile::tempdir().unwrap();
+    let mut config = Config::new(dir.path().join("pool"));
+    config.pool_bytes = Some(2 * STREAMS as usize * FRAME_BYTES);
+    config.max_event_bytes = FRAME_BYTES;
+    config.header_slots = STREAMS as u32;
+    config.workers = 1;
+    let store = Store::open(config).unwrap();
+    // One single-frame lease per stream, held after its writer ends it `Gone`.
+    let leases: Vec<_> = (0..STREAMS)
+        .map(|_| {
+            let mut writer = store.create().unwrap();
+            writer.append(b"leased").unwrap();
+            let Poll::Ready(Some(Read::Record(lease))) = store.reader(writer.id(), 0).unwrap().try_next() else {
+                panic!("expected a record");
+            };
+            writer.finish(Terminal::Gone);
+            lease
+        })
+        .collect();
+    assert_eq!(store.stats().cached_streams, 0);
+    // No lease changes hands while the scrapes run, so every snapshot must count them all.
+    let wrong: usize = std::thread::scope(|scope| {
+        let scrapes: Vec<_> = (0..8)
+            .map(|_| scope.spawn(|| (0..500).filter(|_| store.stats().leased_frames != STREAMS).count()))
+            .collect();
+        scrapes.into_iter().map(|scrape| scrape.join().unwrap()).sum()
+    });
+    assert_eq!(wrong, 0, "{wrong} of 4000 overlapping snapshots missed retired leases");
+    drop(leases);
+    assert_eq!(store.stats().leased_frames, 0);
 }

@@ -10,7 +10,7 @@ mod position;
 mod publication;
 mod request;
 
-pub use cache::{Clock, MaintenanceFailures, ManualClock, MonotonicClock, Store};
+pub use cache::{Clock, MaintenanceFailures, ManualClock, MonotonicClock, Store, StoreStats};
 pub use grammar::{ByteSpan, EventView};
 pub use limits::{Config, Limits, MAX_POOL_BYTES, MAX_STREAM_FRAMES};
 pub use position::{Position, Record};

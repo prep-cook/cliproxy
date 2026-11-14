@@ -24,6 +24,12 @@ impl Writer {
         Position::at(self.id(), self.stream.state.lock().end)
     }
 
+    /// Frames charged to this stream when it ended with `StorageExhausted`, for the producer's
+    /// failure log; `None` for any other end or while it runs.
+    pub fn storage_failure_frames(&self) -> Option<u32> {
+        self.stream.state.lock().failure_frames
+    }
+
     /// Wait for the producer to stop, including expiry, eviction, cancellation and shutdown.
     /// The owned, cancellation-safe future does not borrow the writer and also resolves
     /// immediately after a terminal has already been published, including normal completion.
@@ -278,6 +284,9 @@ impl Writer {
 
     pub fn finish(&mut self, terminal: Terminal) {
         self.stream.finish(terminal);
+        if terminal == Terminal::Gone {
+            self.inner.forget(&self.stream);
+        }
     }
 
     /// Release a non-resumable canonical prefix. Response records must never use this API.
