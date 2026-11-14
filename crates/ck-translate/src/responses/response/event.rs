@@ -27,15 +27,23 @@ const CONSUMED: &[&str] = &[
 enum Class {
     Failure,
     Terminal,
-    Lifecycle,
+    /// `response.created` or `response.in_progress`, by name.
+    Lifecycle(&'static str),
     Added,
     Done,
-    Part { summary: bool, close: bool },
+    Part {
+        summary: bool,
+        close: bool,
+    },
     Text(Text),
     Audio(Audio),
-    Code { snapshot: bool },
+    Code {
+        snapshot: bool,
+    },
     PartialImage,
-    Arguments { snapshot: bool },
+    Arguments {
+        snapshot: bool,
+    },
     Annotation,
 }
 
@@ -71,8 +79,8 @@ const EVENTS: &[(&str, Class)] = &[
     ("response.failed", Class::Failure),
     ("response.completed", Class::Terminal),
     ("response.incomplete", Class::Terminal),
-    ("response.created", Class::Lifecycle),
-    ("response.in_progress", Class::Lifecycle),
+    ("response.created", Class::Lifecycle("response.created")),
+    ("response.in_progress", Class::Lifecycle("response.in_progress")),
     ("response.output_item.added", Class::Added),
     ("response.output_item.done", Class::Done),
     (
@@ -240,10 +248,11 @@ impl State {
                 self.unknown(owner, &doc, &["type", "response", "sequence_number"], source, event)?;
                 self.complete(owner, &doc, response)
             }
-            Class::Lifecycle => {
+            Class::Lifecycle(name) => {
                 let response = doc.required(root, "response")?;
                 self.lifecycle(owner, &doc, response)?;
-                // Lifecycle fields the terminal snapshot may omit; egress merges the later values over them.
+                // Lifecycle fields the terminal snapshot may omit; egress merges the later values
+                // over them, and replays the transition its source event names.
                 self.emitter.emit(
                     owner,
                     Kind::Opaque,
@@ -252,7 +261,11 @@ impl State {
                         e.bytes(b",\"name\":\"responses.response\",\"format\":\"json\",\"value\":")?;
                         object(&doc, response, &["output", "usage", "audio"], e)
                     },
-                    |_| Ok(()),
+                    |e| {
+                        e.bytes(b",\"source\":{\"protocol\":\"responses\",\"event\":")?;
+                        e.string(name)?;
+                        e.bytes(b"}")
+                    },
                 )?;
                 self.unknown(owner, &doc, &["type", "response"], source, event)
             }
@@ -375,7 +388,7 @@ impl State {
                 self.arguments(owner, at, doc, doc.required(root, field)?, snapshot)
             }
             Class::Annotation => self.annotation_event(owner, doc),
-            Class::Failure | Class::Terminal | Class::Lifecycle => Err(Error::Schema),
+            Class::Failure | Class::Terminal | Class::Lifecycle(_) => Err(Error::Schema),
         }
     }
 

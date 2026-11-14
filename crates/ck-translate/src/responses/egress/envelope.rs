@@ -41,7 +41,12 @@ impl<F: FnMut(&'static str, u64)> Egress<F> {
         let doc = &mut self.document;
         let target = doc.root();
         let node = doc.absorb(incoming)?;
-        for (from, to) in [("id", "id"), ("model", "model"), ("created", "created_at")] {
+        for (from, to) in [
+            ("id", "id"),
+            ("model", "model"),
+            ("created", "created_at"),
+            ("status", "status"),
+        ] {
             if let Some(value) = doc.remove(node, from)? {
                 let target = doc.set(target, to, Value::Null)?;
                 doc.transplant(target, value)?;
@@ -104,12 +109,32 @@ impl<F: FnMut(&'static str, u64)> Egress<F> {
     ) -> Result<()> {
         let root = incoming.root();
         if is(&incoming, root, "name", "responses.response")? {
+            let progress = match incoming
+                .member(root, "x_ck")?
+                .map(|x| incoming.member(x, "source"))
+                .transpose()?
+            {
+                Some(Some(source)) => is(&incoming, source, "event", "response.in_progress")?,
+                _ => false,
+            };
             let doc = &mut self.document;
             let node = doc.absorb(incoming)?;
             let value = doc.required(node, "value")?;
             super::super::opaque::preserve_carrier_collision(doc, value)?;
             super::super::merge(doc, doc.root(), value)?;
-            return Ok(());
+            if !progress || self.mode == BodyMode::Buffered {
+                return Ok(());
+            }
+            let response = encode::scratch(owner, |e| write_response(doc, e))?;
+            return self.emit(
+                owner,
+                "response.in_progress",
+                |e| {
+                    e.bytes(b",\"response\":")?;
+                    write_lease(&response, e)
+                },
+                output,
+            );
         }
         if is(&incoming, root, "name", "responses.audio")? {
             let node = self.document.absorb(incoming)?;

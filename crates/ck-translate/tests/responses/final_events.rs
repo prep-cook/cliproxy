@@ -232,3 +232,27 @@ fn failure_and_annotation_events_follow_the_native_schemas() {
         assert_eq!(event["annotation"], citation(i as u64));
     }
 }
+
+#[test]
+fn streaming_clients_see_the_lifecycle_status() {
+    let response = |status: &str| json!({"id":"r","model":"m","status":status,"output":[]});
+    let records = [
+        json!({"type":"response.created","response":response("queued")}),
+        json!({"type":"response.in_progress","response":response("in_progress")}),
+        json!({"type":"response.completed","response":response("completed")}),
+    ];
+    let (out, _) = try_streamed(&records, BodyMode::Streaming).unwrap();
+    let events = client_events(&out);
+    let lifecycle: Vec<_> = events
+        .iter()
+        .map(|e| (e["type"].as_str().unwrap(), e["response"]["status"].as_str().unwrap()))
+        .collect();
+    assert_eq!(
+        lifecycle,
+        [
+            ("response.created", "queued"),
+            ("response.in_progress", "in_progress"),
+            ("response.completed", "completed")
+        ]
+    );
+}
