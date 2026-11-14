@@ -155,36 +155,63 @@ fn write_format(doc: &Document, format: usize, e: &mut Encoder<'_, '_>) -> Resul
     }
     e.bytes(b"}")
 }
-/// Writes the function tools, then the native tool declarations kept in `x_ck.tools`.
+/// Writes the function tools and the native tool declarations kept in `x_ck.tools`; a
+/// declaration whose pointer names its position returns there, others follow the functions.
 fn write_tools(doc: &Document, field: usize, e: &mut Encoder<'_, '_>) -> Result<()> {
+    let native = match doc.member(doc.root(), "x_ck")? {
+        Some(x) => doc.member(x, "tools")?,
+        None => None,
+    };
+    let mut natives = native
+        .map(|n| doc.children(n))
+        .transpose()?
+        .into_iter()
+        .flatten()
+        .peekable();
+    let mut functions = doc.children(field)?.peekable();
     e.bytes(b"[")?;
-    for (i, tool) in doc.children(field)?.enumerate() {
-        if i > 0 {
+    for position in 0u64.. {
+        let at = match natives.peek() {
+            Some(&entry) => functions.peek().is_none() || position_of(doc, entry)?.is_some_and(|p| p <= position),
+            None => false,
+        };
+        if position > 0 && (at || functions.peek().is_some()) {
             e.bytes(b",")?;
         }
-        e.bytes(b"{\"type\":\"function\"")?;
-        let function = doc.required(tool, "function")?;
-        for f in doc.children(function)? {
-            e.bytes(b",")?;
-            doc.write_name(doc.node(f)?.name.ok_or(Error::Schema)?, e)?;
-            e.bytes(b":")?;
-            doc.write(f, e)?;
-        }
-        e.bytes(b"}")?;
-    }
-    if let Some(x) = doc.member(doc.root(), "x_ck")?
-        && let Some(native) = doc.member(x, "tools")?
-    {
-        let mut comma = doc.node(field)?.first.is_some();
-        for entry in doc.children(native)? {
-            if comma {
-                e.bytes(b",")?;
-            }
-            comma = true;
+        if at && let Some(entry) = natives.next() {
             doc.write(doc.required(entry, "declaration")?, e)?;
+        } else if let Some(tool) = functions.next() {
+            e.bytes(b"{\"type\":\"function\"")?;
+            let function = doc.required(tool, "function")?;
+            for f in doc.children(function)? {
+                e.bytes(b",")?;
+                doc.write_name(doc.node(f)?.name.ok_or(Error::Schema)?, e)?;
+                e.bytes(b":")?;
+                doc.write(f, e)?;
+            }
+            originals(doc, tool, e, &["type", "function"])?;
+            e.bytes(b"}")?;
+        } else {
+            break;
         }
     }
     e.bytes(b"]")
+}
+/// The position a `/tools/N` declaration pointer names; `None` for any other pointer.
+fn position_of(doc: &Document, entry: usize) -> Result<Option<u64>> {
+    let mut chars = doc.chars(doc.required(entry, "pointer")?)?;
+    for expected in "/tools/".chars() {
+        if chars.next_scalar()? != Some(expected) {
+            return Ok(None);
+        }
+    }
+    let mut position = None::<u64>;
+    while let Some(c) = chars.next_scalar()? {
+        let digit = u64::from(c.to_digit(10).ok_or(Error::Schema)?);
+        let value = position.unwrap_or(0).checked_mul(10).and_then(|p| p.checked_add(digit));
+        position = Some(value.ok_or(Error::Schema)?);
+    }
+    Ok(position)
 }
 /// Writes the reasoning options, the continuation and the Responses provider parameters.
 fn write_extensions(doc: &Document, x: usize, e: &mut Encoder<'_, '_>) -> Result<()> {

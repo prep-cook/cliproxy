@@ -116,3 +116,15 @@ fn chat_token_limits_become_max_output_tokens() {
         assert!(output.get("max_tokens").is_none(), "{output}");
     }
 }
+
+#[test]
+fn tool_declarations_keep_order_and_unknown_fields() {
+    let input = json!({"model":"m","input":"q","tools":[
+        {"type":"web_search"},
+        {"type":"function","name":"f","parameters":{},"namespace":"ns","vendor":{"a":null}},
+        {"type":"file_search","vector_store_ids":["v"]},
+        {"type":"function","name":"g","parameters":{}},
+    ]});
+    let (output, _) = request(&input, Operation::Generate);
+    assert_eq!(output["tools"], input["tools"]);
+}

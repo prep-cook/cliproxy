@@ -48,7 +48,7 @@ pub(super) fn normalize(doc: &mut Document, owner: &mut Writer, operation: Opera
     }
     normalize_input(doc, owner, x, original)?;
     normalize_options(doc, owner, x, original)?;
-    normalize_tools(doc, x)?;
+    normalize_tools(doc, owner, x, original)?;
     preserve_unknown(doc, owner, original, root, ROOT_FIELDS)
 }
 /// Moves `instructions` and `input` into canonical messages.
@@ -137,11 +137,13 @@ fn nest_schema(doc: &mut Document, format: usize) -> Result<()> {
     }
     Ok(())
 }
-/// Nests function tools and a function tool choice; other tools move to `x_ck.tools`.
-fn normalize_tools(doc: &mut Document, x: usize) -> Result<()> {
+/// Nests function tools and a function tool choice; other tools move to `x_ck.tools` under
+/// a pointer to their position, so egress restores the declaration order.
+fn normalize_tools(doc: &mut Document, owner: &mut Writer, x: usize, original: usize) -> Result<()> {
     let root = doc.root();
     if let Some(tools) = doc.member(root, "tools")? {
         let mut next = doc.node(tools)?.first;
+        let mut position = 0u64;
         while let Some(tool) = next {
             next = doc.node(tool)?.next;
             if is(doc, tool, "type", "function")? {
@@ -149,6 +151,7 @@ fn normalize_tools(doc: &mut Document, x: usize) -> Result<()> {
                 for name in ["name", "description", "parameters", "strict"] {
                     move_field(doc, tool, name, function, name)?;
                 }
+                preserve_unknown(doc, owner, original, tool, &["type", "function"])?;
             } else {
                 let native = match doc.member(x, "tools")? {
                     Some(n) => n,
@@ -156,11 +159,15 @@ fn normalize_tools(doc: &mut Document, x: usize) -> Result<()> {
                 };
                 let entry = doc.add(None, Value::Object)?;
                 doc.append(native, entry)?;
-                doc.set(entry, "pointer", Value::Text("/tools"))?;
+                let lease = encode::scratch(owner, |e| e.string(&format!("/tools/{position}")))?;
+                let pointer = doc.import_json(owner, lease)?;
+                doc.rename(pointer, "pointer")?;
+                doc.append(entry, pointer)?;
                 doc.detach(tools, tool)?;
                 doc.rename(tool, "declaration")?;
                 doc.append(entry, tool)?;
             }
+            position += 1;
         }
     }
     if let Some(choice) = doc.member(root, "tool_choice")?
