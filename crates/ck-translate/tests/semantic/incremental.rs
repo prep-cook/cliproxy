@@ -420,7 +420,6 @@ fn buffered_media_malformed_tail_never_closes_successfully() {
             br#"{"choices":[{"index":0,"message":{"audio":{"data":"AAEC"#,
         )
         .unwrap();
-    ingress.flush(&mut mapped.writer).unwrap();
     assert!(ingress.advance(&mut mapped.writer, br#"\uDC00"#).is_err());
     let output = String::from_utf8(mapped.output(&mapped.writer)).unwrap();
     assert!(output.contains("event: x_ck.data\n"));

@@ -1,6 +1,8 @@
-//! Buffered Chat response media collects small network reads into shared data records, and
-//! buffered and streamed responses open their blocks in the same order.
-use super::{Direction, Mapped, Operation, canonical_values, codec, identity, response};
+//! Chat ingress collects small network reads of media and long strings into shared data
+//! records, and buffered and streamed responses open their blocks in the same order.
+use super::{
+    ChatCapability, Direction, Ingress, Mapped, Operation, RequestIngress, canonical_values, codec, identity, response,
+};
 use base64::Engine;
 use codec::{BodyMode, ResponseIngress};
 use serde_json::{Value, json};
@@ -105,6 +107,62 @@ fn held_media_input_has_a_deadline_and_flushes_split_quartets() {
     ingress.advance(&mut mapped.writer, rest.as_bytes()).unwrap();
     assert_eq!(data_records(&mapped), (3, raw));
     ingress.finish(&mut mapped.writer).unwrap();
+}
+
+/// Held input the scanner validated is published once, without a media close, before a terminal
+/// error ends the response, and the error leaves no flush deadline.
+#[test]
+fn held_media_input_publishes_before_a_terminal_error() {
+    for terminal in [None, Some(&br"\uDC00"[..])] {
+        let mut mapped = Mapped::new();
+        let mut ingress = buffered(&mut mapped);
+        ingress
+            .advance(
+                &mut mapped.writer,
+                br#"{"choices":[{"index":0,"message":{"audio":{"data":"AAEC"#,
+            )
+            .unwrap();
+        assert!(ingress.flush_deadline().is_some());
+        let result = match terminal {
+            Some(bytes) => ingress.advance(&mut mapped.writer, bytes),
+            None => ingress.finish(&mut mapped.writer),
+        };
+        assert!(result.is_err());
+        assert!(ingress.flush_deadline().is_none());
+        assert_eq!(data_records(&mapped), (1, vec![0, 1, 2]));
+        let events = canonical_values(&mapped);
+        assert!(!events.iter().any(|event| event["status"] == "completed"));
+        assert!(events.iter().any(|event| event["code"] == "stream.invalid_input"));
+    }
+}
+
+/// A streamed request string publishes its held input before a terminal error in the same way.
+#[test]
+fn held_request_string_publishes_before_a_terminal_error() {
+    for terminal in [None, Some(&br"\uDC00"[..])] {
+        let mut mapped = Mapped::new();
+        let mut ingress = Ingress::new(
+            &mut mapped.writer,
+            &mapped.store,
+            identity(Direction::Request),
+            Operation::Generate,
+            100_000,
+        )
+        .unwrap();
+        let mut prefix = br#"{"model":"m","messages":[{"role":"user","content":""#.to_vec();
+        prefix.extend(std::iter::repeat_n(b'a', 2048));
+        ingress.advance(&mut mapped.writer, &prefix).unwrap();
+        assert!(ingress.flush_deadline().is_some());
+        let failed = match terminal {
+            Some(bytes) => ingress.advance(&mut mapped.writer, bytes).is_err(),
+            None => ingress.finish(&mut mapped.writer, &ChatCapability).is_err(),
+        };
+        assert!(failed);
+        assert!(ingress.flush_deadline().is_none());
+        assert_eq!(data_records(&mapped), (1, vec![b'a'; 2048]));
+        let events = canonical_values(&mapped);
+        assert!(!events.iter().any(|event| event["status"] == "completed"));
+    }
 }
 
 /// Kinds of the content blocks the canonical stream opens, in order.

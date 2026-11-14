@@ -125,10 +125,7 @@ impl Ingress {
     }
 
     fn prepare(&mut self, owner: &mut Writer) -> Result<()> {
-        self.scanner
-            .as_mut()
-            .ok_or(Error::Closed)?
-            .finish(self.document.input())?;
+        self.scan(owner, None)?;
         self.consume(owner)?;
         super::request_controls::declarations(&mut self.document, owner)?;
         crate::codec::provenance::bindings(&mut self.document, owner)?;
@@ -169,11 +166,7 @@ impl codec::RequestIngress for Ingress {
                 return self.flush_string(owner);
             }
             for bytes in bytes.chunks(8192) {
-                self.document.push_input(owner, bytes)?;
-                self.scanner
-                    .as_mut()
-                    .ok_or(Error::Closed)?
-                    .advance_document(&self.document)?;
+                self.scan(owner, Some(bytes))?;
                 self.consume(owner)?;
             }
             Ok(())

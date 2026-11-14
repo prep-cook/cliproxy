@@ -39,7 +39,7 @@ impl Buffered {
             return self.flush(owner, state);
         }
         for bytes in bytes.chunks(8192) {
-            self.input.advance(owner, bytes)?;
+            self.scan(owner, state, |input, owner| input.advance(owner, bytes))?;
             if let Some(index) = self.active {
                 self.collect(owner, state, index, false)?;
             }
@@ -61,11 +61,38 @@ impl Buffered {
             None => Ok(()),
         }
     }
+    /// Runs an input step that can poison the scanner. When it fails, held input the scanner
+    /// validated before the step is published, without closing its media, before the error
+    /// returns; a failed scanner no longer reports positions.
+    fn scan(
+        &mut self,
+        owner: &mut Writer,
+        state: &mut State,
+        step: impl FnOnce(&mut Pending, &mut Writer) -> Result<()>,
+    ) -> Result<()> {
+        let held = match self.active {
+            Some(index) => {
+                let wire = state.published[index].wire;
+                Some((
+                    index,
+                    self.input.scanner.pending_node(self.input.document.input(), wire)?,
+                ))
+            }
+            None => None,
+        };
+        let result = step(&mut self.input, owner);
+        if result.is_err()
+            && let Some((index, wire)) = held
+        {
+            self.publish(owner, state, index, wire)?;
+        }
+        result
+    }
     pub(super) fn flush_deadline(&self, state: &State) -> Option<std::time::Instant> {
         Some(state.published[self.active?].held? + FLUSH_DELAY)
     }
     pub(super) fn finish(mut self, owner: &mut Writer, state: &mut State) -> Result<()> {
-        self.input.finish()?;
+        self.scan(owner, state, |input, _| input.finish())?;
         if let Some(index) = self.active {
             self.collect(owner, state, index, true)?;
         }
@@ -161,6 +188,13 @@ impl Buffered {
                 return Ok(());
             }
         }
+        self.publish(owner, state, index, wire)
+    }
+
+    /// Decodes and publishes the payload input up to the validated end of `wire`, and completes
+    /// the media once the string has ended.
+    fn publish(&mut self, owner: &mut Writer, state: &mut State, index: usize, wire: json::Node) -> Result<()> {
+        let published = &mut state.published[index];
         published.held = None;
         let mut chars = json::Decoded::fragment(
             self.input.document.input(),
