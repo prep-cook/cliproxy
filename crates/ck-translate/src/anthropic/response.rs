@@ -18,6 +18,8 @@ pub struct Ingress {
     state: State,
     failed: bool,
 }
+type Origin<'a> = Option<(&'a Document, &'a Source, &'a sse::Event)>;
+
 struct Block {
     index: u64,
     scope: Scope,
@@ -303,7 +305,7 @@ impl State {
                 Kind::Heartbeat,
                 Scope::default(),
                 |_| Ok(()),
-                |e| provenance(source, event, e),
+                |e| event_origin(Some((&doc, source, event)), "ping", &["type"], e),
             )?;
         } else if doc.string_is(kind, "message_start")? {
             if self.message_started {
@@ -340,15 +342,15 @@ impl State {
                     base_fields(base, e)?;
                     e.bytes(b",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\"},\"finish_reason\":null}]")
                 },
-                |e| provenance(source, event, e),
+                |e| event_origin(Some((&doc, source, event)), "message_start", &["type", "message"], e),
             )?;
             if let Some(content) = doc.member(message, "content")? {
                 if !matches!(doc.node(content)?.value, Value::Array) {
                     return Err(Error::Schema);
                 }
                 for (index, block) in doc.children(content)?.enumerate() {
-                    self.block_start(owner, &doc, block, index as u64, true)?;
-                    self.block_stop(owner, index as u64)?;
+                    self.block_start(owner, &doc, block, index as u64, true, None)?;
+                    self.block_stop(owner, index as u64, None)?;
                 }
             }
             self.update_usage(owner, &doc, message)?;
@@ -360,6 +362,7 @@ impl State {
                 doc.required(root, "content_block")?,
                 doc.unsigned(doc.required(root, "index")?)?,
                 false,
+                Some((&doc, source, event)),
             )?;
         } else if doc.string_is(kind, "content_block_delta")? {
             self.require_active()?;
@@ -372,17 +375,43 @@ impl State {
             )?;
         } else if doc.string_is(kind, "content_block_stop")? {
             self.require_active()?;
-            self.block_stop(owner, doc.unsigned(doc.required(root, "index")?)?)?;
+            self.block_stop(
+                owner,
+                doc.unsigned(doc.required(root, "index")?)?,
+                Some((&doc, source, event)),
+            )?;
         } else if doc.string_is(kind, "message_delta")? {
+            if !self.message_started {
+                return Err(Error::Schema);
+            }
             self.update_usage(owner, &doc, root)?;
             let delta = doc.required(root, "delta")?;
             if let Some(reason) = doc.member(delta, "stop_reason")?
                 && !matches!(doc.node(reason)?.value, Value::Null)
             {
-                self.finish_choice(owner, &doc, delta)?;
+                self.finish_choice(owner, &doc, delta, Some((&doc, source, event)))?;
+            } else {
+                let base = self.base.as_ref().ok_or(Error::Schema)?;
+                self.emitter.emit(
+                    owner,
+                    Kind::Chunk,
+                    self.scope()?,
+                    |e| {
+                        base_fields(base, e)?;
+                        e.bytes(b",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":null}]")
+                    },
+                    |e| {
+                        provenance_as(source, event, Some("message_delta"), e)?;
+                        super::unknown_at(
+                            &doc,
+                            &[(root, "", &["type", "delta", "usage"]), (delta, "/delta", &[])],
+                            e,
+                        )
+                    },
+                )?;
             }
         } else if doc.string_is(kind, "message_stop")? {
-            self.done(owner)?;
+            self.done(owner, Some((&doc, source, event)))?;
         } else {
             self.start(owner, None)?;
             self.emitter.emit(
@@ -439,15 +468,23 @@ impl State {
                 return Err(Error::Schema);
             }
             for (index, block) in doc.children(content)?.enumerate() {
-                self.block_start(owner, doc, block, index as u64, true)?;
-                self.block_stop(owner, index as u64)?;
+                self.block_start(owner, doc, block, index as u64, true, None)?;
+                self.block_stop(owner, index as u64, None)?;
             }
             self.update_usage(owner, doc, root)?;
-            self.finish_choice(owner, doc, root)?;
+            self.finish_choice(owner, doc, root, None)?;
         }
-        self.done(owner)
+        self.done(owner, None)
     }
-    fn block_start(&mut self, owner: &mut Writer, doc: &Document, node: usize, index: u64, whole: bool) -> Result<()> {
+    fn block_start(
+        &mut self,
+        owner: &mut Writer,
+        doc: &Document,
+        node: usize,
+        index: u64,
+        whole: bool,
+        origin: Origin<'_>,
+    ) -> Result<()> {
         if self.blocks.rows.iter().any(|b| b.index == index) {
             return Err(Error::Schema);
         }
@@ -520,7 +557,7 @@ impl State {
                 };
                 super::object(doc, node, skip, e)
             },
-            |e| e.bytes(b",\"source\":{\"protocol\":\"anthropic\"}"),
+            |e| event_origin(origin, "content_block_start", &["type", "index", "content_block"], e),
         )?;
         if tool {
             let name = doc.required(node, "name")?;
@@ -841,7 +878,7 @@ impl State {
         )?;
         Ok(())
     }
-    fn block_stop(&mut self, owner: &mut Writer, index: u64) -> Result<()> {
+    fn block_stop(&mut self, owner: &mut Writer, index: u64, origin: Origin<'_>) -> Result<()> {
         let position = self
             .blocks
             .rows
@@ -882,8 +919,13 @@ impl State {
             )?;
             block.signature_final = Some(true);
         }
-        self.emitter
-            .emit(owner, Kind::BlockEnd, block.scope, |_| Ok(()), |_| Ok(()))?;
+        self.emitter.emit(
+            owner,
+            Kind::BlockEnd,
+            block.scope,
+            |_| Ok(()),
+            |e| event_origin(origin, "content_block_stop", &["type", "index"], e),
+        )?;
         block.open = false;
         block.arguments = None;
         block.initial = None;
@@ -905,7 +947,7 @@ impl State {
         }
         Ok(())
     }
-    fn finish_choice(&mut self, owner: &mut Writer, doc: &Document, parent: usize) -> Result<()> {
+    fn finish_choice(&mut self, owner: &mut Writer, doc: &Document, parent: usize, origin: Origin<'_>) -> Result<()> {
         self.require_active()?;
         if self.blocks.rows.iter().any(|b| b.open) {
             return Err(Error::Truncated);
@@ -942,8 +984,18 @@ impl State {
             |e| {
                 e.bytes(b",\"native_finish_reason\":")?;
                 doc.write(reason, e)?;
-                e.bytes(b",\"source\":{\"protocol\":\"anthropic\"}")?;
-                if parent == doc.root() {
+                if let Some((_, source, event)) = origin {
+                    provenance_as(source, event, Some("message_delta"), e)?;
+                    super::unknown_at(
+                        doc,
+                        &[
+                            (doc.root(), "", &["type", "delta", "usage"]),
+                            (parent, "/delta", &["stop_reason"]),
+                        ],
+                        e,
+                    )
+                } else if parent == doc.root() {
+                    e.bytes(b",\"source\":{\"protocol\":\"anthropic\"}")?;
                     if let Some(sequence) = doc.member(parent, "stop_sequence")? {
                         e.bytes(
                             b",\"original\":[{\"protocol\":\"anthropic\",\"pointer\":\"/stop_sequence\",\"value\":",
@@ -960,7 +1012,7 @@ impl State {
         self.finished = true;
         Ok(())
     }
-    fn done(&mut self, owner: &mut Writer) -> Result<()> {
+    fn done(&mut self, owner: &mut Writer, origin: Origin<'_>) -> Result<()> {
         if self.base.is_none() || !self.finished || self.blocks.rows.iter().any(|b| b.open) {
             return Err(Error::Truncated);
         }
@@ -976,8 +1028,13 @@ impl State {
                 |_| Ok(()),
             )?;
         }
-        self.emitter
-            .emit(owner, Kind::Done, Scope::default(), |_| Ok(()), |_| Ok(()))?;
+        self.emitter.emit(
+            owner,
+            Kind::Done,
+            Scope::default(),
+            |_| Ok(()),
+            |e| event_origin(origin, "message_stop", &["type"], e),
+        )?;
         self.terminal = true;
         Ok(())
     }
@@ -998,10 +1055,16 @@ fn base_fields(doc: &Document, e: &mut Encoder<'_, '_>) -> Result<()> {
     Ok(())
 }
 fn provenance(source: &Source, event: &sse::Event, e: &mut Encoder<'_, '_>) -> Result<()> {
+    provenance_as(source, event, None, e)
+}
+fn provenance_as(source: &Source, event: &sse::Event, fallback: Option<&str>, e: &mut Encoder<'_, '_>) -> Result<()> {
     e.bytes(b",\"source\":{\"protocol\":\"anthropic\"")?;
     if let Some(name) = event.name(source)? {
         e.bytes(b",\"event\":")?;
         e.quoted_json(|e| e.span(source, name))?;
+    } else if let Some(name) = fallback {
+        e.bytes(b",\"event\":")?;
+        e.string(name)?;
     }
     e.bytes(b",\"sse\":[")?;
     let mut first = true;
@@ -1044,4 +1107,13 @@ fn delta_origin(
         )?;
     }
     Ok(())
+}
+
+fn event_origin(origin: Origin<'_>, kind: &str, known: &[&str], e: &mut Encoder<'_, '_>) -> Result<()> {
+    if let Some((doc, source, event)) = origin {
+        provenance_as(source, event, Some(kind), e)?;
+        super::unknown(doc, doc.root(), known, e)
+    } else {
+        e.bytes(b",\"source\":{\"protocol\":\"anthropic\"}")
+    }
 }

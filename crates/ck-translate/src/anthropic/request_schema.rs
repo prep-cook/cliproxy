@@ -72,12 +72,14 @@ pub(super) fn validate(view: RequestView<'_>) -> Result<()> {
         }
     }
     let mut conversation = false;
+    let mut system = false;
     for message in doc.children(messages)? {
         let role = doc.required(message, "role")?;
         if doc.string_is(role, "system")? {
-            if conversation {
+            if conversation || system {
                 return Err(Error::Unsupported);
             }
+            system = true;
         } else if doc.string_is(role, "user")? || doc.string_is(role, "assistant")? || doc.string_is(role, "tool")? {
             conversation = true;
         } else {

@@ -24,6 +24,7 @@ struct Block {
     started: bool,
     tool: Option<u64>,
     explicit_block: bool,
+    start_origin: Option<Document>,
 }
 pub struct Egress {
     owner: u64,
@@ -35,8 +36,11 @@ pub struct Egress {
     blocks: Table<Block>,
     usage: Option<Document>,
     finish: Option<Document>,
+    start_origin: Option<Document>,
+    finish_origin: Option<Document>,
     count: Option<Document>,
     started: bool,
+    finish_sent: bool,
     terminal: bool,
     failed: bool,
     diagnostic: fn(Diagnostic),
@@ -62,8 +66,11 @@ impl Egress {
             blocks: Table::new(owner)?,
             usage: None,
             finish: None,
+            start_origin: None,
+            finish_origin: None,
             count: None,
             started: false,
+            finish_sent: false,
             terminal: false,
             failed: false,
             diagnostic,
@@ -78,12 +85,35 @@ impl Egress {
             destination: "anthropic",
         });
     }
+    fn finish_delta(&mut self, owner: &mut Writer, output: &mut impl FnMut(ScratchLease) -> Result<()>) -> Result<()> {
+        if self.finish_sent || self.mode == BodyMode::Buffered {
+            return Ok(());
+        }
+        self.begin(owner, output)?;
+        let finish = self.finish.as_ref().ok_or(Error::Schema)?;
+        let origin = self.finish_origin.take();
+        output(native_event(owner, "message_delta", origin.as_ref(), |e| {
+            e.bytes(b",\"delta\":")?;
+            finish.write(finish.root(), e)?;
+            if let Some(usage) = &self.usage {
+                e.bytes(b",\"usage\":")?;
+                write_usage(usage, e)?;
+            }
+            if let Some(doc) = &origin {
+                original_members(doc, doc.required(doc.root(), "x_ck")?, e)?;
+            }
+            Ok(())
+        })?)?;
+        self.finish_sent = true;
+        Ok(())
+    }
     fn begin(&mut self, owner: &mut Writer, output: &mut impl FnMut(ScratchLease) -> Result<()>) -> Result<()> {
         if self.started || self.mode == BodyMode::Buffered {
             return Ok(());
         }
         let base = self.base.as_ref().ok_or(Error::Schema)?;
-        output(event(owner, "message_start", |e| {
+        let origin = self.start_origin.take();
+        output(native_event(owner, "message_start", origin.as_ref(), |e| {
             e.bytes(b",\"message\":{")?;
             write_base(base, e)?;
             e.bytes(b",\"content\":[],\"stop_reason\":null,\"stop_sequence\":null")?;
@@ -91,7 +121,11 @@ impl Egress {
                 e.bytes(b",\"usage\":")?;
                 write_usage(usage, e)?;
             }
-            e.bytes(b"}")
+            e.bytes(b"}")?;
+            if let Some(doc) = &origin {
+                original_members(doc, doc.required(doc.root(), "x_ck")?, e)?;
+            }
+            Ok(())
         })?)?;
         self.started = true;
         Ok(())
@@ -191,6 +225,7 @@ impl Egress {
                     started: false,
                     tool: None,
                     explicit_block: true,
+                    start_origin: Some(doc),
                 })?;
                 if matches!(native, "text" | "thinking") {
                     self.start_block(owner, index as usize, output)?;
@@ -255,6 +290,7 @@ impl Egress {
                     *base = update;
                 }
                 let choices = doc.required(root, "choices")?;
+                let mut finished = false;
                 for choice_node in doc.children(choices)? {
                     let index = doc.unsigned(doc.required(choice_node, "index")?)?;
                     if index != 0 {
@@ -292,6 +328,7 @@ impl Egress {
                     if let Some(reason) = doc.member(choice_node, "finish_reason")?
                         && !matches!(doc.node(reason)?.value, Value::Null)
                     {
+                        finished = true;
                         if self.finish.is_some() || self.blocks.rows.iter().any(|b| b.open) {
                             return Err(Error::Schema);
                         }
@@ -315,13 +352,49 @@ impl Egress {
                                     "end_turn"
                                 })?;
                             }
-                            original_members(&doc, x, e)?;
+                            if let Some(source) = doc.member(x, "source")?
+                                && super::is(&doc, source, "event", "message_delta")?
+                            {
+                                original_members_at(&doc, x, "/delta", e)?;
+                            } else {
+                                original_members(&doc, x, e)?;
+                            }
                             e.bytes(b"}")
                         })?);
                         self.begin(owner, output)?;
                     }
                     if doc.member(choice_node, "logprobs")?.is_some() {
                         self.drop_event(kind, Some(0), "Anthropic has no logprobs carrier");
+                    }
+                }
+                if let Some(source) = doc.member(x, "source")?
+                    && super::is(&doc, source, "protocol", "anthropic")?
+                {
+                    if super::is(&doc, source, "event", "message_start")? {
+                        self.start_origin = Some(doc);
+                    } else if super::is(&doc, source, "event", "message_delta")? {
+                        if finished {
+                            self.finish_origin = Some(doc);
+                            self.finish_delta(owner, output)?;
+                        } else if self.mode == BodyMode::Streaming {
+                            self.begin(owner, output)?;
+                            output(native_event(owner, "message_delta", Some(&doc), |e| {
+                                e.bytes(b",\"delta\":{")?;
+                                original_members_with_separator(&doc, x, "/delta", false, e)?;
+                                e.bytes(b"}")?;
+                                if let Some(usage) = &self.usage {
+                                    e.bytes(b",\"usage\":")?;
+                                    write_usage(usage, e)?;
+                                }
+                                original_members(&doc, x, e)
+                            })?)?;
+                        } else {
+                            self.drop_event(
+                                kind,
+                                choice,
+                                "intermediate message delta has no buffered envelope carrier",
+                            );
+                        }
                     }
                 }
             }
@@ -405,12 +478,12 @@ impl Egress {
                     body.append(body.root(), input)?;
                 }
                 if !self.blocks.rows[index].explicit_block {
-                    self.close_block(owner, index, output)?;
+                    self.close_block(owner, index, None, output)?;
                 }
             }
             Kind::BlockEnd => {
                 let index = self.find(&doc, x)?;
-                self.close_block(owner, index, output)?;
+                self.close_block(owner, index, Some(&doc), output)?;
             }
             Kind::Usage => {
                 let usage = doc.required(root, "usage")?;
@@ -476,17 +549,10 @@ impl Egress {
                     }
                     self.begin(owner, output)?;
                     if self.mode == BodyMode::Streaming {
-                        let finish = self.finish.as_ref().ok_or(Error::Schema)?;
-                        output(event(owner, "message_delta", |e| {
-                            e.bytes(b",\"delta\":")?;
-                            finish.write(finish.root(), e)?;
-                            if let Some(usage) = &self.usage {
-                                e.bytes(b",\"usage\":")?;
-                                write_usage(usage, e)?;
-                            }
-                            Ok(())
+                        self.finish_delta(owner, output)?;
+                        output(native_event(owner, "message_stop", Some(&doc), |e| {
+                            original_members(&doc, x, e)
                         })?)?;
-                        output(event(owner, "message_stop", |_| Ok(()))?)?;
                     } else {
                         output(encode::scratch(owner, |e| self.buffered(e))?)?;
                     }
@@ -545,6 +611,7 @@ impl Egress {
             started: false,
             tool: None,
             explicit_block: false,
+            start_origin: None,
         })?;
         Ok(index)
     }
@@ -578,6 +645,7 @@ impl Egress {
             started: false,
             tool: None,
             explicit_block: false,
+            start_origin: None,
         })?;
         self.start_block(owner, index, output)?;
         Ok(index)
@@ -593,12 +661,17 @@ impl Egress {
         if block.started {
             return Ok(());
         }
+        let origin = block.start_origin.take();
         if self.mode == BodyMode::Streaming {
-            output(event(owner, "content_block_start", |e| {
+            output(native_event(owner, "content_block_start", origin.as_ref(), |e| {
                 e.bytes(b",\"index\":")?;
                 e.unsigned(block.index)?;
                 e.bytes(b",\"content_block\":")?;
-                super::object(&block.document, block.document.root(), &["partial_json"], e)
+                super::object(&block.document, block.document.root(), &["partial_json"], e)?;
+                if let Some(doc) = &origin {
+                    original_members(doc, doc.required(doc.root(), "x_ck")?, e)?;
+                }
+                Ok(())
             })?)?;
         }
         block.started = true;
@@ -608,6 +681,7 @@ impl Egress {
         &mut self,
         owner: &mut Writer,
         index: usize,
+        origin: Option<&Document>,
         output: &mut impl FnMut(ScratchLease) -> Result<()>,
     ) -> Result<()> {
         self.start_block(owner, index, output)?;
@@ -617,9 +691,13 @@ impl Egress {
         }
         block.open = false;
         if self.mode == BodyMode::Streaming {
-            output(event(owner, "content_block_stop", |e| {
+            output(native_event(owner, "content_block_stop", origin, |e| {
                 e.bytes(b",\"index\":")?;
-                e.unsigned(block.index)
+                e.unsigned(block.index)?;
+                if let Some(doc) = origin {
+                    original_members(doc, doc.required(doc.root(), "x_ck")?, e)?;
+                }
+                Ok(())
             })?)?;
         }
         Ok(())
@@ -850,6 +928,15 @@ fn original_members(doc: &Document, x: usize, e: &mut Encoder<'_, '_>) -> Result
     original_members_at(doc, x, "", e)
 }
 fn original_members_at(doc: &Document, x: usize, prefix: &str, e: &mut Encoder<'_, '_>) -> Result<()> {
+    original_members_with_separator(doc, x, prefix, true, e)
+}
+fn original_members_with_separator(
+    doc: &Document,
+    x: usize,
+    prefix: &str,
+    mut separator: bool,
+    e: &mut Encoder<'_, '_>,
+) -> Result<()> {
     if let Some(original) = doc.member(x, "original")? {
         'entry: for entry in doc.children(original)? {
             if !super::is(doc, entry, "protocol", "anthropic")? {
@@ -871,7 +958,11 @@ fn original_members_at(doc: &Document, x: usize, prefix: &str, e: &mut Encoder<'
                     continue 'entry;
                 }
             }
-            e.bytes(b",\"")?;
+            if separator {
+                e.bytes(b",")?;
+            }
+            separator = true;
+            e.bytes(b"\"")?;
             while let Some(c) = chars.next_scalar()? {
                 let c = if c == '~' {
                     match chars.next_scalar()? {

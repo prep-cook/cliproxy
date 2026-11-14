@@ -84,6 +84,10 @@ fn chat_stop_is_an_array_and_foreign_native_thinking_cannot_cross_fence() {
         (json!({"stop":"END"}), true),
         (json!({"stop":["A","B"]}), true),
         (json!({"reasoning":{"effort":"high"}}), false),
+        (
+            json!({"messages":[{"role":"system","content":"first"},{"role":"system","content":"second"},{"role":"user","content":"x"}]}),
+            false,
+        ),
     ] {
         let mut body = json!({"model":"m","max_tokens":16,"messages":[{"role":"user","content":"x"}]});
         body.as_object_mut().unwrap().extend(extra.as_object().unwrap().clone());
@@ -215,4 +219,71 @@ fn future_deltas_stay_opaque_and_follow_the_remapped_block() {
         .unwrap();
     assert_eq!(delta["delta"], rows[2]["delta"]);
     assert_eq!(delta["index"], 0);
+}
+
+#[test]
+fn lifecycle_records_restore_native_metadata_at_its_original_level() {
+    let mut rows = vec![
+        json!({"type":"message_start","message":{"id":"r","model":"m"}}),
+        json!({"type":"content_block_start","index":7,"content_block":{"type":"text","text":""}}),
+        json!({"type":"content_block_delta","index":7,"delta":{"type":"text_delta","text":"x"}}),
+        json!({"type":"content_block_stop","index":7}),
+        json!({"type":"message_delta","delta":{"stop_reason":null,"progress":0},"usage":{"output_tokens":1}}),
+        json!({"type":"message_delta","delta":{},"usage":{"output_tokens":2}}),
+        json!({"type":"message_delta","delta":{"stop_reason":"end_turn","stop_sequence":null,"future_finish":9}}),
+        json!({"type":"message_delta","delta":{},"usage":{"output_tokens":3}}),
+        json!({"type":"message_stop"}),
+    ];
+    let mut input = String::new();
+    for (index, row) in rows.iter_mut().enumerate() {
+        row["vendor"] = json!(index);
+        input.push_str(&format!(
+            "retry: 2000\nevent: {}\ndata: {}\n\n",
+            row["type"].as_str().unwrap(),
+            row
+        ));
+    }
+    let (output, canonical) = response(
+        input.as_bytes(),
+        BodyMode::Streaming,
+        BodyMode::Streaming,
+        Operation::Generate,
+        1,
+    );
+    let output_rows = events(&output);
+    for source in &rows {
+        let native = output_rows
+            .iter()
+            .find(|row| row["vendor"] == source["vendor"])
+            .unwrap();
+        assert_eq!(native["vendor"], source["vendor"]);
+        if source["type"] == "message_delta" {
+            assert_eq!(native["delta"], source["delta"]);
+        }
+        assert!(
+            canonical
+                .iter()
+                .any(|row| row["x_ck"]["original"].as_array().is_some_and(|entries| entries
+                    .iter()
+                    .any(|entry| entry["pointer"] == "/vendor" && entry["value"] == source["vendor"])))
+        );
+    }
+    let restored_order: Vec<_> = output_rows
+        .iter()
+        .filter_map(|row| row.get("vendor").cloned())
+        .collect();
+    assert_eq!(
+        restored_order,
+        rows.iter().map(|row| row["vendor"].clone()).collect::<Vec<_>>()
+    );
+    let finish = output_rows
+        .iter()
+        .find(|row| row["delta"]["stop_reason"] == "end_turn")
+        .unwrap();
+    assert_eq!(finish["delta"]["future_finish"], 9);
+    assert_eq!(finish["delta"].get("stop_sequence"), Some(&Value::Null));
+    assert_eq!(
+        std::str::from_utf8(&output).unwrap().matches("retry: 2000\n").count(),
+        rows.len()
+    );
 }
