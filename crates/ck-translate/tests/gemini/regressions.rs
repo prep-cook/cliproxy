@@ -60,6 +60,8 @@ fn prompt_block_is_a_native_terminal_without_candidates() {
     assert_eq!(out["promptFeedback"], body["promptFeedback"]);
 }
 
+/// A Gemini error body is a terminal upstream failure: one error with a fixed status and code,
+/// none of the provider's message.
 #[test]
 fn native_error_does_not_expose_payload_or_emit_success() {
     let mut mapped = Mapped::new();
@@ -81,6 +83,15 @@ fn native_error_does_not_expose_payload_or_emit_success() {
     let raw = String::from_utf8(mapped.output(&mapped.writer)).unwrap();
     assert!(!raw.contains("credential-secret"));
     assert!(!raw.contains("event: x_ck.done"));
+    let error = raw
+        .split("\n\n")
+        .find(|event| event.starts_with("event: x_ck.error"))
+        .unwrap();
+    let error: Value = serde_json::from_str(error.lines().find_map(|l| l.strip_prefix("data: ")).unwrap()).unwrap();
+    assert_eq!(error["code"], "stream.invalid_input");
+    assert_eq!(error["status"], 502);
+    assert_eq!(error["scope"], "upstream");
+    assert_eq!(raw.matches("event: x_ck.error").count(), 1, "one terminal: {raw}");
 }
 
 /// Identity that arrives after the first chunk reaches canonical chunks and the Gemini client;
@@ -122,4 +133,37 @@ fn null_generation_config_is_unset() {
     let input = json!({"generationConfig":null,"contents":[{"role":"user","parts":[{"text":"a"}]}]});
     let (out, _) = request(&input, Operation::Generate);
     assert_eq!(out, input);
+}
+
+fn validate(input: &Value) -> codec::Result<()> {
+    let mut mapped = Mapped::new();
+    let bytes = serde_json::to_vec(input).unwrap();
+    let mut source = codec::source::Source::new(&mut mapped.writer).unwrap();
+    source.push_bytes(&mut mapped.writer, &bytes).unwrap();
+    let document = codec::document::Document::parse(&mut mapped.writer, source, bytes.len() as u64).unwrap();
+    let media = codec::media::Registry::new(&mut mapped.writer).unwrap();
+    let view = codec::RequestView {
+        document: &document,
+        media: &media,
+        operation: Operation::Generate,
+    };
+    codec::RequestFence::default()
+        .end(view, &gemini::request::GeminiCapability)
+        .map(|_| ())
+}
+
+/// Another protocol's opaque history and signatures cannot be replayed to Gemini; Gemini's own can.
+#[test]
+fn foreign_opaque_signatures_fail_the_gemini_fence() {
+    let request = |part: Value, replay: Value| json!({"model":"m","messages":[{"role":"assistant","content":[part]}],"x_ck":{"replay":[replay]}});
+    let text = json!({"type":"text","text":"a"});
+    let gemini = request(text.clone(), json!({"kind":"gemini","signature":"sig"}));
+    assert!(validate(&gemini).is_ok());
+    let foreign_replay = request(text, json!({"kind":"responses_encrypted","signature":"opaque"}));
+    assert!(matches!(validate(&foreign_replay), Err(codec::Error::Unsupported)));
+    let foreign_part = request(
+        json!({"type":"opaque","protocol":"anthropic","data":"opaque"}),
+        json!({"kind":"gemini","signature":"sig"}),
+    );
+    assert!(matches!(validate(&foreign_part), Err(codec::Error::Unsupported)));
 }
