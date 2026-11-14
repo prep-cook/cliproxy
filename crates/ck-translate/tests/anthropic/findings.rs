@@ -244,3 +244,18 @@ fn non_object_tool_input_never_completes() {
         assert!(!raw.contains("event: x_ck.done\n"));
     }
 }
+
+#[test]
+fn results_link_to_the_latest_calls_and_still_reach_older_ones() {
+    let call = |id: &str| json!({"type":"tool_use","id":id,"name":"f","input":{}});
+    let result = |id: &str| json!({"type":"tool_result","tool_use_id":id,"content":"r"});
+    let body = json!({"model":"m","max_tokens":10,"tools":[{"name":"f","input_schema":{"type":"object"}}],"messages":[
+        {"role":"user","content":"x"},
+        {"role":"assistant","content":[call("a")]},
+        {"role":"user","content":[result("a")]},
+        {"role":"assistant","content":[call("b"),call("c")]},
+        {"role":"user","content":[result("c"),result("b"),result("a")]},
+    ]});
+    let (out, _) = request(&serde_json::to_vec(&body).unwrap(), Operation::Generate);
+    assert_eq!(out["messages"], body["messages"]);
+}

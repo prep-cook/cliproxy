@@ -12,6 +12,8 @@ pub(super) fn validate(view: RequestView<'_>) -> Result<()> {
     let messages = parameters(doc, root, view.operation)?;
     let mut conversation = false;
     let mut system = false;
+    // The latest earlier message with calls; results almost always answer it.
+    let mut recent = None;
     for message in doc.children(messages)? {
         let role = doc.required(message, "role")?;
         if doc.string_is(role, "system")? {
@@ -24,7 +26,10 @@ pub(super) fn validate(view: RequestView<'_>) -> Result<()> {
         } else {
             return Err(Error::Unsupported);
         }
-        self::message(view, messages, message, role)?;
+        self::message(view, (messages, recent), message, role)?;
+        if doc.member(message, "tool_calls")?.is_some() {
+            recent = Some(message);
+        }
     }
     let x = doc.required(root, "x_ck")?;
     extensions(doc, x)?;
@@ -98,14 +103,14 @@ fn parameters(doc: &Document, root: usize, operation: Operation) -> Result<usize
     Ok(messages)
 }
 /// Checks one message's content parts, tool result link and tool calls.
-fn message(view: RequestView<'_>, messages: usize, message: usize, role: usize) -> Result<()> {
+fn message(view: RequestView<'_>, calls: Calls, message: usize, role: usize) -> Result<()> {
     let doc = view.document;
     if let Some(content) = doc.member(message, "content")? {
         match doc.node(content)?.value {
             Value::String(_) | Value::Text(_) | Value::Fragments | Value::Utf8Media => (),
             Value::Array => {
                 for part in doc.children(content)? {
-                    validate_part(view, message, part)?;
+                    validate_part(view, calls, message, part)?;
                 }
             }
             Value::Null if doc.member(message, "tool_calls")?.is_some() => (),
@@ -113,7 +118,7 @@ fn message(view: RequestView<'_>, messages: usize, message: usize, role: usize) 
         }
     }
     if doc.string_is(role, "tool")? {
-        linked(doc, messages, message, None, doc.required(message, "tool_call_id")?)?;
+        linked(doc, calls, message, None, doc.required(message, "tool_call_id")?)?;
     }
     if let Some(calls) = doc.member(message, "tool_calls")? {
         if !doc.string_is(role, "assistant")? || !matches!(doc.node(calls)?.value, Value::Array) {
@@ -262,7 +267,7 @@ fn tool_choice(doc: &Document, root: usize, x: usize) -> Result<()> {
     }
     Ok(())
 }
-fn validate_part(view: RequestView<'_>, message: usize, part: usize) -> Result<()> {
+fn validate_part(view: RequestView<'_>, calls: Calls, message: usize, part: usize) -> Result<()> {
     let doc = view.document;
     let kind = doc.required(part, "type")?;
     if doc.string_is(kind, "text")? || doc.string_is(kind, "reasoning")? {
@@ -283,19 +288,13 @@ fn validate_part(view: RequestView<'_>, message: usize, part: usize) -> Result<(
             return Err(Error::Unsupported);
         }
     } else if doc.string_is(kind, "tool_result")? {
-        linked(
-            doc,
-            doc.required(doc.root(), "messages")?,
-            message,
-            Some(part),
-            doc.required(part, "tool_call_id")?,
-        )?;
+        linked(doc, calls, message, Some(part), doc.required(part, "tool_call_id")?)?;
         if let Some(content) = doc.member(part, "content")? {
             if !matches!(doc.node(content)?.value, Value::Array) {
                 return Err(Error::Schema);
             }
             for child in doc.children(content)? {
-                validate_part(view, message, child)?;
+                validate_part(view, calls, message, child)?;
             }
         }
         if let Some(error) = doc.member(part, "is_error")?
@@ -312,7 +311,11 @@ fn validate_part(view: RequestView<'_>, message: usize, part: usize) -> Result<(
     }
     Ok(())
 }
-fn linked(doc: &Document, messages: usize, message: usize, result: Option<usize>, id: usize) -> Result<()> {
+/// The messages array and the latest message before the current one that has calls.
+type Calls = (usize, Option<usize>);
+/// Links a result to its call: first in its own message (server results only), then in
+/// the latest earlier message with calls, and only then in any earlier message.
+fn linked(doc: &Document, calls: Calls, message: usize, result: Option<usize>, id: usize) -> Result<()> {
     super::string(doc, id)?;
     let result_order = result
         .map(|part| super::content::history(doc, part))
@@ -325,32 +328,45 @@ fn linked(doc: &Document, messages: usize, message: usize, result: Option<usize>
         .map(|node| doc.node(node))
         .transpose()?
         .is_some_and(|node| matches!(node.value, Value::Bool(true)));
-    for prior in doc.children(messages)? {
-        if prior == message && !server {
-            break;
-        }
-        if let Some(calls) = doc.member(prior, "tool_calls")? {
-            for call in doc.children(calls)? {
-                if doc.equal_strings(id, doc.required(call, "id")?)? {
-                    if server != super::is(doc, call, "type", "server")? {
-                        return Err(Error::Schema);
-                    }
-                    if prior == message {
-                        let before = super::content::history(doc, call)?.ok_or(Error::Schema)?;
-                        let after = result_order.ok_or(Error::Schema)?;
-                        if doc.unsigned(doc.required(before, "block_index")?)?
-                            >= doc.unsigned(doc.required(after, "block_index")?)?
-                        {
-                            return Err(Error::Schema);
-                        }
-                    }
-                    return Ok(());
-                }
-            }
-        }
-        if prior == message {
-            break;
+    let (messages, recent) = calls;
+    let mut found = None;
+    for prior in [server.then_some(message), recent].into_iter().flatten() {
+        if found.is_none() {
+            found = call(doc, prior, id)?.map(|call| (prior, call));
         }
     }
-    Err(Error::Schema)
+    if found.is_none() {
+        for prior in doc.children(messages)? {
+            if prior == message {
+                break;
+            }
+            if let Some(call) = call(doc, prior, id)? {
+                found = Some((prior, call));
+                break;
+            }
+        }
+    }
+    let (prior, call) = found.ok_or(Error::Schema)?;
+    if server != super::is(doc, call, "type", "server")? {
+        return Err(Error::Schema);
+    }
+    if prior == message {
+        let before = super::content::history(doc, call)?.ok_or(Error::Schema)?;
+        let after = result_order.ok_or(Error::Schema)?;
+        if doc.unsigned(doc.required(before, "block_index")?)? >= doc.unsigned(doc.required(after, "block_index")?)? {
+            return Err(Error::Schema);
+        }
+    }
+    Ok(())
+}
+/// The call in `message` whose id equals `id`.
+fn call(doc: &Document, message: usize, id: usize) -> Result<Option<usize>> {
+    if let Some(calls) = doc.member(message, "tool_calls")? {
+        for call in doc.children(calls)? {
+            if doc.equal_strings(id, doc.required(call, "id")?)? {
+                return Ok(Some(call));
+            }
+        }
+    }
+    Ok(None)
 }
