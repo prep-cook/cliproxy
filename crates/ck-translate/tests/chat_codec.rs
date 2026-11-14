@@ -38,6 +38,8 @@ mod quota;
 mod reasoning;
 #[path = "semantic/request_wire.rs"]
 mod request_wire;
+#[path = "semantic/response_chunks.rs"]
+mod response_chunks;
 #[path = "semantic/response_media.rs"]
 mod response_media;
 #[path = "semantic/response_wire.rs"]
