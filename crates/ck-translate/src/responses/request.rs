@@ -646,7 +646,6 @@ fn validate(view: RequestView<'_>) -> Result<()> {
                             "reasoning_summary",
                             "refusal",
                             "encrypted",
-                            "redacted",
                             "image",
                             "audio",
                             "document",
