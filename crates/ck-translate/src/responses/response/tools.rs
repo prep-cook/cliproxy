@@ -92,6 +92,8 @@ impl State {
         Ok(())
     }
 
+    /// Reconciles a server tool item snapshot: its arguments or code, then its result fields;
+    /// `close` publishes the results and ends the tool.
     pub(super) fn server_snapshot(
         &mut self,
         owner: &mut Writer,
@@ -101,6 +103,22 @@ impl State {
         close: bool,
     ) -> Result<()> {
         let server = self.items[at].server.ok_or(Error::Schema)?;
+        self.server_input(owner, (at, server), doc, node, close)?;
+        let results = self.server_results(owner, (at, server), doc, node)?;
+        if !close || self.items[at].tool_closed {
+            return Ok(());
+        }
+        self.close_server(owner, (at, server), results, doc, node)
+    }
+
+    fn server_input(
+        &mut self,
+        owner: &mut Writer,
+        (at, server): (usize, Server),
+        doc: &Document,
+        node: usize,
+        close: bool,
+    ) -> Result<()> {
         if server == Server::Mcp
             && let Some(arguments) = doc.member(node, "arguments")?
         {
@@ -128,6 +146,17 @@ impl State {
                 self.code(owner, at, doc, code, close)?;
             }
         }
+        Ok(())
+    }
+
+    /// Retains changed result fields; a change after the tool closed is a contradiction.
+    fn server_results(
+        &mut self,
+        owner: &mut Writer,
+        (at, server): (usize, Server),
+        doc: &Document,
+        node: usize,
+    ) -> Result<usize> {
         let item = &mut self.items[at];
         let results = match item.results {
             Some(results) => results,
@@ -153,9 +182,18 @@ impl State {
                 item.doc.transplant(target, imported)?;
             }
         }
-        if !close || item.tool_closed {
-            return Ok(());
-        }
+        Ok(results)
+    }
+
+    fn close_server(
+        &mut self,
+        owner: &mut Writer,
+        (at, server): (usize, Server),
+        results: usize,
+        doc: &Document,
+        node: usize,
+    ) -> Result<()> {
+        let item = &mut self.items[at];
         if server == Server::Mcp && item.arguments.is_some() && !item.arguments_done {
             validate_arguments(owner, item)?;
             item.arguments_done = true;

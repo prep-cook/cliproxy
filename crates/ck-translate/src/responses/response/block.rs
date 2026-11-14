@@ -1,0 +1,305 @@
+use super::*;
+
+impl State {
+    /// Opens, extends or closes one content or summary part of item `at`; `snapshot` parts are
+    /// full values whose already published prefix is not repeated.
+    pub(super) fn block(
+        &mut self,
+        owner: &mut Writer,
+        at: usize,
+        (index, summary): (u64, bool),
+        doc: &Document,
+        part: usize,
+        (snapshot, close): (bool, bool),
+    ) -> Result<()> {
+        let item = &mut self.items[at];
+        let existing = item
+            .blocks
+            .iter()
+            .position(|b| b.index == index && b.summary == summary);
+        if item.closed && existing.is_none() {
+            return Err(Error::Schema);
+        }
+        let block = match existing {
+            Some(block) => block,
+            None => self.open_block(owner, at, (index, summary), doc, part)?,
+        };
+        self.block_text(owner, at, block, doc, part, snapshot)?;
+        self.block_logprobs(owner, at, block, doc, part, snapshot)?;
+        self.block_annotations(owner, at, block, doc, part, snapshot)?;
+        let item = &mut self.items[at];
+        if close && !item.blocks[block].closed {
+            self.emitter.emit(
+                owner,
+                Kind::BlockEnd,
+                item.scope(Some(block as u64)),
+                |_| Ok(()),
+                |_| Ok(()),
+            )?;
+            item.blocks[block].closed = true;
+        }
+        Ok(())
+    }
+
+    fn open_block(
+        &mut self,
+        owner: &mut Writer,
+        at: usize,
+        (index, summary): (u64, bool),
+        doc: &Document,
+        part: usize,
+    ) -> Result<usize> {
+        let item = &mut self.items[at];
+        let lease = encode::scratch(owner, |e| {
+            object(doc, part, &["text", "refusal", "annotations", "logprobs"], e)
+        })?;
+        let value = item.doc.import_json(owner, lease)?;
+        let scope = item.scope(Some(item.blocks.len() as u64));
+        let kind = if summary {
+            "reasoning_summary"
+        } else if is(doc, part, "type", "reasoning_text")? {
+            "thinking"
+        } else if is(doc, part, "type", "refusal")? {
+            "refusal"
+        } else {
+            "text"
+        };
+        self.emitter.emit(
+            owner,
+            Kind::BlockStart,
+            scope,
+            |e| {
+                e.bytes(b",\"kind\":")?;
+                e.string(kind)?;
+                e.bytes(b",\"attributes\":")?;
+                item.doc.write(value, e)
+            },
+            |e| {
+                e.bytes(b",\"source\":{\"protocol\":\"responses\"")?;
+                e.bytes(if summary {
+                    b",\"summary_index\":"
+                } else {
+                    b",\"content_index\":"
+                })?;
+                e.unsigned(index)?;
+                e.bytes(b"}")
+            },
+        )?;
+        item.blocks.push(Block {
+            index,
+            summary,
+            value,
+            closed: false,
+        })
+    }
+
+    fn block_text(
+        &mut self,
+        owner: &mut Writer,
+        at: usize,
+        block: usize,
+        doc: &Document,
+        part: usize,
+        snapshot: bool,
+    ) -> Result<()> {
+        let item = &mut self.items[at];
+        let summary = item.blocks[block].summary;
+        let value = item.blocks[block].value;
+        for (native, delta) in [
+            (
+                "text",
+                if summary || is(doc, part, "type", "reasoning_text")? {
+                    "reasoning_content"
+                } else {
+                    "content"
+                },
+            ),
+            ("refusal", "refusal"),
+        ] {
+            if let Some(incoming) = doc.member(part, native)? {
+                string(doc, incoming)?;
+                let old = item.doc.member(value, native)?;
+                let fragment = if snapshot {
+                    suffix(owner, &item.doc, old, doc, incoming)?
+                } else {
+                    super::super::mapped(owner, |e| doc.write(incoming, e))?
+                };
+                let empty = fragment.chars(fragment.root())?.next_scalar()?.is_none();
+                if (item.blocks[block].closed || item.closed) && !empty {
+                    return Err(Error::Schema);
+                }
+                if !empty || old.is_none() {
+                    let base = self.base.as_ref().ok_or(Error::Schema)?;
+                    self.emitter.emit(
+                        owner,
+                        Kind::Chunk,
+                        item.scope(Some(block as u64)),
+                        |e| {
+                            chunk_base(base, e)?;
+                            e.bytes(b",\"choices\":[{\"index\":0,\"delta\":{")?;
+                            e.string(delta)?;
+                            e.bytes(b":")?;
+                            fragment.write(fragment.root(), e)?;
+                            e.bytes(b"},\"finish_reason\":null")?;
+                            e.bytes(b"}]")
+                        },
+                        |e| e.bytes(b",\"source\":{\"protocol\":\"responses\"}"),
+                    )?;
+                    let imported = item.doc.absorb(fragment)?;
+                    append_fragment(&mut item.doc, value, native, imported)?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn block_logprobs(
+        &mut self,
+        owner: &mut Writer,
+        at: usize,
+        block: usize,
+        doc: &Document,
+        part: usize,
+        snapshot: bool,
+    ) -> Result<()> {
+        let item = &mut self.items[at];
+        let value = item.blocks[block].value;
+        if let Some(logprobs) = doc.member(part, "logprobs")? {
+            let tail = super::super::snapshot::array_tail(
+                owner,
+                &item.doc,
+                item.doc.member(value, "logprobs")?,
+                doc,
+                logprobs,
+                snapshot,
+            )?;
+            if tail.node(tail.root())?.first.is_some() {
+                if item.blocks[block].closed || item.closed {
+                    return Err(Error::Schema);
+                }
+                let base = self.base.as_ref().ok_or(Error::Schema)?;
+                self.emitter.emit(
+                    owner,
+                    Kind::Chunk,
+                    item.scope(Some(block as u64)),
+                    |e| {
+                        chunk_base(base, e)?;
+                        e.bytes(b",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":null")?;
+                        super::super::snapshot::write_logprobs(&tail, e)?;
+                        e.bytes(b"}]")
+                    },
+                    |_| Ok(()),
+                )?;
+                super::super::snapshot::append_array(&mut item.doc, value, "logprobs", tail)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn block_annotations(
+        &mut self,
+        owner: &mut Writer,
+        at: usize,
+        block: usize,
+        doc: &Document,
+        part: usize,
+        snapshot: bool,
+    ) -> Result<()> {
+        let item = &mut self.items[at];
+        let value = item.blocks[block].value;
+        if let Some(annotations) = doc.member(part, "annotations")? {
+            let tail = super::super::snapshot::array_tail(
+                owner,
+                &item.doc,
+                item.doc.member(value, "annotations")?,
+                doc,
+                annotations,
+                snapshot,
+            )?;
+            for annotation in tail.children(tail.root())? {
+                if item.blocks[block].closed || item.closed {
+                    return Err(Error::Schema);
+                }
+                self.emitter.emit(
+                    owner,
+                    Kind::Annotation,
+                    item.scope(Some(block as u64)),
+                    |e| {
+                        e.bytes(b",\"kind\":\"citation\",\"value\":")?;
+                        tail.write(annotation, e)
+                    },
+                    |_| Ok(()),
+                )?;
+            }
+            super::super::snapshot::append_array(&mut item.doc, value, "annotations", tail)?;
+        }
+        Ok(())
+    }
+
+    pub(super) fn arguments(
+        &mut self,
+        owner: &mut Writer,
+        at: usize,
+        doc: &Document,
+        node: usize,
+        snapshot: bool,
+    ) -> Result<()> {
+        let item = &mut self.items[at];
+        if item.tool.is_none() {
+            return Err(Error::Schema);
+        }
+        string(doc, node)?;
+        let fragment = if snapshot {
+            suffix(owner, &item.doc, item.arguments, doc, node)?
+        } else {
+            super::super::mapped(owner, |e| doc.write(node, e))?
+        };
+        let empty = fragment.chars(fragment.root())?.next_scalar()?.is_none();
+        if (item.tool_closed || item.arguments_done) && !empty {
+            return Err(Error::Schema);
+        }
+        if !empty || item.arguments.is_none() {
+            let base = self.base.as_ref().ok_or(Error::Schema)?;
+            self.emitter.emit(
+                owner,
+                Kind::Chunk,
+                item.scope(None),
+                |e| {
+                    chunk_base(base, e)?;
+                    e.bytes(b",\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":")?;
+                    e.unsigned(item.index)?;
+                    e.bytes(b",\"function\":{\"arguments\":")?;
+                    fragment.write(fragment.root(), e)?;
+                    e.bytes(b"}}]},\"finish_reason\":null}]")
+                },
+                |_| Ok(()),
+            )?;
+            let imported = item.doc.absorb(fragment)?;
+            let root = item.doc.root();
+            let field = append_fragment(&mut item.doc, root, "arguments", imported)?;
+            item.arguments = Some(field);
+        }
+        if snapshot && !item.tool_closed {
+            validate_arguments(owner, item)?;
+            item.arguments_done = true;
+            if item.server.is_some() {
+                return Ok(());
+            }
+            self.emitter.emit(
+                owner,
+                Kind::ToolEnd,
+                item.scope(None),
+                |e| {
+                    e.bytes(if item.custom()? {
+                        b",\"status\":\"completed\""
+                    } else {
+                        b",\"status\":\"completed\",\"valid_json\":true"
+                    })
+                },
+                |_| Ok(()),
+            )?;
+            item.tool_closed = true;
+        }
+        Ok(())
+    }
+}
