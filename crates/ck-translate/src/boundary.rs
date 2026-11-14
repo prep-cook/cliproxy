@@ -9,7 +9,7 @@ use crate::codec::{
     event::{Emitter, Kind, Scope},
     source::Source,
 };
-use ck_stream::{MetadataPermit, Writer};
+use ck_stream::Writer;
 
 /// Parses encoder output back into a document, so normalization can work on mapped JSON.
 pub(crate) fn mapped(owner: &mut Writer, write: impl Fn(&mut Encoder<'_, '_>) -> Result<()>) -> Result<Document> {
@@ -174,46 +174,4 @@ pub(crate) fn original(
 fn named(doc: &Document, name: crate::codec::document::Name, keys: &[&str]) -> Result<bool> {
     keys.iter()
         .try_fold(false, |found, key| Ok(found || doc.name_is(name, key)?))
-}
-
-/// Capacity accounting for position/scalar tables; payload bytes never belong here.
-// ponytail: copy of the private `codec::table::Table`; replace with a re-export once `codec`
-// exposes that module to sibling codecs.
-pub(crate) struct Table<T> {
-    values: Vec<T>,
-    permit: MetadataPermit,
-}
-impl<T> Table<T> {
-    pub(crate) fn new(owner: &mut Writer) -> Result<Self> {
-        Ok(Self {
-            values: Vec::new(),
-            permit: owner.reserve_metadata(0)?,
-        })
-    }
-    pub(crate) fn push(&mut self, value: T) -> Result<usize> {
-        self.permit.check_live()?;
-        if self.values.len() == self.values.capacity() {
-            let capacity = self.values.capacity().max(4).checked_mul(2).ok_or(Error::Limit)?;
-            self.permit
-                .resize(capacity.checked_mul(std::mem::size_of::<T>()).ok_or(Error::Limit)?)?;
-            self.values
-                .try_reserve_exact(capacity - self.values.len())
-                .map_err(|_| Error::Limit)?;
-            self.permit.resize(self.values.capacity() * std::mem::size_of::<T>())?;
-        }
-        let index = self.values.len();
-        self.values.push(value);
-        Ok(index)
-    }
-}
-impl<T> std::ops::Deref for Table<T> {
-    type Target = [T];
-    fn deref(&self) -> &[T] {
-        &self.values
-    }
-}
-impl<T> std::ops::DerefMut for Table<T> {
-    fn deref_mut(&mut self) -> &mut [T] {
-        &mut self.values
-    }
 }

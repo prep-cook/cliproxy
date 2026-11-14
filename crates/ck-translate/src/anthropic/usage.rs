@@ -1,4 +1,4 @@
-use crate::boundary::Table;
+use crate::codec::table::Table;
 use crate::codec::{
     Error, Result,
     document::{Document, Name, Value},

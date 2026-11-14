@@ -9,7 +9,8 @@ mod request_schema;
 pub mod response;
 mod usage;
 
-use crate::boundary::{Table, failure, is, mapped, member, object, string};
+use crate::boundary::{failure, is, mapped, member, object, string};
+use crate::codec::table::Table;
 use crate::codec::{Result, document::Document, encode::Encoder};
 
 fn unknown(doc: &Document, parent: usize, known: &[&str], e: &mut Encoder<'_, '_>) -> Result<()> {
