@@ -415,12 +415,15 @@ impl Egress {
     ) -> Result<()> {
         if self.mode == BodyMode::Streaming {
             let block = &self.blocks[index];
-            output(event(owner, "content_block_delta", |e| {
+            output(native_event(owner, "content_block_delta", Some(doc), |e| {
                 e.bytes(b",\"index\":")?;
                 e.unsigned(block.index)?;
                 e.bytes(b",\"delta\":{\"type\":\"citations_delta\",\"citation\":")?;
                 doc.write(value, e)?;
-                e.bytes(b"}")
+                let x = doc.required(doc.root(), "x_ck")?;
+                original_members_at(doc, x, "/delta", e)?;
+                e.bytes(b"}")?;
+                original_members(doc, x, e)
             })?)?;
         } else {
             let incoming = mapped(owner, |e| doc.write(value, e))?;

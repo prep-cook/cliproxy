@@ -146,6 +146,17 @@ impl codec::ResponseIngress for Ingress {
         self.handle(owner, result)
     }
 }
+/// Message members with a canonical home; the rest stay in provenance.
+const MESSAGE_FIELDS: &[&str] = &[
+    "id",
+    "model",
+    "type",
+    "role",
+    "content",
+    "usage",
+    "stop_reason",
+    "stop_sequence",
+];
 impl State {
     fn scope(&self) -> Result<Scope> {
         Ok(Scope {
@@ -186,21 +197,7 @@ impl State {
             |e| {
                 e.bytes(b",\"source\":{\"protocol\":\"anthropic\"},\"synthetic\":[\"created\"]")?;
                 if let Some((d, n)) = doc {
-                    unknown(
-                        d,
-                        n,
-                        &[
-                            "id",
-                            "model",
-                            "type",
-                            "role",
-                            "content",
-                            "usage",
-                            "stop_reason",
-                            "stop_sequence",
-                        ],
-                        e,
-                    )?;
+                    unknown(d, n, MESSAGE_FIELDS, e)?;
                 }
                 Ok(())
             },

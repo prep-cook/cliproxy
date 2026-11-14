@@ -382,6 +382,7 @@ fn tool_choice(owner: &mut Writer, doc: &mut Document, root: usize, original: us
         doc.replace(kind, Value::Text("function"))?;
         let f = doc.set(choice, "function", Value::Object)?;
         doc.append(f, name)?;
+        capture(owner, doc, choice, &["type", "function"], original)?;
     } else if doc.string_is(kind, "auto")? || doc.string_is(kind, "any")? || doc.string_is(kind, "none")? {
         let value = if doc.string_is(kind, "any")? {
             "required"

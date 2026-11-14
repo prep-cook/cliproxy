@@ -112,9 +112,8 @@ impl Egress {
             && is(&doc, source, "protocol", "anthropic")?
         {
             if is(&doc, source, "event", "message_start")? {
-                if self.mode == BodyMode::Streaming {
-                    self.start_origin = Some(doc);
-                }
+                // Streaming replays the whole envelope; buffered keeps its message members.
+                self.start_origin = Some(doc);
             } else if is(&doc, source, "event", "message_delta")? {
                 if finished && self.mode == BodyMode::Streaming {
                     self.finish_origin = Some(doc);
@@ -235,6 +234,9 @@ impl Egress {
     pub(super) fn buffered(&self, e: &mut Encoder<'_, '_>) -> Result<()> {
         e.bytes(b"{")?;
         write_base(self.base.as_ref().ok_or(Error::Schema)?, e)?;
+        if let Some(origin) = &self.start_origin {
+            original_members_at(origin, origin.required(origin.root(), "x_ck")?, "/message", e)?;
+        }
         e.bytes(b",\"content\":[")?;
         for (index, block) in self.blocks.iter().enumerate() {
             if index != 0 {

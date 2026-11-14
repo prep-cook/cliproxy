@@ -146,7 +146,8 @@ impl State {
             return Err(Error::Schema);
         }
         // A leading heartbeat may have created synthetic identity; replace it with supplied metadata.
-        if self.base.is_some() {
+        let refreshed = self.base.is_some();
+        if refreshed {
             if self.blocks.iter().any(|b| b.open) || self.finished {
                 return Err(Error::Schema);
             }
@@ -169,7 +170,21 @@ impl State {
                 base_fields(base, e)?;
                 e.bytes(b",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\"},\"finish_reason\":null}]")
             },
-            |e| event_origin(Some(origin), "message_start", &["type", "message"], e),
+            |e| {
+                if !refreshed {
+                    return event_origin(Some(origin), "message_start", &["type", "message"], e);
+                }
+                // The synthetic response.start could not carry the message's unknown members.
+                provenance_as(origin.1, origin.2, Some("message_start"), e)?;
+                unknown_at(
+                    doc,
+                    &[
+                        (doc.root(), "", &["type", "message"]),
+                        (message, "/message", MESSAGE_FIELDS),
+                    ],
+                    e,
+                )
+            },
         )?;
         if let Some(content) = doc.member(message, "content")? {
             if !matches!(doc.node(content)?.value, Value::Array) {

@@ -1,5 +1,5 @@
 //! Regression tests for the Anthropic codec review findings.
-use crate::{BodyMode, Operation, events, json, request, request_fragmented, response, sse};
+use crate::{BodyMode, Operation, Value, events, json, request, request_fragmented, response, sse};
 
 #[test]
 fn media_whose_type_follows_its_data_publishes_one_lifetime() {
@@ -63,4 +63,74 @@ fn opaque_request_blocks_keep_their_cache_directive() {
     let body = json!({"model":"m","max_tokens":10,"messages":[{"role":"user","content":[{"type":"text","text":"a"},{"type":"future_block","value":"x","cache_control":{"type":"ephemeral","ttl":"1h"}},{"type":"future_block","value":"y"}]}]});
     let (out, _) = request(&serde_json::to_vec(&body).unwrap(), Operation::Generate);
     assert_eq!(out["messages"], body["messages"]);
+}
+
+#[test]
+fn named_tool_choice_keeps_unknown_members() {
+    let body = json!({"model":"m","max_tokens":10,"messages":[{"role":"user","content":"x"}],"tools":[{"name":"f","input_schema":{"type":"object"}}],"tool_choice":{"type":"tool","name":"f","future":{"x":null},"disable_parallel_tool_use":true}});
+    let (out, _) = request(&serde_json::to_vec(&body).unwrap(), Operation::Generate);
+    assert_eq!(out["tool_choice"], body["tool_choice"]);
+}
+
+#[test]
+fn message_unknowns_survive_a_leading_ping() {
+    let rows = [
+        json!({"type":"ping"}),
+        json!({"type":"message_start","message":{"id":"r","model":"m","future":{"x":null}},"outer":1}),
+        json!({"type":"message_delta","delta":{"stop_reason":"end_turn"}}),
+        json!({"type":"message_stop"}),
+    ];
+    let (out, _) = response(
+        &sse(&rows),
+        BodyMode::Streaming,
+        BodyMode::Buffered,
+        Operation::Generate,
+        7,
+    );
+    let body: Value = serde_json::from_slice(&out).unwrap();
+    assert_eq!(body["id"], "r");
+    assert_eq!(body["future"], rows[1]["message"]["future"]);
+    let (out, _) = response(
+        &sse(&rows),
+        BodyMode::Streaming,
+        BodyMode::Streaming,
+        Operation::Generate,
+        7,
+    );
+    let native = events(&out);
+    let start = native.iter().find(|v| v["type"] == "message_start").unwrap();
+    assert_eq!(start["message"]["future"], rows[1]["message"]["future"]);
+    assert_eq!(start["outer"], 1);
+    // Without the ping the members travel on response.start; they must not be written twice.
+    let (out, _) = response(
+        &sse(&rows[1..]),
+        BodyMode::Streaming,
+        BodyMode::Streaming,
+        Operation::Generate,
+        7,
+    );
+    let raw = String::from_utf8(out).unwrap();
+    assert_eq!(raw.matches("\"future\"").count(), 1, "{raw}");
+}
+
+#[test]
+fn citation_delta_keeps_envelope_unknowns() {
+    let rows = [
+        json!({"type":"message_start","message":{"id":"r","model":"m"}}),
+        json!({"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}),
+        json!({"type":"content_block_delta","index":0,"outer":17,"delta":{"type":"citations_delta","citation":{"type":"char_location","start_char_index":0,"end_char_index":1},"future":23}}),
+        json!({"type":"content_block_stop","index":0}),
+        json!({"type":"message_delta","delta":{"stop_reason":"end_turn"}}),
+        json!({"type":"message_stop"}),
+    ];
+    let (out, _) = response(
+        &sse(&rows),
+        BodyMode::Streaming,
+        BodyMode::Streaming,
+        Operation::Generate,
+        7,
+    );
+    let native = events(&out);
+    let citation = native.iter().find(|v| v["delta"]["type"] == "citations_delta").unwrap();
+    assert_eq!(citation, &rows[2]);
 }

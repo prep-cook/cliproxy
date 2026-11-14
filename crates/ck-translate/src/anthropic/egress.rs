@@ -119,6 +119,9 @@ impl Egress {
         output(native_event(owner, "message_start", origin.as_ref(), |e| {
             e.bytes(b",\"message\":{")?;
             write_base(base, e)?;
+            if let Some(doc) = &origin {
+                original_members_at(doc, doc.required(doc.root(), "x_ck")?, "/message", e)?;
+            }
             e.bytes(b",\"content\":[],\"stop_reason\":null,\"stop_sequence\":null")?;
             if let Some(usage) = &self.usage {
                 e.bytes(b",\"usage\":")?;
