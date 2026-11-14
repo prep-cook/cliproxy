@@ -115,3 +115,11 @@ fn streaming_unknown_metadata_and_late_identity_reach_egress() {
     assert_eq!(text["responseId"], "late-id");
     assert_eq!(text["modelVersion"], "late-model");
 }
+
+/// A null message field is unset in protobuf JSON; it is kept, not refused.
+#[test]
+fn null_generation_config_is_unset() {
+    let input = json!({"generationConfig":null,"contents":[{"role":"user","parts":[{"text":"a"}]}]});
+    let (out, _) = request(&input, Operation::Generate);
+    assert_eq!(out, input);
+}

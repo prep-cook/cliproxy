@@ -38,7 +38,15 @@ pub(super) fn write(view: RequestView<'_>, e: &mut Encoder<'_, '_>) -> Result<()
         }
     }
     let native = super::request_schema::native(doc)?;
-    let native_config = native.map(|n| doc.member(n, "generationConfig")).transpose()?.flatten();
+    let mut native_config = native.map(|n| doc.member(n, "generationConfig")).transpose()?.flatten();
+    // A native null config returns as null unless mapped controls now fill the config.
+    let null_config = match native_config {
+        Some(n) => matches!(doc.node(n)?.value, Value::Null),
+        None => false,
+    };
+    if null_config {
+        native_config = None;
+    }
     let thinking = x.map(|x| doc.member(x, "thinking")).transpose()?.flatten();
     let config_present = native_config.is_some()
         || thinking.is_some()
@@ -50,6 +58,8 @@ pub(super) fn write(view: RequestView<'_>, e: &mut Encoder<'_, '_>) -> Result<()
         e.bytes(b",\"generationConfig\":{")?;
         generation_config(doc, thinking, native_config, e)?;
         e.bytes(b"}")?;
+    } else if null_config {
+        e.bytes(b",\"generationConfig\":null")?;
     }
     tool_declarations(doc, x, e)?;
     if let Some(native) = native {

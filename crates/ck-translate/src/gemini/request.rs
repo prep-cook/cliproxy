@@ -171,7 +171,10 @@ fn normalize(owner: &mut Writer, doc: &mut Document, operation: Operation, model
         }
     }
     if let Some(config) = doc.remove(root, "generationConfig")? {
-        generation_config(doc, config, x)?;
+        // A null config is unset in protobuf JSON: it maps nothing and returns as it came.
+        if !matches!(doc.node(config)?.value, Value::Null) {
+            generation_config(doc, config, x)?;
+        }
         doc.append(native, config)?;
     }
     messages(owner, doc)?;
