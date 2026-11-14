@@ -222,27 +222,36 @@ impl State {
         Ok(false)
     }
 
+    /// Publishes one annotation and records it on its part, so the part's done snapshot does
+    /// not publish it again.
     fn annotation_event(&mut self, owner: &mut Writer, doc: &Document) -> Result<()> {
         let root = doc.root();
         let at = self.find_event(doc)?;
         let index = doc.unsigned(doc.required(root, "content_index")?)?;
         let annotation = doc.required(root, "annotation")?;
-        let local = self.items[at]
+        let item = &mut self.items[at];
+        let local = item
             .blocks
             .iter()
             .position(|b| b.index == index && !b.summary)
-            .ok_or(Error::Schema)? as u64;
+            .ok_or(Error::Schema)?;
         self.emitter.emit(
             owner,
             Kind::Annotation,
-            self.items[at].scope(Some(local)),
+            item.scope(Some(local as u64)),
             |e| {
                 e.bytes(b",\"kind\":\"citation\",\"value\":")?;
                 doc.write(annotation, e)
             },
             |e| provenance(doc, root, e),
         )?;
-        Ok(())
+        let single = super::super::mapped(owner, |e| {
+            e.bytes(b"[")?;
+            doc.write(annotation, e)?;
+            e.bytes(b"]")
+        })?;
+        let value = item.blocks[local].value;
+        super::super::snapshot::append_array(&mut item.doc, value, "annotations", single)
     }
 
     fn audio_event(&mut self, owner: &mut Writer, doc: &Document) -> Result<bool> {

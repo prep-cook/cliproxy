@@ -35,6 +35,31 @@ fn message(status: &str, content: Value) -> Value {
 }
 
 #[test]
+fn annotation_events_and_part_snapshots_publish_each_citation_once() {
+    let annotation = json!({"type":"url_citation","url":"u","start_index":0,"end_index":2,"title":"t"});
+    let part = json!({"type":"output_text","text":"hi","annotations":[annotation]});
+    let records = [
+        json!({"type":"response.created","response":{"id":"r","model":"m","created_at":1}}),
+        json!({"type":"response.output_item.added","output_index":0,"item":message("in_progress", json!([]))}),
+        json!({"type":"response.content_part.added","output_index":0,"item_id":"i","content_index":0,"part":{"type":"output_text","text":""}}),
+        json!({"type":"response.output_text.delta","output_index":0,"item_id":"i","content_index":0,"delta":"hi"}),
+        json!({"type":"response.output_text.annotation.added","output_index":0,"item_id":"i","content_index":0,"annotation_index":0,"annotation":annotation}),
+        json!({"type":"response.content_part.done","output_index":0,"item_id":"i","content_index":0,"part":part}),
+        json!({"type":"response.output_item.done","output_index":0,"item":message("completed", json!([part]))}),
+        json!({"type":"response.completed","response":{"id":"r","status":"completed","metadata":{"k":"v"},"output":[message("completed", json!([part]))]}}),
+    ];
+    let (out, events) = streamed(&records);
+    assert_eq!(out["metadata"], json!({"k":"v"}));
+    let citations: Vec<_> = events.iter().filter(|e| e["kind"] == "citation").collect();
+    assert_eq!(citations.len(), 1);
+    assert_eq!(citations[0]["x_ck"]["source"]["output_index"], 0);
+    assert_eq!(out["output"][0]["content"][0]["annotations"], json!([annotation]));
+    let mut late = records.to_vec();
+    late.swap(4, 5);
+    assert!(fails(&wire(&late)));
+}
+
+#[test]
 fn part_snapshots_publish_logprobs_and_annotations() {
     let annotation = json!({"type":"url_citation","url":"u","start_index":0,"end_index":2,"title":"t"});
     let logprobs = json!([{"token":"hi","logprob":-0.1,"bytes":[104,105],"top_logprobs":[]}]);
