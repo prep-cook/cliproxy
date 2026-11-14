@@ -66,6 +66,6 @@ fn snapshot_index_table_quota_lasts_until_suffix_edits_apply() {
         (Some((step, error)), _) => panic!("step {step} failed with {error:?}"),
         (None, records) => (None, records),
     };
-    assert_eq!(outcome(315_611), (Some(1), 71));
-    assert_eq!(outcome(315_612), (None, 141));
+    assert_eq!(outcome(318_683), (Some(1), 71));
+    assert_eq!(outcome(318_684), (None, 141));
 }

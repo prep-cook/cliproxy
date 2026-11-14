@@ -670,7 +670,8 @@ fn buffered_ingress_mutations_replace_media_and_remove_references_before_replay(
 fn changed_byte_lengths_follow_replacement_offsets_and_end_count() {
     use base64::Engine;
     let wire = concat!(
-        "data: {\"choices\":[{\"index\":7,\"delta\":{\"audio\":{\"data\":\"AQID\"}}}]}\n\n",
+        // The transcript publishes the held audio before it, so the bytes arrive in two records.
+        "data: {\"choices\":[{\"index\":7,\"delta\":{\"audio\":{\"data\":\"AQID\",\"transcript\":\"t\"}}}]}\n\n",
         "data: {\"choices\":[{\"index\":7,\"delta\":{\"audio\":{\"data\":\"BA==\"}},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n"
     );
     for mode in [BodyMode::Streaming, BodyMode::Buffered] {

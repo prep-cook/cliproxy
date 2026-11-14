@@ -9,7 +9,7 @@ use codec::{BodyMode, ResponseIngress};
 use serde_json::{Value, json};
 
 /// Input bytes a data record collects before it publishes (docs/INTERNAL-STREAM.md, §3.4).
-const THRESHOLD: usize = 28_672;
+pub(super) const THRESHOLD: usize = 28_672;
 
 fn buffered(mapped: &mut Mapped) -> codec::chat::response::Ingress {
     codec::chat::response::Ingress::new(
@@ -25,7 +25,7 @@ fn buffered(mapped: &mut Mapped) -> codec::chat::response::Ingress {
 
 /// Data records in publication order, checked for consecutive indexes and offsets, and their
 /// decoded bytes.
-fn data_records(mapped: &Mapped) -> (usize, Vec<u8>) {
+pub(super) fn data_records(mapped: &Mapped) -> (usize, Vec<u8>) {
     let events = canonical_values(mapped);
     let data: Vec<&Value> = events.iter().filter(|event| event["bytes"].is_string()).collect();
     let mut bytes = Vec::new();

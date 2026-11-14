@@ -84,7 +84,10 @@ impl Ingress {
 }
 impl codec::ResponseIngress for Ingress {
     fn flush_deadline(&self) -> Option<std::time::Instant> {
-        self.buffered.as_ref()?.flush_deadline(&self.state)
+        match &self.buffered {
+            Some(buffered) => buffered.flush_deadline(&self.state),
+            None => self.state.audio_deadline(),
+        }
     }
 
     fn advance(&mut self, owner: &mut Writer, bytes: &[u8]) -> Result<()> {
@@ -104,6 +107,8 @@ impl codec::ResponseIngress for Ingress {
                 let state = &mut self.state;
                 scanner.advance(source, |event| state.event(owner, source, event))?;
                 source.release_before(scanner.consumed())?;
+                // Empty advance is a flush.
+                state.flush_audio(owner, bytes.is_empty())?;
             }
             Ok(())
         })();
@@ -140,6 +145,8 @@ impl Ingress {
         if let Err(error) = result {
             self.failed = true;
             if !self.state.terminal && !matches!(error, Error::Storage(_)) {
+                // Held audio is published once, without its media end, before the failure.
+                self.state.flush_audio(owner, true)?;
                 self.state.emit_usage(owner, true)?;
                 super::failure(&mut self.state.emitter, owner, "upstream")?;
                 self.state.terminal = true;
