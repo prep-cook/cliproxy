@@ -15,6 +15,8 @@ mod golden;
 mod incremental;
 #[path = "gemini/media.rs"]
 mod media;
+#[path = "gemini/quota.rs"]
+mod quota;
 #[path = "gemini/regressions.rs"]
 mod regressions;
 #[path = "semantic/mod.rs"]
