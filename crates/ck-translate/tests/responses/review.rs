@@ -214,3 +214,40 @@ fn chat_reasoning_becomes_a_reasoning_item_before_the_message() {
         assert_eq!(kinds, [json!("reasoning")], "{body}");
     }
 }
+
+#[test]
+fn text_parts_publish_their_done_events_before_the_part_ends() {
+    let input = json!({"id":"r","status":"completed","output":[
+        {"id":"rs","type":"reasoning","summary":[{"type":"summary_text","text":"sum"}],"content":[{"type":"reasoning_text","text":"think"}]},
+        {"id":"i","type":"message","role":"assistant","content":[{"type":"output_text","text":"hi"},{"type":"refusal","refusal":"no"}]}]});
+    let (out, _) = response(
+        &serde_json::to_vec(&input).unwrap(),
+        BodyMode::Buffered,
+        BodyMode::Streaming,
+        Operation::Generate,
+    );
+    let events = super::cross::client_events(&out);
+    for (name, field, value, part) in [
+        (
+            "response.reasoning_summary_text.done",
+            "text",
+            "sum",
+            "response.reasoning_summary_part.done",
+        ),
+        (
+            "response.reasoning_text.done",
+            "text",
+            "think",
+            "response.content_part.done",
+        ),
+        ("response.output_text.done", "text", "hi", "response.content_part.done"),
+        ("response.refusal.done", "refusal", "no", "response.content_part.done"),
+    ] {
+        let at = events
+            .iter()
+            .position(|e| e["type"] == name)
+            .unwrap_or_else(|| panic!("{name} missing"));
+        assert_eq!(events[at][field], value);
+        assert_eq!(events[at + 1]["type"], part, "{name}");
+    }
+}

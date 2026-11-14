@@ -401,6 +401,29 @@ impl<F: FnMut(&'static str, u64)> Egress<F> {
         let At { x, item, index, .. } = at;
         let doc = &mut self.document;
         if let Some((part, summary, block)) = find_part(doc, item, x)? {
+            let text = match text_done(doc, part)? {
+                Some((name, field)) => Some((
+                    name,
+                    encode::scratch(owner, |e| {
+                        item_fields(doc, item, index, e)?;
+                        e.bytes(if summary {
+                            b",\"summary_index\":"
+                        } else {
+                            b",\"content_index\":"
+                        })?;
+                        e.unsigned(block)?;
+                        e.bytes(b",")?;
+                        e.string(field)?;
+                        e.bytes(b":")?;
+                        match doc.member(part, field)? {
+                            Some(value) => doc.write(value, e)?,
+                            None => e.bytes(b"\"\"")?,
+                        }
+                        super::super::member(doc, part, "logprobs", e)
+                    })?,
+                )),
+                None => None,
+            };
             let payload = encode::scratch(owner, |e| {
                 item_fields(doc, item, index, e)?;
                 e.bytes(if summary {
@@ -412,6 +435,9 @@ impl<F: FnMut(&'static str, u64)> Egress<F> {
                 e.bytes(b",\"part\":")?;
                 write_part(doc, part, e)
             })?;
+            if let Some((name, done)) = text {
+                self.emit(owner, name, |e| write_lease(&done, e), output)?;
+            }
             self.emit(
                 owner,
                 if summary {
@@ -537,6 +563,21 @@ impl<F: FnMut(&'static str, u64)> Egress<F> {
         })?;
         self.emit(owner, "response.output_item.done", |e| write_lease(&payload, e), output)
     }
+}
+
+/// The done event and full-value member that close a text, refusal or reasoning part.
+fn text_done(doc: &Document, part: usize) -> Result<Option<(&'static str, &'static str)>> {
+    for (kind, name, field) in [
+        ("output_text", "response.output_text.done", "text"),
+        ("refusal", "response.refusal.done", "refusal"),
+        ("reasoning_text", "response.reasoning_text.done", "text"),
+        ("summary_text", "response.reasoning_summary_text.done", "text"),
+    ] {
+        if is(doc, part, "type", kind)? {
+            return Ok(Some((name, field)));
+        }
+    }
+    Ok(None)
 }
 
 /// Appends a function call output item for the call that `x` starts inside a message item.
