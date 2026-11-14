@@ -1,7 +1,9 @@
 use crate::codec::{
     Error, Operation, RequestView, Result,
     document::{Document, Value},
+    table::Table,
 };
+use std::collections::hash_map::RandomState;
 
 pub(super) fn validate(view: RequestView<'_>) -> Result<()> {
     if view.operation == Operation::Compact {
@@ -10,11 +12,22 @@ pub(super) fn validate(view: RequestView<'_>) -> Result<()> {
     let doc = view.document;
     let root = doc.root();
     let messages = parameters(doc, root, view.operation)?;
+    doc.with_table(|index| {
+        let hasher = RandomState::new();
+        index_calls(doc, messages, index, &hasher)?;
+        roles(view, messages, (index, &hasher))
+    })?;
+    let x = doc.required(root, "x_ck")?;
+    extensions(doc, x)?;
+    tools(doc, root, x)?;
+    tool_choice(doc, root, x)
+}
+/// Checks message roles and order, then each message against the call index.
+fn roles(view: RequestView<'_>, messages: usize, (index, hasher): (&CallIndex, &RandomState)) -> Result<()> {
+    let doc = view.document;
     let mut conversation = false;
     let mut system = false;
-    // The latest earlier message with calls; results almost always answer it.
-    let mut recent = None;
-    for message in doc.children(messages)? {
+    for (ordinal, message) in doc.children(messages)?.enumerate() {
         let role = doc.required(message, "role")?;
         if doc.string_is(role, "system")? {
             if conversation || system {
@@ -26,15 +39,14 @@ pub(super) fn validate(view: RequestView<'_>) -> Result<()> {
         } else {
             return Err(Error::Unsupported);
         }
-        self::message(view, (messages, recent), message, role)?;
-        if doc.member(message, "tool_calls")?.is_some() {
-            recent = Some(message);
-        }
+        let calls = Calls {
+            index,
+            hasher,
+            ordinal: ordinal as u64,
+        };
+        self::message(view, calls, message, role)?;
     }
-    let x = doc.required(root, "x_ck")?;
-    extensions(doc, x)?;
-    tools(doc, root, x)?;
-    tool_choice(doc, root, x)
+    Ok(())
 }
 /// Checks the top-level generation parameters and returns the messages array.
 fn parameters(doc: &Document, root: usize, operation: Operation) -> Result<usize> {
@@ -103,14 +115,14 @@ fn parameters(doc: &Document, root: usize, operation: Operation) -> Result<usize
     Ok(messages)
 }
 /// Checks one message's content parts, tool result link and tool calls.
-fn message(view: RequestView<'_>, calls: Calls, message: usize, role: usize) -> Result<()> {
+fn message(view: RequestView<'_>, calls: Calls<'_>, message: usize, role: usize) -> Result<()> {
     let doc = view.document;
     if let Some(content) = doc.member(message, "content")? {
         match doc.node(content)?.value {
             Value::String(_) | Value::Text(_) | Value::Fragments | Value::Utf8Media => (),
             Value::Array => {
                 for part in doc.children(content)? {
-                    validate_part(view, calls, message, part)?;
+                    validate_part(view, calls, part)?;
                 }
             }
             Value::Null if doc.member(message, "tool_calls")?.is_some() => (),
@@ -118,7 +130,7 @@ fn message(view: RequestView<'_>, calls: Calls, message: usize, role: usize) -> 
         }
     }
     if doc.string_is(role, "tool")? {
-        linked(doc, calls, message, None, doc.required(message, "tool_call_id")?)?;
+        linked(doc, calls, None, doc.required(message, "tool_call_id")?)?;
     }
     if let Some(calls) = doc.member(message, "tool_calls")? {
         if !doc.string_is(role, "assistant")? || !matches!(doc.node(calls)?.value, Value::Array) {
@@ -262,7 +274,7 @@ fn tool_choice(doc: &Document, root: usize, x: usize) -> Result<()> {
     }
     Ok(())
 }
-fn validate_part(view: RequestView<'_>, calls: Calls, message: usize, part: usize) -> Result<()> {
+fn validate_part(view: RequestView<'_>, calls: Calls<'_>, part: usize) -> Result<()> {
     let doc = view.document;
     let kind = doc.required(part, "type")?;
     if doc.string_is(kind, "text")? || doc.string_is(kind, "reasoning")? {
@@ -283,13 +295,13 @@ fn validate_part(view: RequestView<'_>, calls: Calls, message: usize, part: usiz
             return Err(Error::Unsupported);
         }
     } else if doc.string_is(kind, "tool_result")? {
-        linked(doc, calls, message, Some(part), doc.required(part, "tool_call_id")?)?;
+        linked(doc, calls, Some(part), doc.required(part, "tool_call_id")?)?;
         if let Some(content) = doc.member(part, "content")? {
             if !matches!(doc.node(content)?.value, Value::Array) {
                 return Err(Error::Schema);
             }
             for child in doc.children(content)? {
-                validate_part(view, calls, message, child)?;
+                validate_part(view, calls, child)?;
             }
         }
         if let Some(error) = doc.member(part, "is_error")?
@@ -306,11 +318,43 @@ fn validate_part(view: RequestView<'_>, calls: Calls, message: usize, part: usiz
     }
     Ok(())
 }
-/// The messages array and the latest message before the current one that has calls.
-type Calls = (usize, Option<usize>);
-/// Links a result to its call: first in its own message (server results only), then in
-/// the latest earlier message with calls, and only then in any earlier message.
-fn linked(doc: &Document, calls: Calls, message: usize, result: Option<usize>, id: usize) -> Result<()> {
+/// Tool calls by ID hash, then message ordinal, then call node: one sorted index, charged to
+/// the document's metadata quota, links every result without rescanning history.
+type CallIndex = Table<(u64, u64, usize)>;
+/// The call index and the ordinal of the message being validated.
+#[derive(Clone, Copy)]
+struct Calls<'a> {
+    index: &'a CallIndex,
+    hasher: &'a RandomState,
+    ordinal: u64,
+}
+/// Indexes every call ID and rejects a repeated one: the Anthropic API requires unique
+/// `tool_use` IDs, and a repeated ID would make result linking ambiguous.
+fn index_calls(doc: &Document, messages: usize, index: &mut CallIndex, hasher: &RandomState) -> Result<()> {
+    for (ordinal, message) in doc.children(messages)?.enumerate() {
+        if let Some(list) = doc.member(message, "tool_calls")?
+            && matches!(doc.node(list)?.value, Value::Array)
+        {
+            for call in doc.children(list)? {
+                let id = doc.required(call, "id")?;
+                super::string(doc, id)?;
+                index.push((string_hash(doc, id, hasher)?, ordinal as u64, call))?;
+            }
+        }
+    }
+    index.sort_unstable();
+    for (at, &(hash, _, call)) in index.iter().enumerate() {
+        for &(_, _, other) in index[at + 1..].iter().take_while(|entry| entry.0 == hash) {
+            if doc.equal_strings(doc.required(call, "id")?, doc.required(other, "id")?)? {
+                return Err(Error::Schema);
+            }
+        }
+    }
+    Ok(())
+}
+/// Links a result to its call, which must precede it: in an earlier message, or in the same
+/// message at an earlier block for a server result.
+fn linked(doc: &Document, calls: Calls<'_>, result: Option<usize>, id: usize) -> Result<()> {
     super::string(doc, id)?;
     let result_order = result
         .map(|part| super::content::history(doc, part))
@@ -323,29 +367,14 @@ fn linked(doc: &Document, calls: Calls, message: usize, result: Option<usize>, i
         .map(|node| doc.node(node))
         .transpose()?
         .is_some_and(|node| matches!(node.value, Value::Bool(true)));
-    let (messages, recent) = calls;
-    let mut found = None;
-    for prior in [server.then_some(message), recent].into_iter().flatten() {
-        if found.is_none() {
-            found = call(doc, prior, id)?.map(|call| (prior, call));
-        }
+    let (ordinal, call) = call(doc, calls, id)?.ok_or(Error::Schema)?;
+    if ordinal > calls.ordinal || (ordinal == calls.ordinal && !server) {
+        return Err(Error::Schema);
     }
-    if found.is_none() {
-        for prior in doc.children(messages)? {
-            if prior == message {
-                break;
-            }
-            if let Some(call) = call(doc, prior, id)? {
-                found = Some((prior, call));
-                break;
-            }
-        }
-    }
-    let (prior, call) = found.ok_or(Error::Schema)?;
     if server != super::is(doc, call, "type", "server")? {
         return Err(Error::Schema);
     }
-    if prior == message {
+    if ordinal == calls.ordinal {
         let before = super::content::history(doc, call)?.ok_or(Error::Schema)?;
         let after = result_order.ok_or(Error::Schema)?;
         if doc.unsigned(doc.required(before, "block_index")?)? >= doc.unsigned(doc.required(after, "block_index")?)? {
@@ -354,14 +383,23 @@ fn linked(doc: &Document, calls: Calls, message: usize, result: Option<usize>, i
     }
     Ok(())
 }
-/// The call in `message` whose id equals `id`.
-fn call(doc: &Document, message: usize, id: usize) -> Result<Option<usize>> {
-    if let Some(calls) = doc.member(message, "tool_calls")? {
-        for call in doc.children(calls)? {
-            if doc.equal_strings(id, doc.required(call, "id")?)? {
-                return Ok(Some(call));
-            }
+/// The message ordinal and node of the call whose ID equals `id`.
+fn call(doc: &Document, calls: Calls<'_>, id: usize) -> Result<Option<(u64, usize)>> {
+    let hash = string_hash(doc, id, calls.hasher)?;
+    let first = calls.index.partition_point(|entry| entry.0 < hash);
+    for &(_, ordinal, call) in calls.index[first..].iter().take_while(|entry| entry.0 == hash) {
+        if doc.equal_strings(id, doc.required(call, "id")?)? {
+            return Ok(Some((ordinal, call)));
         }
     }
     Ok(None)
+}
+fn string_hash(doc: &Document, node: usize, hasher: &RandomState) -> Result<u64> {
+    use std::hash::{BuildHasher, Hasher};
+    let mut state = hasher.build_hasher();
+    let mut chars = doc.chars(node)?;
+    while let Some(c) = chars.next_scalar()? {
+        state.write_u32(c.into());
+    }
+    Ok(state.finish())
 }

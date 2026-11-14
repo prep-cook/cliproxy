@@ -1,5 +1,7 @@
 use crate::codec::event::Direction;
-use crate::{Mapped, Operation, RequestIngress, anthropic, assert_invalid_input, identity, json, request};
+use crate::{
+    Mapped, Operation, RequestIngress, Value, anthropic, assert_invalid_input, codec, identity, json, request,
+};
 
 #[test]
 fn server_and_mcp_history_preserve_semantic_results_and_native_order() {
@@ -87,4 +89,80 @@ fn unlinked_forward_and_wrong_kind_server_results_fail_the_fence() {
         assert_invalid_input(&raw, "client");
         assert!(!std::str::from_utf8(&raw).unwrap().contains("event: x_ck.request.end\n"));
     }
+}
+
+/// Asserts that an Anthropic request with `messages` fails the fence with the client error.
+fn assert_rejected(messages: Value) {
+    let mut mapped = Mapped::new();
+    let mut input = anthropic::request::Ingress::new(
+        &mut mapped.writer,
+        &mapped.store,
+        identity(Direction::Request),
+        Operation::Generate,
+        10_000,
+    )
+    .unwrap();
+    let body = json!({"model":"m","max_tokens":10,"messages":messages});
+    input
+        .advance(&mut mapped.writer, &serde_json::to_vec(&body).unwrap())
+        .unwrap();
+    let result = input.finish(&mut mapped.writer, &anthropic::request::AnthropicCapability);
+    assert!(matches!(result, Err(codec::Error::Schema)), "{messages}");
+    let raw = mapped.output(&mapped.writer);
+    assert_invalid_input(&raw, "client");
+    assert!(!std::str::from_utf8(&raw).unwrap().contains("event: x_ck.request.end\n"));
+}
+
+fn call(id: &str) -> Value {
+    json!({"type":"tool_use","id":id,"name":"f","input":{}})
+}
+
+fn result(id: &str) -> Value {
+    json!({"type":"tool_result","tool_use_id":id,"content":"r"})
+}
+
+#[test]
+fn duplicate_tool_call_ids_fail_the_fence() {
+    assert_rejected(json!([{"role":"assistant","content":[call("a"),call("a")]}]));
+    assert_rejected(json!([
+        {"role":"assistant","content":[call("a")]},
+        {"role":"user","content":[result("a")]},
+        {"role":"assistant","content":[call("b"),call("a")]},
+    ]));
+}
+
+#[test]
+fn client_results_need_a_call_in_an_earlier_message() {
+    assert_rejected(json!([
+        {"role":"user","content":[result("a")]},
+        {"role":"assistant","content":[call("a")]},
+    ]));
+    assert_rejected(json!([{"role":"assistant","content":[call("a"),result("a")]}]));
+}
+
+#[test]
+fn duplicate_chat_tool_call_ids_fail_the_anthropic_fence() {
+    let call = |id: &str| json!({"id":id,"type":"function","function":{"name":"f","arguments":"{}"}});
+    let body = json!({"model":"m","max_tokens":10,"messages":[
+        {"role":"assistant","content":null,"tool_calls":[call("a")]},
+        {"role":"tool","tool_call_id":"a","content":"r"},
+        {"role":"assistant","content":null,"tool_calls":[call("a")]},
+    ]});
+    let mut mapped = Mapped::new();
+    let mut input = codec::chat::request::Ingress::new(
+        &mut mapped.writer,
+        &mapped.store,
+        identity(Direction::Request),
+        Operation::Generate,
+        10_000,
+    )
+    .unwrap();
+    input
+        .advance(&mut mapped.writer, &serde_json::to_vec(&body).unwrap())
+        .unwrap();
+    let result = input.finish(&mut mapped.writer, &anthropic::request::AnthropicCapability);
+    assert!(matches!(result, Err(codec::Error::Schema)));
+    let error: Value = crate::events(&mapped.output(&mapped.writer)).pop().unwrap();
+    assert_eq!(error["code"], "stream.invalid_input");
+    assert_eq!(error["status"], 400);
 }
