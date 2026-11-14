@@ -95,6 +95,9 @@ pub(crate) struct State {
     terminal: Option<Terminal>,
     pub(crate) readers: usize,
     scratch_frames: usize,
+    /// The scratch frame small leases pack into, and its first unleased byte. Only leases
+    /// reference it; the lease drop that frees it clears this under the same lock.
+    scratch_open: Option<(u32, usize)>,
     external_metadata: usize,
     // Taken at invalidation, so an evicted stream frees its header before its last handle drops.
     slot: Option<u32>,
@@ -154,6 +157,7 @@ impl Stream {
                 terminal: None,
                 readers: 0,
                 scratch_frames: 0,
+                scratch_open: None,
                 external_metadata: 0,
                 slot: Some(slot),
                 failure_frames: None,
