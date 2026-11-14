@@ -156,7 +156,8 @@ impl Source {
         let end = self.len.checked_add(bytes).ok_or(Error::Limit)?;
         if bytes != 0 {
             if self.segments.len() == self.segments.capacity() {
-                let capacity = self.segments.capacity().max(4).checked_mul(2).ok_or(Error::Limit)?;
+                // Most sources hold one segment: start at one, then double.
+                let capacity = self.segments.capacity().checked_mul(2).ok_or(Error::Limit)?.max(1);
                 self.metadata.resize(
                     capacity
                         .checked_mul(std::mem::size_of::<Segment>())

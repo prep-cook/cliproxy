@@ -32,6 +32,8 @@ mod request_reader;
 mod ownership;
 #[path = "semantic/provenance.rs"]
 mod provenance;
+#[path = "semantic/quota.rs"]
+mod quota;
 #[path = "semantic/reasoning.rs"]
 mod reasoning;
 #[path = "semantic/request_wire.rs"]
