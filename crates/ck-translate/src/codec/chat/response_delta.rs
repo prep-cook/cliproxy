@@ -14,58 +14,85 @@ impl State {
         if !matches!(doc.node(body)?.value, Value::Object) {
             return Err(Error::Schema);
         }
+        // Streamed responses carry reasoning before the answer, so a buffered message opens its
+        // reasoning block first whatever its member order.
+        // ponytail: a `content` over 1,024 bytes that precedes `reasoning_content` is published,
+        // and opens its block, while the body arrives (response_buffered.rs), before reasoning is
+        // read. Agreeing there needs that text held to the message end or egress ordering.
+        let reasoning = if buffered {
+            doc.member(body, "reasoning_content")?
+        } else {
+            None
+        };
+        if let Some(field) = reasoning {
+            self.body_field(owner, doc, field, position, buffered)?;
+        }
         for field in doc.children(body)? {
-            if buffered && self.finish_published(owner, doc, field)? {
-                continue;
+            if Some(field) != reasoning {
+                self.body_field(owner, doc, field, position, buffered)?;
             }
-            let name = doc.node(field)?.name.ok_or(Error::Schema)?;
-            if doc.name_is(name, "audio")?
-                && matches!(doc.node(field)?.value, Value::Object)
-                && self.media_value(owner, doc, field, self.scope(position), "audio")?
-            {
-                continue;
-            }
-            if doc.name_is(name, "images")?
-                || (doc.name_is(name, "content")? && matches!(doc.node(field)?.value, Value::Array))
-            {
-                let name = if doc.name_is(name, "images")? {
-                    "images"
-                } else {
-                    "content"
-                };
-                self.array_field(owner, doc, field, position, name)?;
-                continue;
-            }
-            if doc.name_is(name, "annotations")? && matches!(doc.node(field)?.value, Value::Array) {
-                self.annotations(owner, doc, field, position)?;
-                continue;
-            }
-            if doc.name_is(name, "tool_calls")? {
-                self.tool_calls(owner, doc, field, position, buffered)?;
-                continue;
-            }
-            if doc.name_is(name, "function_call")? {
-                self.legacy_tool(owner, doc, field, position)?;
-                continue;
-            }
-            let mut known = false;
-            for key in [
-                "role",
-                "content",
-                "reasoning_content",
-                "refusal",
-                "audio",
-                "annotations",
-            ] {
-                known |= doc.name_is(name, key)?;
-            }
-            if !known {
-                self.unknown_field(owner, doc, field, position)?;
-                continue;
-            }
-            self.scalar_field(owner, doc, field, name, position)?;
         }
         Ok(())
+    }
+
+    /// Publishes one member of a message or delta.
+    fn body_field(
+        &mut self,
+        owner: &mut Writer,
+        doc: &Document,
+        field: usize,
+        position: usize,
+        buffered: bool,
+    ) -> Result<()> {
+        if buffered && self.finish_published(owner, doc, field)? {
+            return Ok(());
+        }
+        let name = doc.node(field)?.name.ok_or(Error::Schema)?;
+        if doc.name_is(name, "audio")?
+            && matches!(doc.node(field)?.value, Value::Object)
+            && self.media_value(owner, doc, field, self.scope(position), "audio")?
+        {
+            return Ok(());
+        }
+        if doc.name_is(name, "images")?
+            || (doc.name_is(name, "content")? && matches!(doc.node(field)?.value, Value::Array))
+        {
+            let name = if doc.name_is(name, "images")? {
+                "images"
+            } else {
+                "content"
+            };
+            self.array_field(owner, doc, field, position, name)?;
+            return Ok(());
+        }
+        if doc.name_is(name, "annotations")? && matches!(doc.node(field)?.value, Value::Array) {
+            self.annotations(owner, doc, field, position)?;
+            return Ok(());
+        }
+        if doc.name_is(name, "tool_calls")? {
+            self.tool_calls(owner, doc, field, position, buffered)?;
+            return Ok(());
+        }
+        if doc.name_is(name, "function_call")? {
+            self.legacy_tool(owner, doc, field, position)?;
+            return Ok(());
+        }
+        let mut known = false;
+        for key in [
+            "role",
+            "content",
+            "reasoning_content",
+            "refusal",
+            "audio",
+            "annotations",
+        ] {
+            known |= doc.name_is(name, key)?;
+        }
+        if !known {
+            self.unknown_field(owner, doc, field, position)?;
+            return Ok(());
+        }
+        self.scalar_field(owner, doc, field, name, position)
     }
 
     fn tool_calls(

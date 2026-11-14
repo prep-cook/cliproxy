@@ -1,5 +1,6 @@
-//! Buffered Chat response media collects small network reads into shared data records.
-use super::{Direction, Mapped, Operation, canonical_values, codec, identity};
+//! Buffered Chat response media collects small network reads into shared data records, and
+//! buffered and streamed responses open their blocks in the same order.
+use super::{Direction, Mapped, Operation, canonical_values, codec, identity, response};
 use base64::Engine;
 use codec::{BodyMode, ResponseIngress};
 use serde_json::{Value, json};
@@ -104,4 +105,45 @@ fn held_media_input_has_a_deadline_and_flushes_split_quartets() {
     ingress.advance(&mut mapped.writer, rest.as_bytes()).unwrap();
     assert_eq!(data_records(&mapped), (3, raw));
     ingress.finish(&mut mapped.writer).unwrap();
+}
+
+/// Kinds of the content blocks the canonical stream opens, in order.
+fn block_order(events: &[Value]) -> Vec<String> {
+    events
+        .iter()
+        .filter(|event| {
+            event["x_ck"].get("block_index").is_some()
+                && event["x_ck"].get("media_id").is_none()
+                && event["kind"].is_string()
+        })
+        .map(|event| event["kind"].as_str().unwrap().to_owned())
+        .collect()
+}
+
+/// A buffered message lists `content` before `reasoning_content`, as providers that stream
+/// reasoning first do; buffered ingress opens the blocks in the order streamed ingress does.
+/// Long reasoning publishes while the body is still arriving.
+#[test]
+fn buffered_and_streamed_reasoning_open_blocks_in_the_same_order() {
+    for reasoning in ["think".to_owned(), "r".repeat(2048)] {
+        let message = json!({"role":"assistant","content":"answer","reasoning_content":reasoning});
+        let body =
+            json!({"id":"r","model":"m","created":1,"choices":[{"index":0,"message":message,"finish_reason":"stop"}]});
+        let (_, buffered) = response(body.to_string().as_bytes(), BodyMode::Buffered, BodyMode::Buffered);
+        let chunk = |delta: Value, finish: Value| json!({"id":"r","model":"m","created":1,"choices":[{"index":0,"delta":delta,"finish_reason":finish}]});
+        let stream = format!(
+            "data: {}\n\ndata: {}\n\ndata: {}\n\ndata: [DONE]\n\n",
+            chunk(json!({"role":"assistant","reasoning_content":reasoning}), Value::Null),
+            chunk(json!({"content":"answer"}), Value::Null),
+            chunk(json!({}), json!("stop")),
+        );
+        let (_, streamed) = response(stream.as_bytes(), BodyMode::Streaming, BodyMode::Buffered);
+        assert_eq!(block_order(&streamed), ["thinking", "text"]);
+        assert_eq!(
+            block_order(&buffered),
+            block_order(&streamed),
+            "reasoning of {} bytes",
+            reasoning.len()
+        );
+    }
 }
