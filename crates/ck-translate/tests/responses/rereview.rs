@@ -1,0 +1,323 @@
+//! Re-review of the final codec review: closing reconciliation, opaque parts, failures and the
+//! lifecycle a streaming client sees.
+use super::cross::client_events;
+use super::final_events::buffered_output;
+use super::final_review::{egress_of, try_raw, try_streamed};
+use super::*;
+use codec::event::{Kind, Scope};
+
+/// The part that a streamed message starts with `started` and closes with `done`, as a buffered
+/// client receives it.
+fn closed_part(started: Value, done: Value) -> Value {
+    let item = |content: Value| json!({"id":"i","type":"message","role":"assistant","content":content});
+    let records = [
+        json!({"type":"response.created","response":{"id":"r","model":"m","status":"in_progress","output":[]}}),
+        json!({"type":"response.output_item.added","output_index":0,"item":item(json!([]))}),
+        json!({"type":"response.content_part.added","output_index":0,"content_index":0,"item_id":"i","part":started}),
+        json!({"type":"response.output_item.done","output_index":0,"item":item(json!([done]))}),
+        json!({"type":"response.completed","response":{"id":"r","status":"completed","output":[item(json!([done]))]}}),
+    ];
+    let (out, _) = try_streamed(&records, BodyMode::Buffered).unwrap();
+    serde_json::from_slice::<Value>(&out).unwrap()["output"][0]["content"][0].clone()
+}
+
+/// Client events for buffered Responses `body` replayed to a streaming client.
+fn streamed(body: &Value) -> Vec<Value> {
+    let (out, _) = response(
+        body.to_string().as_bytes(),
+        BodyMode::Buffered,
+        BodyMode::Streaming,
+        Operation::Generate,
+    );
+    client_events(&out)
+}
+
+#[test]
+fn closing_snapshots_merge_nested_and_opaque_members() {
+    // An omitted nested member keeps its started value.
+    assert_eq!(
+        closed_part(
+            json!({"type":"output_text","text":"","vendor":{"a":1,"b":2}}),
+            json!({"type":"output_text","text":"hi","vendor":{"b":3}})
+        ),
+        json!({"type":"output_text","text":"hi","vendor":{"a":1,"b":3},"annotations":[]})
+    );
+    // The text of an opaque part is an ordinary member.
+    assert_eq!(
+        closed_part(
+            json!({"type":"future_content","text":"","vendor":1}),
+            json!({"type":"future_content","text":"opaque","vendor":2})
+        ),
+        json!({"type":"future_content","text":"opaque","vendor":2})
+    );
+}
+
+#[test]
+fn empty_arrays_first_supplied_at_close_keep_their_presence() {
+    let done = json!({"type":"output_text","text":"hi","annotations":[],"logprobs":[]});
+    assert_eq!(closed_part(json!({"type":"output_text","text":""}), done.clone()), done);
+}
+
+#[test]
+fn unknown_items_keep_every_member() {
+    let future = json!([{"id":"i","type":"future_tool","status":"completed","content":"opaque-content",
+        "summary":"opaque-summary","encrypted_content":"E","input":"payload","arguments":"arg"}]);
+    assert_eq!(buffered_output(future.clone()), future);
+    // Parts and encryption of an unknown item open no blocks.
+    let parts = json!([{"id":"i","type":"future_tool","status":"completed","encrypted_content":"E",
+        "content":[{"type":"output_text","text":"x"}],"summary":[{"type":"summary_text","text":"y"}]}]);
+    let body = json!({"id":"r","status":"completed","output":parts});
+    let (out, canonical) = response(
+        body.to_string().as_bytes(),
+        BodyMode::Buffered,
+        BodyMode::Buffered,
+        Operation::Generate,
+    );
+    let blocks: Vec<_> = canonical
+        .iter()
+        .filter(|e| e["x_ck"]["block_index"].is_number())
+        .collect();
+    assert!(blocks.is_empty(), "{blocks:?}");
+    assert_eq!(serde_json::from_slice::<Value>(&out).unwrap()["output"], parts);
+}
+
+#[test]
+fn opaque_summary_parts_raise_no_text_events() {
+    for kind in ["output_text", "refusal"] {
+        let part = json!({"type":kind,"text":"opaque-text","payload":7});
+        let item = json!({"id":"i","type":"reasoning","status":"completed","summary":[part]});
+        let events = streamed(&json!({"id":"r","status":"completed","output":[item]}));
+        let types: Vec<_> = events.iter().map(|e| e["type"].as_str().unwrap()).collect();
+        assert_eq!(
+            types,
+            [
+                "response.created",
+                "response.output_item.added",
+                "response.reasoning_summary_part.added",
+                "response.reasoning_summary_part.done",
+                "response.output_item.done",
+                "response.completed"
+            ]
+        );
+        for event in &events[2..4] {
+            assert_eq!(event["part"], part);
+        }
+        assert_eq!(events[5]["response"]["output"][0], item);
+    }
+}
+
+/// Client bytes and canonical records for Responses `input` whose ingress fails; egress still
+/// ends the response.
+fn failing(input: &[u8], mode: BodyMode, downstream: BodyMode) -> (Vec<u8>, Vec<Value>) {
+    let mut m = Mapped::new();
+    let mut ingress = responses::response::Ingress::new(
+        &mut m.writer,
+        identity(Direction::Response),
+        Operation::Generate,
+        mode,
+        1024 * 1024,
+    )
+    .unwrap();
+    let mut reader = m.store.reader(m.writer.id(), 0).unwrap();
+    let mut egress = responses::egress::Egress::new(&mut m.writer, Operation::Generate, downstream, |_, _| {}).unwrap();
+    let ingested = ingress
+        .advance(&mut m.writer, input)
+        .and_then(|()| ingress.finish(&mut m.writer));
+    assert!(ingested.is_err());
+    let mut out = Vec::new();
+    while let std::task::Poll::Ready(Some(ck_stream::Read::Record(lease))) = reader.try_next() {
+        egress
+            .advance(&mut m.writer, lease, |chunk| {
+                out.extend_from_slice(&bytes(&chunk));
+                Ok(())
+            })
+            .unwrap();
+    }
+    egress.finish().unwrap();
+    (out, events(&m))
+}
+
+const FAILED: &str = r#"{"id":"r","model":"m","created_at":123,"status":"failed","output":[],
+    "error":{"code":"server_error","message":"SENSITIVE"},"usage":{"input_tokens":10,"output_tokens":2,"total_tokens":12}}"#;
+
+/// The failed response a client receives, after checking the stream's lifecycle events.
+fn failed_response(out: &[u8], downstream: BodyMode) -> Value {
+    assert!(!String::from_utf8_lossy(out).contains("SENSITIVE"));
+    if downstream == BodyMode::Buffered {
+        return serde_json::from_slice(out).unwrap();
+    }
+    let events = client_events(out);
+    let types: Vec<_> = events.iter().map(|e| e["type"].as_str().unwrap()).collect();
+    assert_eq!(types, ["response.created", "response.failed"]);
+    assert_eq!(events[0]["response"]["id"], "r");
+    events[1]["response"].clone()
+}
+
+#[test]
+fn failed_responses_keep_their_identity_and_usage() {
+    let failed: Value = serde_json::from_str(FAILED).unwrap();
+    let first = format!("data: {}\n\n", json!({"type":"response.failed","response":failed}));
+    let created =
+        json!({"type":"response.created","response":{"id":"r","model":"m","status":"in_progress","output":[]}});
+    let later = format!("data: {created}\n\n{first}");
+    for downstream in [BodyMode::Buffered, BodyMode::Streaming] {
+        for (input, mode) in [
+            (FAILED, BodyMode::Buffered),
+            (first.as_str(), BodyMode::Streaming),
+            (later.as_str(), BodyMode::Streaming),
+        ] {
+            let (out, canonical) = failing(input.as_bytes(), mode, downstream);
+            assert!(!format!("{canonical:?}").contains("SENSITIVE"));
+            let response = failed_response(&out, downstream);
+            for name in ["id", "model", "created_at", "usage"] {
+                assert_eq!(response[name], failed[name], "{name} {input}");
+            }
+            assert_eq!(response["status"], "failed");
+        }
+    }
+    // A stream that fails before it starts still opens with `response.created`.
+    let (out, _) = failing(
+        b"event: response.output_text.delta\ndata: x\n\n",
+        BodyMode::Streaming,
+        BodyMode::Streaming,
+    );
+    let types: Vec<_> = client_events(&out).iter().map(|e| e["type"].clone()).collect();
+    assert_eq!(types, ["response.created", "response.failed"]);
+}
+
+#[test]
+fn failed_responses_publish_only_their_identity_and_usage() {
+    let failed = json!({"id":"r","object":"response","created_at":123,"model":"m","status":"failed","output":[],
+        "error":{"code":"server_error","message":"SENSITIVE"},"message":"SENSITIVE","metadata":{"m":"SENSITIVE"},
+        "usage":{"input_tokens":10,"output_tokens":2,"total_tokens":12}});
+    let buffered = failed.to_string();
+    let first = format!("data: {}\n\n", json!({"type":"response.failed","response":failed}));
+    for downstream in [BodyMode::Buffered, BodyMode::Streaming] {
+        for (input, mode) in [
+            (buffered.as_str(), BodyMode::Buffered),
+            (first.as_str(), BodyMode::Streaming),
+        ] {
+            let (out, canonical) = failing(input.as_bytes(), mode, downstream);
+            assert!(!format!("{canonical:?}").contains("SENSITIVE"), "{canonical:?}");
+            let response = failed_response(&out, downstream);
+            for name in ["id", "object", "created_at", "model", "usage"] {
+                assert_eq!(response[name], failed[name], "{name} {input}");
+            }
+            assert!(response.get("message").is_none() && response.get("metadata").is_none());
+        }
+    }
+}
+
+#[test]
+fn failures_carry_the_native_server_error_code() {
+    let (out, _) = failing(FAILED.as_bytes(), BodyMode::Buffered, BodyMode::Buffered);
+    let response: Value = serde_json::from_slice(&out).unwrap();
+    assert_eq!(
+        response["error"],
+        json!({"code":"server_error","message":"Response failed"})
+    );
+}
+
+const COMPLETED: &str =
+    "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"r\",\"status\":\"completed\",\"output\":[]}}\n\n";
+
+#[test]
+fn unnamed_data_is_not_classified_by_its_first_byte() {
+    for data in ["{diagnostic}", "  {\"type\":\"response.output_text.delta\""] {
+        let (_, canonical) = try_raw(format!("data: {data}\n\n{COMPLETED}").as_bytes(), BodyMode::Buffered).unwrap();
+        let opaque: Vec<_> = canonical.iter().filter(|e| e["format"] == "text").collect();
+        assert_eq!(opaque[0]["value"], data);
+    }
+}
+
+/// Streaming client JSON events for Responses SSE `input`; an unknown text record passes
+/// through as it is.
+fn json_events(input: &str) -> Vec<Value> {
+    let (out, _) = try_raw(input.as_bytes(), BodyMode::Streaming).unwrap();
+    std::str::from_utf8(&out)
+        .unwrap()
+        .lines()
+        .filter_map(|line| serde_json::from_str(line.strip_prefix("data: ")?).ok())
+        .collect()
+}
+
+#[test]
+fn a_heartbeat_before_creation_fixes_no_identity() {
+    let response = |status: &str| json!({"id":"r","status":status,"output":[]});
+    let lifecycle = wire(&[
+        json!({"type":"response.created","response":response("queued")}),
+        json!({"type":"response.in_progress","response":response("in_progress")}),
+        json!({"type":"response.completed","response":response("completed")}),
+    ]);
+    for prefix in [": ping\n\n", "data: ordinary text\n\n", "data: {diagnostic}\n\n"] {
+        let events = json_events(&format!("{prefix}{lifecycle}"));
+        let created = events.iter().find(|e| e["type"] == "response.created").unwrap();
+        assert_eq!(created["response"]["status"], "queued", "{prefix}");
+        // A stream whose only snapshot is the terminal one takes its identity from it.
+        let terminal = json_events(&format!("{prefix}{COMPLETED}"));
+        assert_eq!(terminal[0]["type"], "response.created");
+        for event in events.iter().chain(&terminal).filter(|e| e.get("response").is_some()) {
+            assert_eq!(event["response"]["id"], "r", "{prefix}");
+        }
+    }
+}
+
+#[test]
+fn response_created_carries_its_own_snapshot() {
+    let created = json!({"type":"response.created","response":{"id":"r","status":"in_progress",
+        "instructions":"RULE","tools":[{"type":"web_search"}],"output":[]}});
+    let (out, _) = try_raw(
+        format!("data: {created}\n\n{COMPLETED}").as_bytes(),
+        BodyMode::Streaming,
+    )
+    .unwrap();
+    let events = client_events(&out);
+    assert_eq!(events[0]["type"], "response.created");
+    assert_eq!(events[0]["response"]["instructions"], "RULE");
+    assert_eq!(events[0]["response"]["tools"], json!([{"type":"web_search"}]));
+    // The created event goes out with its snapshot, before any later record.
+    let input = format!("data: {created}\n\ndata: ordinary text\n\n{COMPLETED}");
+    let (out, _) = try_raw(input.as_bytes(), BodyMode::Streaming).unwrap();
+    let first = String::from_utf8(out)
+        .unwrap()
+        .lines()
+        .find(|l| l.starts_with("data: "))
+        .unwrap()
+        .to_owned();
+    assert!(first.starts_with("data: {\"type\":\"response.created\""), "{first}");
+    // A stream without a creation snapshot still opens with `response.created`.
+    let progress = json!({"type":"response.in_progress","response":{"id":"r","status":"in_progress","output":[]}});
+    let (out, _) = try_raw(
+        format!("data: {progress}\n\n{COMPLETED}").as_bytes(),
+        BodyMode::Streaming,
+    )
+    .unwrap();
+    let types: Vec<_> = client_events(&out).iter().map(|e| e["type"].clone()).collect();
+    assert_eq!(
+        types,
+        ["response.created", "response.in_progress", "response.completed"]
+    );
+    // So does a canonical response that ends right after its start.
+    let start = (
+        Kind::ResponseStart,
+        Scope::default(),
+        r#","id":"r","model":"m","created":1"#,
+    );
+    let (out, _) = egress_of(&[start, (Kind::Done, Scope::default(), "")], BodyMode::Streaming);
+    let types: Vec<_> = client_events(&out).iter().map(|e| e["type"].clone()).collect();
+    assert_eq!(types, ["response.created", "response.completed"]);
+}
+
+#[test]
+fn announced_text_parts_carry_their_annotations() {
+    let citation = json!({"type":"url_citation","url":"https://e/","title":"t","start_index":0,"end_index":1});
+    let part = json!({"type":"output_text","text":"hi","annotations":[citation]});
+    let item = json!({"id":"i","type":"message","role":"assistant","status":"completed","content":[part]});
+    let events = streamed(&json!({"id":"r","status":"completed","output":[item]}));
+    let added = events
+        .iter()
+        .find(|e| e["type"] == "response.content_part.added")
+        .unwrap();
+    assert_eq!(added["part"], json!({"type":"output_text","text":"","annotations":[]}));
+    assert_eq!(events.last().unwrap()["response"]["output"][0], item);
+}
