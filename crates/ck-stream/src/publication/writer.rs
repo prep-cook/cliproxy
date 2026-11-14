@@ -30,6 +30,12 @@ impl Writer {
         self.stream.state.lock().failure_frames
     }
 
+    /// Metadata bytes charged against `max_metadata_bytes`, for the codec benchmark harness only.
+    #[cfg(feature = "bench-hooks")]
+    pub fn metadata_bytes(&self) -> usize {
+        Stream::metadata(&self.stream.state.lock())
+    }
+
     /// Wait for the producer to stop, including expiry, eviction, cancellation and shutdown.
     /// The owned, cancellation-safe future does not borrow the writer and also resolves
     /// immediately after a terminal has already been published, including normal completion.

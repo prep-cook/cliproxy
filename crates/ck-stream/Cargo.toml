@@ -11,6 +11,10 @@ homepage.workspace = true
 exclude.workspace = true
 categories.workspace = true
 
+[features]
+# Read-only accessors for bench/codec; no production caller enables this.
+bench-hooks = []
+
 [dependencies]
 libc.workspace = true
 parking_lot = "0.12.5"
