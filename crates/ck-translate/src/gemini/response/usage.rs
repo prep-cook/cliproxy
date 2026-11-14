@@ -4,6 +4,7 @@ use super::State;
 use crate::codec::{
     Error, Result,
     document::{Document, Value},
+    encode::Encoder,
     event::{Emitter, Kind, Scope},
 };
 use ck_stream::Writer;
@@ -72,20 +73,8 @@ pub(super) fn emit(emitter: &mut Emitter, owner: &mut Writer, doc: &Document, fi
                     doc.write(n, e)?;
                 }
             }
-            if let (Some(candidates), Some(thoughts)) = (
-                doc.member(root, "candidatesTokenCount")?,
-                doc.member(root, "thoughtsTokenCount")?,
-            ) && !matches!(doc.node(candidates)?.value, Value::Null)
-                && !matches!(doc.node(thoughts)?.value, Value::Null)
-            {
-                e.bytes(b",\"output_tokens\":")?;
-                e.unsigned(
-                    doc.unsigned(candidates)?
-                        .checked_add(doc.unsigned(thoughts)?)
-                        .ok_or(Error::Schema)?,
-                )?;
-                e.bytes(b",\"derived\":[\"output_tokens\"]")?;
-            }
+            output(doc, root, e)?;
+            modalities(doc, root, e)?;
             e.bytes(b",\"native\":{\"protocol\":\"gemini\",\"value\":")?;
             doc.write(root, e)?;
             e.bytes(b"}}")
@@ -93,4 +82,83 @@ pub(super) fn emit(emitter: &mut Emitter, owner: &mut Writer, doc: &Document, fi
         |_| Ok(()),
     )?;
     Ok(())
+}
+
+/// A count the snapshot reports: present and not null.
+fn known(doc: &Document, parent: usize, key: &str) -> Result<Option<u64>> {
+    match doc.member(parent, key)? {
+        Some(n) if !matches!(doc.node(n)?.value, Value::Null) => Ok(Some(doc.unsigned(n)?)),
+        _ => Ok(None),
+    }
+}
+
+/// Inclusive output: `candidatesTokenCount` excludes thoughts, so a reported thought count is
+/// added and marks the sum derived. A null thought count leaves the output unknown.
+fn output(doc: &Document, root: usize, e: &mut Encoder<'_, '_>) -> Result<()> {
+    let Some(candidates) = known(doc, root, "candidatesTokenCount")? else {
+        return Ok(());
+    };
+    let thoughts = doc.member(root, "thoughtsTokenCount")?;
+    let total = match thoughts {
+        None => candidates,
+        Some(_) => match known(doc, root, "thoughtsTokenCount")? {
+            Some(thoughts) => candidates.checked_add(thoughts).ok_or(Error::Schema)?,
+            None => return Ok(()),
+        },
+    };
+    e.bytes(b",\"output_tokens\":")?;
+    e.unsigned(total)?;
+    if thoughts.is_some() {
+        e.bytes(b",\"derived\":[\"output_tokens\"]")?;
+    }
+    Ok(())
+}
+
+/// Audio counts from the per-modality breakdowns, and text and image counts as details. Other
+/// modalities (video, document) and the cache and tool-use breakdowns stay in `native`.
+fn modalities(doc: &Document, root: usize, e: &mut Encoder<'_, '_>) -> Result<()> {
+    // Top-level counts come first: the details object closes the run.
+    const MAP: [(&str, &str, &str, bool); 6] = [
+        ("promptTokensDetails", "AUDIO", "input_audio_tokens", false),
+        ("candidatesTokensDetails", "AUDIO", "output_audio_tokens", false),
+        ("promptTokensDetails", "TEXT", "input_text_tokens", true),
+        ("promptTokensDetails", "IMAGE", "input_image_tokens", true),
+        ("candidatesTokensDetails", "TEXT", "output_text_tokens", true),
+        ("candidatesTokensDetails", "IMAGE", "output_image_tokens", true),
+    ];
+    let mut details = false;
+    for (list, modality, canonical, detail) in MAP {
+        let Some(count) = modality_count(doc, root, list, modality)? else {
+            continue;
+        };
+        e.bytes(if detail && !details { b",\"details\":{" } else { b"," })?;
+        details |= detail;
+        e.string(canonical)?;
+        e.bytes(b":")?;
+        e.unsigned(count)?;
+    }
+    if details {
+        e.bytes(b"}")?;
+    }
+    Ok(())
+}
+
+/// The reported `tokenCount` of one modality in a `ModalityTokenCount` list.
+fn modality_count(doc: &Document, root: usize, list: &str, modality: &str) -> Result<Option<u64>> {
+    let Some(list) = doc.member(root, list)? else {
+        return Ok(None);
+    };
+    if matches!(doc.node(list)?.value, Value::Null) {
+        return Ok(None);
+    }
+    super::super::array(doc, list)?;
+    for entry in doc.children(list)? {
+        super::super::object(doc, entry)?;
+        if let Some(name) = doc.member(entry, "modality")?
+            && doc.string_is(name, modality)?
+        {
+            return known(doc, entry, "tokenCount");
+        }
+    }
+    Ok(None)
 }

@@ -15,6 +15,8 @@ mod incremental;
 mod semantic;
 #[path = "gemini/streams.rs"]
 mod streams;
+#[path = "gemini/usage.rs"]
+mod usage;
 
 use codec::{
     BodyMode, Operation, RequestEgress, RequestIngress, ResponseEgress, ResponseIngress,
