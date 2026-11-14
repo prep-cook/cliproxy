@@ -33,6 +33,7 @@ impl<F: FnMut(&'static str, u64)> Egress<F> {
         } else if is(doc, item, "type", "reasoning")? {
             doc.set(item, "summary", Value::Array)?;
         }
+        initialize_call(doc, item)?;
         doc.bind_origin(item, x, None)?;
         if !native {
             self.pending = Some(item);
@@ -108,6 +109,7 @@ impl<F: FnMut(&'static str, u64)> Egress<F> {
         if !separate {
             return Ok(());
         }
+        initialize_call(doc, item)?;
         let payload = encode::scratch(owner, |e| {
             e.bytes(b",\"output_index\":")?;
             e.unsigned(index)?;
@@ -170,6 +172,11 @@ impl<F: FnMut(&'static str, u64)> Egress<F> {
                 }),
             )?;
         }
+        let native = doc
+            .member(x, "source")?
+            .map(|s| is(doc, s, "protocol", "responses"))
+            .transpose()?;
+        initialize_part(doc, part, native != Some(true))?;
         doc.bind_origin(part, x, None)?;
         let payload = encode::scratch(owner, |e| {
             item_fields(doc, item, index, e)?;
@@ -515,6 +522,42 @@ fn restore_originals(doc: &mut Document, x: usize, target: usize) -> Result<()> 
         let field = doc.add(Some(Name::Pointer(pointer)), Value::Null)?;
         doc.transplant(field, value)?;
         doc.append(target, field)?;
+    }
+    Ok(())
+}
+
+/// Gives a text part the empty members that native clients append deltas to. A Responses source
+/// supplies its own `annotations` or their absence; any other source gets the native empty array.
+fn initialize_part(doc: &mut Document, part: usize, annotate: bool) -> Result<()> {
+    let (field, annotated) = if is(doc, part, "type", "output_text")? {
+        ("text", true)
+    } else if is(doc, part, "type", "refusal")? {
+        ("refusal", false)
+    } else if is(doc, part, "type", "reasoning_text")? || is(doc, part, "type", "summary_text")? {
+        ("text", false)
+    } else {
+        return Ok(());
+    };
+    if doc.member(part, field)?.is_none() {
+        doc.set(part, field, Value::Text(""))?;
+    }
+    if annotated && annotate && doc.member(part, "annotations")?.is_none() {
+        doc.set(part, "annotations", Value::Array)?;
+    }
+    Ok(())
+}
+
+/// Gives a call item the empty arguments or input that native clients append deltas to.
+fn initialize_call(doc: &mut Document, item: usize) -> Result<()> {
+    let field = if is(doc, item, "type", "function_call")? {
+        "arguments"
+    } else if is(doc, item, "type", "custom_tool_call")? {
+        "input"
+    } else {
+        return Ok(());
+    };
+    if doc.member(item, field)?.is_none() {
+        doc.set(item, field, Value::Text(""))?;
     }
     Ok(())
 }
