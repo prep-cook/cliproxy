@@ -66,7 +66,7 @@ impl Document {
                 offset,
             });
         }
-        self.reserve(0, 1)?;
+        self.reserve(0, 1, 0)?;
         self.records = Some(self.sources.len());
         self.sources.push(source);
         Ok(Adopted {
@@ -75,7 +75,8 @@ impl Document {
         })
     }
 
-    /// Copies the subtree at `node` of an adopted record under `name`, mapping its texts.
+    /// Copies the subtree at `node` of an adopted record under `name`, mapping its texts. A
+    /// record is decoded JSON, so it holds no [`Value::Id`] whose index would need mapping.
     pub(crate) fn copy_adopted(
         &mut self,
         event: &Document,
@@ -164,7 +165,7 @@ impl Document {
     }
 
     pub fn add(&mut self, name: Option<Name>, value: Value) -> Result<usize> {
-        self.reserve(1, 0)?;
+        self.reserve(1, 0, 0)?;
         let index = self.nodes.len();
         self.nodes.push(Node {
             name,

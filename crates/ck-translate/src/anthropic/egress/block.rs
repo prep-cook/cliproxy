@@ -112,7 +112,7 @@ impl Egress {
             copy_value(body, body.root(), "id", id)?;
         } else {
             let id = local(body, body.required(x, "tool_call_id")?)?;
-            body.set(body.root(), "id", Value::Id(id))?;
+            body.set_id(body.root(), "id", id)?;
         }
         let name = body.required(from, "name")?;
         copy_value(body, body.root(), "name", name)?;

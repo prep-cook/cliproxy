@@ -107,7 +107,7 @@ impl Registry {
         } else {
             doc.replace(node, Value::Object)?;
             doc.set(node, "type", Value::Text("x_ck_media"))?;
-            doc.set(node, "media_id", Value::Id(id))?;
+            doc.set_id(node, "media_id", id)?;
             doc.set(node, "value_kind", Value::Text("bytes"))?;
         }
         self.entries.push(Entry {

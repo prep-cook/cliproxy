@@ -21,7 +21,7 @@ impl Document {
         match &self.nodes.get(index).ok_or(Error::Position)?.value {
             Value::String(t) => Ok(Characters::Mapped(json::Decoded::new(self.source(*t)?, t.span)?)),
             Value::Text(s) => Ok(Characters::Static(s.chars())),
-            Value::Id(id) => Ok(Characters::Static(id.as_str().chars())),
+            Value::Id(id) => Ok(Characters::Static(self.local_id(*id)?.as_str().chars())),
             Value::Fragments => Ok(Characters::Fragments(FragmentCharacters {
                 doc: self,
                 root: index,
