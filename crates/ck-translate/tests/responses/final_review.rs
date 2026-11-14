@@ -59,3 +59,64 @@ fn announced_parts_and_calls_carry_their_empty_accumulators() {
         json!({"type":"output_text","text":"","annotations":[]})
     );
 }
+
+/// Encodes `input` after the trusted reader rebuilt it from the canonical records; `edit` may
+/// change the rebuilt document first.
+fn rebuilt(input: &Value, operation: Operation, edit: impl FnOnce(&mut codec::document::Document)) -> Value {
+    let mut m = Mapped::new();
+    let mut ingress = responses::request::Ingress::new(
+        &mut m.writer,
+        &m.store,
+        identity(Direction::Request),
+        operation,
+        1024 * 1024,
+    )
+    .unwrap();
+    ingress
+        .advance(&mut m.writer, &serde_json::to_vec(input).unwrap())
+        .unwrap();
+    ingress
+        .finish(&mut m.writer, &responses::request::ResponsesCapability)
+        .unwrap();
+    let mut reader = m.store.reader(m.writer.id(), 0).unwrap();
+    let (mut doc, media) = codec::chat::request::read_request(&mut m.writer, &mut reader).unwrap();
+    edit(&mut doc);
+    let ready = codec::RequestFence::default()
+        .end(
+            codec::RequestView {
+                document: &doc,
+                media: &media,
+                operation,
+            },
+            &responses::request::ResponsesCapability,
+        )
+        .unwrap();
+    let output = responses::request::Egress {
+        destination: "responses",
+        upstream_stream: false,
+    }
+    .encode(&ready, &mut m.writer)
+    .unwrap();
+    serde_json::from_slice(&bytes(&output)).unwrap()
+}
+
+#[test]
+fn provenance_survives_the_canonical_records() {
+    for (input, operation) in [
+        (
+            json!({"model":"m","input":[{"type":"compaction","encrypted_content":"E"}],"vendor":7}),
+            Operation::Compact,
+        ),
+        (
+            json!({"model":"m","instructions":"be brief","input":[{"role":"developer","content":"d"},
+                {"type":"reasoning","id":"rs","summary":[{"type":"summary_text","text":"s"}],"encrypted_content":"E"},
+                {"type":"future_item","payload":1},
+                {"role":"assistant","content":[{"type":"future_part","x":1}]}],
+                "tools":[{"type":"web_search"},{"type":"function","name":"f","parameters":{},"vendor":1}]}),
+            Operation::Generate,
+        ),
+    ] {
+        let (direct, _) = request(&input, operation);
+        assert_eq!(rebuilt(&input, operation, |_| {}), direct, "{input}");
+    }
+}

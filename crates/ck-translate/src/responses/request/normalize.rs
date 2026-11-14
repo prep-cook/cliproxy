@@ -62,7 +62,7 @@ fn normalize_input(doc: &mut Document, owner: &mut Writer, x: usize, original: u
         doc.set(message, "role", Value::Text("developer"))?;
         doc.rename(instructions, "content")?;
         doc.append(message, instructions)?;
-        doc.bind_origin(message, instructions, Some("responses.instructions"))?;
+        mark(doc, owner, original, message, "/instructions", Value::Bool(true))?;
     }
     if let Some(input) = doc.remove(root, "input")? {
         if matches!(doc.node(input)?.value, Value::String(_) | Value::Utf8Media) {
@@ -213,7 +213,7 @@ fn normalize_item(doc: &mut Document, owner: &mut Writer, item: usize, items: &m
     {
         normalize_message(doc, owner, item, messages, original)
     } else {
-        normalize_opaque(doc, item, messages)
+        normalize_opaque(doc, owner, item, messages, original)
     }
 }
 /// Wraps a function or custom tool call in an assistant message; the item id is kept as an
@@ -297,16 +297,7 @@ fn normalize_output(
 /// encrypted content becomes a replay entry.
 fn normalize_reasoning(doc: &mut Document, owner: &mut Writer, item: usize, items: &mut Items) -> Result<()> {
     let Items { messages, original, .. } = *items;
-    let compaction = is(doc, item, "type", "compaction")?;
-    doc.bind_origin(
-        item,
-        original,
-        Some(if compaction {
-            "responses.compaction"
-        } else {
-            "responses.reasoning"
-        }),
-    )?;
+    // The item `type`, kept below as an original field, tells request egress which item it was.
     doc.append(messages, item)?;
     doc.set(item, "role", Value::Text("assistant"))?;
     let native_content = doc.remove(item, "content")?;
@@ -388,9 +379,20 @@ fn normalize_message(
     Ok(())
 }
 /// Keeps an item kind without a canonical form as an opaque part of an assistant message.
-fn normalize_opaque(doc: &mut Document, item: usize, messages: usize) -> Result<()> {
+fn normalize_opaque(
+    doc: &mut Document,
+    owner: &mut Writer,
+    item: usize,
+    messages: usize,
+    original: usize,
+) -> Result<()> {
     let message = doc.add(None, Value::Object)?;
     doc.append(messages, message)?;
+    let kind = match doc.member(item, "type")? {
+        Some(kind) => doc.node(kind)?.value,
+        None => Value::Null,
+    };
+    mark(doc, owner, original, message, "/type", kind)?;
     doc.set(message, "role", Value::Text("assistant"))?;
     let content = doc.set(message, "content", Value::Array)?;
     let part = doc.add(None, Value::Object)?;
@@ -398,7 +400,6 @@ fn normalize_opaque(doc: &mut Document, item: usize, messages: usize) -> Result<
     doc.set(part, "type", Value::Text("opaque"))?;
     doc.set(part, "protocol", Value::Text("responses"))?;
     doc.rename(item, "value")?;
-    doc.bind_origin(part, message, Some("responses.item"))?;
     doc.append(part, item)?;
     Ok(())
 }
@@ -465,6 +466,27 @@ fn normalize_part(doc: &mut Document, owner: &mut Writer, part: usize, original:
         doc.append(part, value)?;
     }
     Ok(())
+}
+/// Records in `x_ck.original` that `target` stands for the Responses member `pointer`: the
+/// `instructions` message, or the item type of an item kept opaque. Unlike an in-memory carrier,
+/// the entry is published with its binding, so it survives the canonical records (§4).
+fn mark(
+    doc: &mut Document,
+    owner: &mut Writer,
+    original: usize,
+    target: usize,
+    pointer: &str,
+    value: Value,
+) -> Result<()> {
+    let entry = doc.add(None, Value::Object)?;
+    doc.append(original, entry)?;
+    doc.set(entry, "protocol", Value::Text("responses"))?;
+    let lease = encode::scratch(owner, |e| e.string(pointer))?;
+    let pointer = doc.import_json(owner, lease)?;
+    doc.rename(pointer, "pointer")?;
+    doc.append(entry, pointer)?;
+    doc.set(entry, "value", value)?;
+    doc.bind_origin(entry, target, None)
 }
 fn preserve(doc: &mut Document, owner: &mut Writer, original: usize, target: usize, value: usize) -> Result<()> {
     let name = doc.node(value)?.name.ok_or(Error::Schema)?;

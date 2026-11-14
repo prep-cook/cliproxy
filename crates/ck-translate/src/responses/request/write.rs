@@ -1,4 +1,5 @@
 use super::super::{is, member};
+use super::native::{item_type, native, typed};
 use crate::codec::{
     Error, Operation, RequestView, Result,
     document::{Document, Name, Value},
@@ -255,10 +256,7 @@ fn write_extensions(doc: &Document, x: usize, e: &mut Encoder<'_, '_>) -> Result
 }
 /// True for the developer message that carries the Responses `instructions` field.
 fn instructions(doc: &Document, message: usize) -> Result<bool> {
-    Ok(doc
-        .origin(message)?
-        .is_some_and(|(_, carrier)| carrier == Some("responses.instructions"))
-        && is(doc, message, "role", "developer")?)
+    Ok(native(doc, message, "instructions")?.is_some() && is(doc, message, "role", "developer")?)
 }
 /// Starts the next input item.
 fn separate(first: &mut bool, e: &mut Encoder<'_, '_>) -> Result<()> {
@@ -284,17 +282,16 @@ fn write_message(
     }
     let calls = doc.member(message, "tool_calls")?;
     if let Some(content) = doc.member(message, "content")? {
+        let kind = item_type(doc, message)?;
+        let native = typed(doc, kind, "reasoning")? || typed(doc, kind, "compaction")?;
         if let Some(part) = doc.node(content)?.first
-            && doc
-                .origin(part)?
-                .is_some_and(|(_, carrier)| carrier == Some("responses.item"))
+            && kind.is_some()
+            && !native
             && is(doc, part, "type", "opaque")?
         {
             separate(first, e)?;
             return doc.write(doc.required(part, "value")?, e);
         }
-        let native = doc.origin(message)?.and_then(|(_, carrier)| carrier);
-        let native = matches!(native, Some("responses.compaction" | "responses.reasoning"));
         let reasoning = native || any_part(doc, content, true)?;
         if reasoning {
             separate(first, e)?;
@@ -424,9 +421,7 @@ fn write_reasoning(
     (index, replay): (u64, &mut Option<usize>),
     e: &mut Encoder<'_, '_>,
 ) -> Result<()> {
-    let compaction = doc
-        .origin(message)?
-        .is_some_and(|(_, carrier)| carrier == Some("responses.compaction"));
+    let compaction = typed(doc, item_type(doc, message)?, "compaction")?;
     e.bytes(b"{\"type\":")?;
     e.string(if compaction { "compaction" } else { "reasoning" })?;
     let has = |kind: &str| -> Result<bool> {

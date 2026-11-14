@@ -8,6 +8,7 @@ use crate::codec::{
 use ck_stream::{ScratchLease, Writer};
 
 mod input;
+mod native;
 mod normalize;
 mod validate;
 mod write;
@@ -72,6 +73,7 @@ impl Ingress {
             media: &self.media,
             operation: self.operation,
         })?;
+        bindings(document, owner)?;
         let root = document.root();
         publish_fields(
             document,
@@ -127,6 +129,57 @@ impl codec::RequestIngress for Ingress {
         };
         crate::boundary::end_request(&mut self.fence, view, destination, &mut self.emitter, owner)
     }
+}
+
+/// Serializes the trusted binding of every bound `x_ck` list entry, as
+/// `codec::provenance::bindings` does, so the trusted record reader restores it (§4). All
+/// pointers share one imported array: each import holds storage until the document retires its
+/// scratch, so one import per entry exhausted the pool on requests with many original fields.
+fn bindings(doc: &mut Document, owner: &mut Writer) -> Result<()> {
+    let x = doc.required(doc.root(), "x_ck")?;
+    let lease = encode::scratch(owner, |e| {
+        e.bytes(b"[")?;
+        let mut first = true;
+        for list in codec::provenance::BOUND_LISTS {
+            for entry in doc
+                .member(x, list)?
+                .map(|l| doc.children(l))
+                .transpose()?
+                .into_iter()
+                .flatten()
+            {
+                if let Some((parent, _)) = doc.origin(entry)? {
+                    if !first {
+                        e.bytes(b",")?;
+                    }
+                    first = false;
+                    codec::provenance::pointer(doc, parent, e)?;
+                }
+            }
+        }
+        e.bytes(b"]")
+    })?;
+    let pointers = doc.import_json(owner, lease)?;
+    for list in codec::provenance::BOUND_LISTS {
+        let Some(list) = doc.member(x, list)? else {
+            continue;
+        };
+        let mut next = doc.node(list)?.first;
+        while let Some(entry) = next {
+            next = doc.node(entry)?.next;
+            let Some((_, carrier)) = doc.origin(entry)? else {
+                continue;
+            };
+            let binding = doc.node(pointers)?.first.ok_or(Error::Schema)?;
+            doc.detach(pointers, binding)?;
+            doc.rename(binding, "binding")?;
+            doc.append(entry, binding)?;
+            if let Some(carrier) = carrier {
+                doc.set(entry, "carrier", Value::Text(carrier))?;
+            }
+        }
+    }
+    Ok(())
 }
 
 pub struct ResponsesCapability;
