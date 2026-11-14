@@ -283,3 +283,24 @@ fn redacted_blocks_record_their_replay_position() {
         ]
     );
 }
+
+#[test]
+fn partial_cache_creation_update_keeps_omitted_buckets() {
+    let rows = [
+        json!({"type":"message_start","message":{"id":"r","model":"m","usage":{"input_tokens":1,"cache_creation":{"ephemeral_5m_input_tokens":1,"ephemeral_1h_input_tokens":2}}}}),
+        json!({"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"cache_creation":{"ephemeral_1h_input_tokens":3}}}),
+        json!({"type":"message_stop"}),
+    ];
+    let (_, canonical) = response(
+        &sse(&rows),
+        BodyMode::Streaming,
+        BodyMode::Streaming,
+        Operation::Generate,
+        7,
+    );
+    let last = canonical.iter().rev().find(|v| v.get("usage").is_some()).unwrap();
+    assert_eq!(
+        last["usage"]["native"]["value"]["cache_creation"],
+        json!({"ephemeral_5m_input_tokens":1,"ephemeral_1h_input_tokens":3})
+    );
+}
