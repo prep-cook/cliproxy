@@ -9,6 +9,8 @@ pub mod codec;
 pub mod gemini;
 #[path = "semantic/mod.rs"]
 mod semantic;
+#[path = "gemini/streams.rs"]
+mod streams;
 
 use codec::{
     BodyMode, Operation, RequestEgress, RequestIngress, ResponseEgress, ResponseIngress,
