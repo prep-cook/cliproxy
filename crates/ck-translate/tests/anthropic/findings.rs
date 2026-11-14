@@ -57,3 +57,10 @@ fn declared_server_tool_can_be_chosen_by_name() {
     assert_eq!(out["tool_choice"], body["tool_choice"]);
     assert_eq!(out["tools"], body["tools"]);
 }
+
+#[test]
+fn opaque_request_blocks_keep_their_cache_directive() {
+    let body = json!({"model":"m","max_tokens":10,"messages":[{"role":"user","content":[{"type":"text","text":"a"},{"type":"future_block","value":"x","cache_control":{"type":"ephemeral","ttl":"1h"}},{"type":"future_block","value":"y"}]}]});
+    let (out, _) = request(&serde_json::to_vec(&body).unwrap(), Operation::Generate);
+    assert_eq!(out["messages"], body["messages"]);
+}

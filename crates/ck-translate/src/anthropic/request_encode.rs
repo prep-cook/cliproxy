@@ -360,7 +360,7 @@ fn part_value(
     let doc = view.document;
     let kind = doc.required(part, "type")?;
     if doc.string_is(kind, "opaque")? {
-        return doc.write(doc.required(part, "value")?, e);
+        return opaque_part(doc, part, e);
     }
     e.bytes(b"{\"type\":")?;
     if doc.string_is(kind, "reasoning")? {
@@ -412,6 +412,24 @@ fn part_value(
     } else {
         doc.write(kind, e)?;
         super::member(doc, part, "text", e)?;
+    }
+    originals(doc, part, e)?;
+    e.bytes(b"}")
+}
+/// Writes an unknown block with the cache directive normalization moved to x_ck.cache_control.
+fn opaque_part(doc: &Document, part: usize, e: &mut Encoder<'_, '_>) -> Result<()> {
+    let value = doc.required(part, "value")?;
+    if !matches!(doc.node(value)?.value, Value::Object) || doc.node(value)?.first.is_none() {
+        return doc.write(value, e);
+    }
+    e.bytes(b"{")?;
+    for (index, field) in doc.children(value)?.enumerate() {
+        if index != 0 {
+            e.bytes(b",")?;
+        }
+        doc.write_name(doc.node(field)?.name.ok_or(Error::Schema)?, e)?;
+        e.bytes(b":")?;
+        doc.write(field, e)?;
     }
     originals(doc, part, e)?;
     e.bytes(b"}")
