@@ -38,6 +38,30 @@ fn terminal(reader: &mut Reader, expected: Terminal) {
 }
 
 #[test]
+fn scratch_prefix_borrows_exclude_unwritten_capacity() {
+    let (_dir, store) = store(4, 4);
+    let mut writer = store.create().unwrap();
+    let mut pending = writer.begin_scratch(FRAME_BYTES + 3).unwrap();
+    assert!(matches!(pending.chunk(0), Err(Error::InvalidPosition)));
+    pending.write(b"abc").unwrap();
+    assert_eq!(pending.chunk(0).unwrap(), b"abc");
+    assert!(matches!(pending.chunk(3), Err(Error::InvalidPosition)));
+    pending.write(&vec![7; FRAME_BYTES - 3]).unwrap();
+    pending.write(b"end").unwrap();
+    assert_eq!(pending.chunk(FRAME_BYTES - 1).unwrap(), &[7]);
+    assert_eq!(pending.chunk(FRAME_BYTES).unwrap(), b"end");
+    let frozen = pending.complete().unwrap();
+    assert_eq!(frozen.chunk(FRAME_BYTES).unwrap(), b"end");
+    drop(frozen);
+    let mut pending = writer.begin_scratch(8).unwrap();
+    pending.write(b"live").unwrap();
+    let borrowed = pending.chunk(0).unwrap();
+    writer.finish(Terminal::Gone);
+    assert_eq!(borrowed, b"live");
+    assert!(matches!(pending.chunk(0), Err(Error::Gone)));
+}
+
+#[test]
 fn scratch_and_canonical_share_frame_quota_in_both_directions() {
     for scratch_first in [false, true] {
         let (_dir, store) = store(8, 4);

@@ -72,6 +72,7 @@ mod claude_interactions;
 mod claude_responses;
 mod claude_responses_response;
 mod claude_tool_args;
+pub mod codec;
 mod codex_chat_request;
 mod codex_chat_response;
 mod codex_claude;

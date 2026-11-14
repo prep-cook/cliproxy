@@ -334,6 +334,161 @@ dependencies = [
 ]
 
 [[package]]
+name = "ck-core"
+version = "0.4.1"
+dependencies = [
+ "anyhow",
+ "base64 0.22.1",
+ "bytes",
+ "futures-util",
+ "http",
+ "serde",
+ "serde_json",
+ "serde_yaml_ng",
+ "sha2",
+ "tracing",
+ "unsafe-libyaml",
+]
+
+[[package]]
+name = "ck-differential-driver"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "axum",
+ "ck-core",
+ "ck-exec",
+ "ck-server",
+ "tokio",
+ "wreq",
+]
+
+[[package]]
+name = "ck-exec"
+version = "0.4.1"
+dependencies = [
+ "async-compression",
+ "base64 0.22.1",
+ "brotli-decompressor",
+ "btls",
+ "bytes",
+ "chrono",
+ "ck-core",
+ "ck-translate",
+ "ck-wire",
+ "flate2",
+ "futures-util",
+ "getrandom 0.3.4",
+ "gjson",
+ "http",
+ "http-body",
+ "httpdate",
+ "libc",
+ "regex",
+ "serde",
+ "serde_json",
+ "serde_yaml_ng",
+ "sha2",
+ "socket2",
+ "tiktoken-rs",
+ "tokio",
+ "tokio-tungstenite",
+ "tokio-util",
+ "tower",
+ "tracing",
+ "url",
+ "uuid",
+ "windows-sys",
+ "wreq",
+]
+
+[[package]]
+name = "ck-server"
+version = "0.4.1"
+dependencies = [
+ "anyhow",
+ "async-compression",
+ "axum",
+ "base64 0.22.1",
+ "bcrypt",
+ "btls",
+ "bytes",
+ "chrono",
+ "ck-core",
+ "ck-exec",
+ "ck-translate",
+ "ck-wire",
+ "flate2",
+ "futures-util",
+ "getrandom 0.3.4",
+ "gjson",
+ "http-body",
+ "hyper",
+ "hyper-util",
+ "libc",
+ "regex",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "serde_yaml_ng",
+ "sha2",
+ "socket2",
+ "subtle",
+ "tokio",
+ "tokio-btls",
+ "tokio-util",
+ "tower",
+ "tower-service",
+ "tracing",
+ "tracing-subscriber",
+ "url",
+ "uuid",
+ "windows-sys",
+ "wreq",
+ "zstd",
+]
+
+[[package]]
+name = "ck-stream"
+version = "0.4.1"
+dependencies = [
+ "libc",
+ "parking_lot",
+ "tokio",
+]
+
+[[package]]
+name = "ck-translate"
+version = "0.4.1"
+dependencies = [
+ "base64 0.22.1",
+ "bytes",
+ "ck-core",
+ "ck-stream",
+ "ck-wire",
+ "rand",
+ "regex",
+ "serde_json",
+ "sha2",
+ "uuid",
+]
+
+[[package]]
+name = "ck-wire"
+version = "0.4.1"
+dependencies = [
+ "base64 0.22.1",
+ "ck-core",
+ "http",
+ "memchr",
+ "ryu",
+ "serde_json",
+ "serde_yaml_ng",
+ "sha2",
+ "tokio",
+]
+
+[[package]]
 name = "clang-sys"
 version = "1.9.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -378,151 +533,6 @@ name = "core-foundation-sys"
 version = "0.8.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "773648b94d0e5d620f64f280777445740e61fe701025087ec8b57f45c791888b"
-
-[[package]]
-name = "ck-wire"
-version = "0.4.1"
-dependencies = [
- "base64 0.22.1",
- "ck-core",
- "http",
- "memchr",
- "ryu",
- "serde_json",
- "serde_yaml_ng",
- "sha2",
- "tokio",
-]
-
-[[package]]
-name = "ck-core"
-version = "0.4.1"
-dependencies = [
- "anyhow",
- "base64 0.22.1",
- "bytes",
- "futures-util",
- "http",
- "serde",
- "serde_json",
- "serde_yaml_ng",
- "sha2",
- "tracing",
- "unsafe-libyaml",
-]
-
-[[package]]
-name = "ck-differential-driver"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "axum",
- "ck-core",
- "ck-exec",
- "ck-server",
- "tokio",
- "wreq",
-]
-
-[[package]]
-name = "ck-exec"
-version = "0.4.1"
-dependencies = [
- "async-compression",
- "base64 0.22.1",
- "brotli-decompressor",
- "btls",
- "bytes",
- "chrono",
- "ck-wire",
- "ck-core",
- "ck-translate",
- "flate2",
- "futures-util",
- "getrandom 0.3.4",
- "gjson",
- "http",
- "http-body",
- "httpdate",
- "libc",
- "regex",
- "serde",
- "serde_json",
- "serde_yaml_ng",
- "sha2",
- "socket2",
- "tiktoken-rs",
- "tokio",
- "tokio-tungstenite",
- "tokio-util",
- "tower",
- "tracing",
- "url",
- "uuid",
- "windows-sys",
- "wreq",
-]
-
-[[package]]
-name = "ck-server"
-version = "0.4.1"
-dependencies = [
- "anyhow",
- "async-compression",
- "axum",
- "base64 0.22.1",
- "bcrypt",
- "btls",
- "bytes",
- "chrono",
- "ck-wire",
- "ck-core",
- "ck-exec",
- "ck-translate",
- "flate2",
- "futures-util",
- "getrandom 0.3.4",
- "gjson",
- "http-body",
- "hyper",
- "hyper-util",
- "libc",
- "regex",
- "rusqlite",
- "serde",
- "serde_json",
- "serde_yaml_ng",
- "sha2",
- "socket2",
- "subtle",
- "tokio",
- "tokio-btls",
- "tokio-util",
- "tower",
- "tower-service",
- "tracing",
- "tracing-subscriber",
- "url",
- "uuid",
- "windows-sys",
- "wreq",
- "zstd",
-]
-
-[[package]]
-name = "ck-translate"
-version = "0.4.1"
-dependencies = [
- "base64 0.22.1",
- "bytes",
- "ck-wire",
- "ck-core",
- "rand",
- "regex",
- "serde_json",
- "sha2",
- "uuid",
-]
 
 [[package]]
 name = "cpufeatures"

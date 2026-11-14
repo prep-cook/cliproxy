@@ -173,6 +173,27 @@ pub struct ScratchReservation {
 }
 
 impl ScratchReservation {
+    /// Borrow only initialized bytes, clipped to their frame boundary.
+    /// The borrow excludes appends until it ends; unwritten capacity is never readable.
+    pub fn chunk(&self, offset: usize) -> Result<&[u8], Error> {
+        let stream = &self.lease.metadata.stream;
+        if stream.invalidated.load(Ordering::Acquire) {
+            return Err(Error::Gone);
+        }
+        if offset >= self.written {
+            return Err(Error::InvalidPosition);
+        }
+        let frame_offset = offset % FRAME_BYTES;
+        let len = (self.written - offset).min(FRAME_BYTES - frame_offset);
+        // SAFETY: the reservation owns these initialized bytes. Rust excludes write's
+        // mutable borrow while this slice is live, and the reservation pins the mapping.
+        Ok(unsafe {
+            stream
+                .pool
+                .slice(self.lease.frames[offset / FRAME_BYTES], frame_offset, len)
+        })
+    }
+
     /// Append bytes within the declared length. Overrun leaves the reservation unchanged.
     pub fn write(&mut self, mut bytes: &[u8]) -> Result<(), Error> {
         let stream = &self.lease.metadata.stream;
@@ -190,8 +211,8 @@ impl ScratchReservation {
             let offset = self.written % FRAME_BYTES;
             let len = bytes.len().min(FRAME_BYTES - offset);
             let frame = self.lease.frames[self.written / FRAME_BYTES];
-            // SAFETY: this reservation exclusively owns these frames; no immutable lease
-            // escapes before complete. Bounds exclude unwritten bytes from the completed lease.
+            // SAFETY: this reservation exclusively owns these frames; mutable access
+            // excludes prefix borrows, and writes only extend the initialized prefix.
             unsafe { stream.pool.write(frame, offset, &bytes[..len]) };
             self.written += len;
             bytes = &bytes[len..];

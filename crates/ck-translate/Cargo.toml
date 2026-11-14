@@ -17,6 +17,7 @@ base64 = "0.22"
 bytes.workspace = true
 ck-wire.workspace = true
 ck-core.workspace = true
+ck-stream.workspace = true
 serde_json.workspace = true
 sha2 = "0.10"
 rand = "0.9"

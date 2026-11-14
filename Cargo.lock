@@ -775,6 +775,7 @@ dependencies = [
  "base64 0.22.1",
  "bytes",
  "ck-core",
+ "ck-stream",
  "ck-wire",
  "rand 0.9.5",
  "regex",

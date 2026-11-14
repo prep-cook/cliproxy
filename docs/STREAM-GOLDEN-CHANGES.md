@@ -16,6 +16,25 @@ A fixture ID is its repository path plus its recorded `name` and occurrence inde
 
 No fixture expectations change in Phase A. Later rows must include a test name, command/result and commit, or an explicit unsupported-operation reason. Empty output, a missing registry arm and a skipped test are not semantic passes. Existing `golden.rs::PENDING` entries remain input obligations; they are not accepted losses.
 
+## Chat reference checkpoints
+
+The old pair registry and its goldens remain unchanged until integration cutover. These new boundary tests prove individual Chat contracts, not full reference-codec acceptance.
+
+| Test in `crates/ck-translate/tests/chat_codec.rs` | Contract and observed result | Commit |
+| --- | --- | --- |
+| `completed_request_fields_and_messages_publish_before_the_body_ends` | Completed root fields and messages publish before EOF; parent containers precede children and pointers are assigned once. | `1405cb20` |
+| `late_destination_rejection_keeps_published_prefix_without_success` | A late unsupported semantic preserves the canonical prefix but emits no request.end or done and authorizes no upstream body. | `1405cb20` |
+| `completed_message_media_is_available_before_later_request_fields` | Media for a completed message is available before later root fields arrive. This does not prove flushing inside an unfinished media string. | `1405cb20` |
+| `request_controls::native_controls_custom_declarations_and_nullable_values_survive_fence` | Native nullable controls, custom declarations and simultaneous sampling values survive the capability fence. | `04b6c056` |
+| `request_controls::late_invalid_native_semantics_never_publish_request_end` | Invalid late native controls cannot authorize upstream encoding. | `04b6c056` |
+| `response_media::native_audio_fragments_reassemble_across_every_base64_boundary` | Native audio reconstructs exact decoded bytes across source-event quartet boundaries in both downstream modes. | `04b6c056` |
+| `response_media::unfinished_native_audio_cannot_publish_successful_choice_finish` | An unfinished audio quartet produces an error without successful item or response completion. | `04b6c056` |
+
+At `1405cb20`, fmt check, clippy with warnings denied, and `cargo nextest run -p ck-translate -p ck-stream --locked --no-fail-fast` passed: 149 tests passed, one existing storage test skipped. Unfinished-string/media publication, full Chat media/provenance/usage/terminal coverage and final independent review remain acceptance obligations.
+
+At `04b6c056`, the same fmt, clippy and two-crate nextest gates passed: 170 tests passed, one existing storage test skipped. The intervening media checkpoint also covers structured content, native media, recursive response provenance, usage details and malformed terminals. Full acceptance still requires unfinished-string publication/source retirement, complete request controls and provenance, final-snapshot reconciliation, stable logical-media identity, mutation/deletion semantics and independent final-tree review.
+
+
 ## Registry inventory: 30 arms
 
 Source: `crates/ck-translate/src/lib.rs:283-315`. Each row names one current `(client, upstream)` arm, not a new pair API. `openai` means Chat; `openai-response` means Responses; `codex` and `antigravity` name wire envelopes, not extra client routes.
