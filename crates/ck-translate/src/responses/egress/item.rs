@@ -313,12 +313,15 @@ impl<F: FnMut(&'static str, u64)> Egress<F> {
             None => doc.set(part, "annotations", Value::Array)?,
         };
         let value = doc.required(node, "value")?;
+        let position = doc.children(annotations)?.count();
         doc.detach(node, value)?;
         doc.append(annotations, value)?;
         let payload = encode::scratch(owner, |e| {
             item_fields(doc, item, index, e)?;
             e.bytes(b",\"content_index\":")?;
             e.unsigned(block)?;
+            e.bytes(b",\"annotation_index\":")?;
+            e.unsigned(position as u64)?;
             e.bytes(b",\"annotation\":")?;
             doc.write(value, e)
         })?;

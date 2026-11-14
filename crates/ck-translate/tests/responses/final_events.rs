@@ -1,4 +1,5 @@
 //! Final codec review, continued: event classification, terminal snapshots and native schemas.
+use super::cross::client_events;
 use super::final_review::{try_raw, try_streamed};
 use super::*;
 
@@ -150,4 +151,84 @@ fn closing_parts_reconcile_nested_members() {
     assert_eq!(serde_json::from_slice::<Value>(&out).unwrap()["output"][0], item);
     // The later value replaces the started one rather than adding a duplicate key.
     assert_eq!(String::from_utf8_lossy(&out).matches("\"vendor\"").count(), 1);
+}
+
+#[test]
+fn failure_and_annotation_events_follow_the_native_schemas() {
+    let created =
+        json!({"type":"response.created","response":{"id":"r","model":"m","status":"in_progress","output":[]}});
+    let records = [
+        created.clone(),
+        json!({"type":"response.output_item.added","output_index":0,
+            "item":{"id":"i","type":"message","role":"assistant","content":[]}}),
+        json!({"type":"response.content_part.added","output_index":0,"item_id":"i","content_index":0,
+            "part":{"type":"output_text","text":"","annotations":[]}}),
+        json!({"type":"response.output_text.delta","output_index":0,"item_id":"i","content_index":0,"delta":"hi"}),
+        json!({"type":"response.failed","response":{"id":"r","status":"failed"}}),
+    ];
+    for mode in [BodyMode::Streaming, BodyMode::Buffered] {
+        let mut m = Mapped::new();
+        let mut ingress = responses::response::Ingress::new(
+            &mut m.writer,
+            identity(Direction::Response),
+            Operation::Generate,
+            BodyMode::Streaming,
+            1024 * 1024,
+        )
+        .unwrap();
+        let mut reader = m.store.reader(m.writer.id(), 0).unwrap();
+        let mut egress = responses::egress::Egress::new(
+            &mut m.writer,
+            identity(Direction::Response),
+            Operation::Generate,
+            mode,
+            |_, _| {},
+        )
+        .unwrap();
+        let _ = ingress
+            .advance(&mut m.writer, wire(&records).as_bytes())
+            .and_then(|()| ingress.finish(&mut m.writer));
+        let mut out = Vec::new();
+        while let std::task::Poll::Ready(Some(ck_stream::Read::Record(lease))) = reader.try_next() {
+            egress
+                .advance(&mut m.writer, lease, |chunk| {
+                    out.extend_from_slice(&bytes(&chunk));
+                    Ok(())
+                })
+                .unwrap();
+        }
+        let response = match mode {
+            BodyMode::Streaming => {
+                let events = client_events(&out);
+                let failed = events.last().unwrap();
+                assert_eq!(failed["type"], "response.failed");
+                assert_eq!(failed["sequence_number"], events.len() as u64 - 1);
+                failed["response"].clone()
+            }
+            _ => serde_json::from_slice::<Value>(&out).unwrap(),
+        };
+        assert_eq!(response["id"], "r");
+        assert_eq!(response["object"], "response");
+        assert_eq!(response["status"], "failed");
+        assert!(response["error"]["code"].is_string() && response["error"]["message"].is_string());
+    }
+    let citation = |i: u64| json!({"type":"url_citation","url":format!("https://e/{i}"),"title":"t","start_index":0,"end_index":1});
+    let text = json!({"id":"r","status":"completed","output":[{"id":"i","type":"message","role":"assistant",
+        "content":[{"type":"output_text","text":"hi","annotations":[citation(0),citation(1)]}]}]});
+    let (out, _) = response(
+        text.to_string().as_bytes(),
+        BodyMode::Buffered,
+        BodyMode::Streaming,
+        Operation::Generate,
+    );
+    let events = client_events(&out);
+    let added: Vec<_> = events
+        .iter()
+        .filter(|e| e["type"] == "response.output_text.annotation.added")
+        .collect();
+    assert_eq!(added.len(), 2);
+    for (i, event) in added.iter().enumerate() {
+        assert_eq!(event["annotation_index"], i as u64);
+        assert_eq!(event["annotation"], citation(i as u64));
+    }
 }

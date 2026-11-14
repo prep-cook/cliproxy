@@ -1,24 +1,34 @@
 use super::*;
 
 impl<F: FnMut(&'static str, u64)> Egress<F> {
-    /// Ends the response with the sanitized failure record.
+    /// Ends the response as failed: the response with a sanitized error, as the body in buffered
+    /// mode and in a `response.failed` event when streaming.
     pub(super) fn failed(
         &mut self,
         owner: &mut Writer,
         output: &mut impl FnMut(ScratchLease) -> Result<()>,
     ) -> Result<()> {
         self.terminal = true;
-        let failed = encode::scratch(owner, |e| {
-            if self.mode == BodyMode::Streaming {
-                e.bytes(b"event: response.failed\ndata: ")?;
-            }
-            e.bytes(b"{\"type\":\"response.failed\",\"error\":{\"code\":\"upstream_error\",\"message\":\"Response failed\"}}")?;
-            if self.mode == BodyMode::Streaming {
-                e.bytes(b"\n\n")?;
-            }
-            Ok(())
-        })?;
-        output(failed)
+        let doc = &mut self.document;
+        let root = doc.root();
+        doc.set(root, "status", Value::Text("failed"))?;
+        let error = doc.set(root, "error", Value::Object)?;
+        doc.set(error, "code", Value::Text("upstream_error"))?;
+        doc.set(error, "message", Value::Text("Response failed"))?;
+        order_array(doc, doc.required(root, "output")?, "output_index", owner)?;
+        let response = encode::scratch(owner, |e| write_response(doc, e))?;
+        if self.mode == BodyMode::Buffered {
+            return output(response);
+        }
+        self.emit(
+            owner,
+            "response.failed",
+            |e| {
+                e.bytes(b",\"response\":")?;
+                write_lease(&response, e)
+            },
+            output,
+        )
     }
 
     /// Publishes `response.created` with the restored native identity.
