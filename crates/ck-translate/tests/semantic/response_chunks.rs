@@ -1,0 +1,248 @@
+//! Chat ingress collects small network reads of media and long strings into shared data
+//! records, and buffered and streamed responses open their blocks in the same order.
+use super::{
+    ChatCapability, Direction, Ingress, Mapped, Operation, RequestIngress, canonical_values, codec, identity,
+    response_fragmented,
+};
+use base64::Engine;
+use codec::{BodyMode, ResponseIngress};
+use serde_json::{Value, json};
+
+/// Input bytes a data record collects before it publishes (docs/INTERNAL-STREAM.md, §3.4).
+const THRESHOLD: usize = 28_672;
+
+fn buffered(mapped: &mut Mapped) -> codec::chat::response::Ingress {
+    codec::chat::response::Ingress::new(
+        &mut mapped.writer,
+        &mapped.store,
+        identity(Direction::Response),
+        Operation::Generate,
+        BodyMode::Buffered,
+        1024 * 1024,
+    )
+    .unwrap()
+}
+
+/// Data records in publication order, checked for consecutive indexes and offsets, and their
+/// decoded bytes.
+fn data_records(mapped: &Mapped) -> (usize, Vec<u8>) {
+    let events = canonical_values(mapped);
+    let data: Vec<&Value> = events.iter().filter(|event| event["bytes"].is_string()).collect();
+    let mut bytes = Vec::new();
+    for (index, event) in data.iter().enumerate() {
+        assert_eq!(event["index"], index);
+        assert_eq!(event["offset"], bytes.len());
+        bytes.extend(
+            base64::engine::general_purpose::STANDARD
+                .decode(event["bytes"].as_str().unwrap())
+                .unwrap(),
+        );
+    }
+    (data.len(), bytes)
+}
+
+fn image_body(encoded: &str) -> String {
+    json!({"id":"r","model":"m","created":1,"choices":[{"index":0,"message":{"role":"assistant",
+        "content":[{"type":"image_url","image_url":{"url":format!("data:image/png;base64,{encoded}")}}]},
+        "finish_reason":"stop"}]})
+    .to_string()
+}
+
+/// An 80 KB image read 13 bytes at a time fits a 16-frame pool: its reads share data records
+/// instead of costing a frame-aligned record each.
+#[test]
+fn buffered_image_in_small_reads_shares_data_records() {
+    let raw: Vec<u8> = (0..80_000).map(|index| (index % 251) as u8).collect();
+    let encoded = base64::engine::general_purpose::STANDARD.encode(&raw);
+    let mut mapped = Mapped::configured(std::sync::Arc::new(ck_stream::ManualClock::default()), 16);
+    let mut ingress = buffered(&mut mapped);
+    for piece in image_body(&encoded).as_bytes().chunks(13) {
+        ingress.advance(&mut mapped.writer, piece).unwrap();
+    }
+    ingress.finish(&mut mapped.writer).unwrap();
+    let (records, bytes) = data_records(&mapped);
+    assert_eq!(bytes, raw);
+    assert!(
+        records <= encoded.len().div_ceil(THRESHOLD) + 1,
+        "{records} data records"
+    );
+    let end = canonical_values(&mapped)
+        .into_iter()
+        .find(|event| event["status"] == "completed")
+        .unwrap();
+    assert_eq!(end["bytes"], raw.len());
+}
+
+/// Held media input reports a deadline at most 100 ms after collection starts, which later
+/// input does not move; a flush publishes the complete base64 quartets and keeps a split one
+/// for the next read.
+#[test]
+fn held_media_input_has_a_deadline_and_flushes_split_quartets() {
+    let raw: Vec<u8> = (0..3000).map(|index| (index % 251) as u8).collect();
+    let encoded = base64::engine::general_purpose::STANDARD.encode(&raw);
+    let body = image_body(&encoded);
+    let start = body.find("base64,").unwrap() + "base64,".len();
+    // Stop two characters into a quartet, then one more character, so a quartet stays split.
+    let (first, rest) = body.split_at(start + 2002);
+    let (second, rest) = rest.split_at(1);
+    let mut mapped = Mapped::new();
+    let mut ingress = buffered(&mut mapped);
+    let began = std::time::Instant::now();
+    ingress.advance(&mut mapped.writer, first.as_bytes()).unwrap();
+    let deadline = ingress.flush_deadline().unwrap();
+    assert!(deadline > began && deadline <= std::time::Instant::now() + std::time::Duration::from_millis(100));
+    ingress.advance(&mut mapped.writer, second.as_bytes()).unwrap();
+    assert_eq!(ingress.flush_deadline(), Some(deadline));
+    assert_eq!(data_records(&mapped).0, 0);
+    ingress.flush(&mut mapped.writer).unwrap();
+    assert!(ingress.flush_deadline().is_none());
+    assert_eq!(data_records(&mapped), (1, raw[..1500].to_vec()));
+    // A read after the deadline publishes without an explicit flush.
+    let (third, rest) = rest.split_at(5);
+    ingress.advance(&mut mapped.writer, third.as_bytes()).unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(101));
+    let (fourth, rest) = rest.split_at(1);
+    ingress.advance(&mut mapped.writer, fourth.as_bytes()).unwrap();
+    assert_eq!(data_records(&mapped), (2, raw[..1506].to_vec()));
+    // The string's end publishes before the body ends.
+    ingress.advance(&mut mapped.writer, rest.as_bytes()).unwrap();
+    assert_eq!(data_records(&mapped), (3, raw));
+    ingress.finish(&mut mapped.writer).unwrap();
+}
+
+/// Held input the scanner validated is published once, without a media close, before a terminal
+/// error ends the response, and the error leaves no flush deadline.
+#[test]
+fn held_media_input_publishes_before_a_terminal_error() {
+    for terminal in [None, Some(&br"\uDC00"[..])] {
+        let mut mapped = Mapped::new();
+        let mut ingress = buffered(&mut mapped);
+        ingress
+            .advance(
+                &mut mapped.writer,
+                br#"{"choices":[{"index":0,"message":{"audio":{"data":"AAEC"#,
+            )
+            .unwrap();
+        assert!(ingress.flush_deadline().is_some());
+        let result = match terminal {
+            Some(bytes) => ingress.advance(&mut mapped.writer, bytes),
+            None => ingress.finish(&mut mapped.writer),
+        };
+        assert!(result.is_err());
+        assert!(ingress.flush_deadline().is_none());
+        assert_eq!(data_records(&mapped), (1, vec![0, 1, 2]));
+        let events = canonical_values(&mapped);
+        assert!(!events.iter().any(|event| event["status"] == "completed"));
+        assert!(events.iter().any(|event| event["code"] == "stream.invalid_input"));
+    }
+}
+
+/// A streamed request string publishes its held input before a terminal error in the same way.
+#[test]
+fn held_request_string_publishes_before_a_terminal_error() {
+    for terminal in [None, Some(&br"\uDC00"[..])] {
+        let mut mapped = Mapped::new();
+        let mut ingress = Ingress::new(
+            &mut mapped.writer,
+            &mapped.store,
+            identity(Direction::Request),
+            Operation::Generate,
+            100_000,
+        )
+        .unwrap();
+        let mut prefix = br#"{"model":"m","messages":[{"role":"user","content":""#.to_vec();
+        prefix.extend(std::iter::repeat_n(b'a', 2048));
+        ingress.advance(&mut mapped.writer, &prefix).unwrap();
+        assert!(ingress.flush_deadline().is_some());
+        let failed = match terminal {
+            Some(bytes) => ingress.advance(&mut mapped.writer, bytes).is_err(),
+            None => ingress.finish(&mut mapped.writer, &ChatCapability).is_err(),
+        };
+        assert!(failed);
+        assert!(ingress.flush_deadline().is_none());
+        assert_eq!(data_records(&mapped), (1, vec![b'a'; 2048]));
+        let events = canonical_values(&mapped);
+        assert!(!events.iter().any(|event| event["status"] == "completed"));
+    }
+}
+
+/// Kinds of the content blocks the canonical stream opens, in order.
+fn block_order(events: &[Value]) -> Vec<String> {
+    events
+        .iter()
+        .filter(|event| {
+            event["x_ck"].get("block_index").is_some()
+                && event["x_ck"].get("media_id").is_none()
+                && event["kind"].is_string()
+        })
+        .map(|event| event["kind"].as_str().unwrap().to_owned())
+        .collect()
+}
+
+/// Buffered ingress opens reasoning before the answer, as streamed ingress does, whatever the
+/// member order: short reasoning after short content, long reasoning published while the body
+/// arrives, and short reasoning before a long content published while the body arrives.
+#[test]
+fn buffered_and_streamed_reasoning_open_blocks_in_the_same_order() {
+    let long_content = "a".repeat(2048);
+    let long_reasoning = "r".repeat(2048);
+    for (message, reasoning, content) in [
+        (
+            json!({"role":"assistant","content":"answer","reasoning_content":"think"}),
+            "think",
+            "answer",
+        ),
+        (
+            json!({"role":"assistant","content":"answer","reasoning_content":long_reasoning}),
+            long_reasoning.as_str(),
+            "answer",
+        ),
+        (
+            json!({"role":"assistant","reasoning_content":"think","content":long_content}),
+            "think",
+            long_content.as_str(),
+        ),
+    ] {
+        let body =
+            json!({"id":"r","model":"m","created":1,"choices":[{"index":0,"message":message,"finish_reason":"stop"}]});
+        let (output, buffered) =
+            response_fragmented(body.to_string().as_bytes(), BodyMode::Buffered, BodyMode::Buffered, 13);
+        let output: Value = serde_json::from_slice(&output).unwrap();
+        assert_eq!(output["choices"][0]["message"]["reasoning_content"], reasoning);
+        assert_eq!(output["choices"][0]["message"]["content"], content);
+        let chunk = |delta: Value, finish: Value| json!({"id":"r","model":"m","created":1,"choices":[{"index":0,"delta":delta,"finish_reason":finish}]});
+        let stream = format!(
+            "data: {}\n\ndata: {}\n\ndata: {}\n\ndata: [DONE]\n\n",
+            chunk(json!({"role":"assistant","reasoning_content":reasoning}), Value::Null),
+            chunk(json!({"content":content}), Value::Null),
+            chunk(json!({}), json!("stop")),
+        );
+        let (_, streamed) = response_fragmented(stream.as_bytes(), BodyMode::Streaming, BodyMode::Buffered, 13);
+        assert_eq!(block_order(&streamed), ["thinking", "text"]);
+        assert_eq!(block_order(&buffered), block_order(&streamed), "{message}");
+    }
+}
+
+/// Reasoning published ahead of one long answer field is not published again ahead of the next.
+#[test]
+fn early_reasoning_is_published_once_before_several_long_fields() {
+    let content = "a".repeat(2048);
+    let refusal = "r".repeat(2048);
+    let message = json!({"role":"assistant","reasoning_content":"think","content":content,"refusal":refusal});
+    let body =
+        json!({"id":"r","model":"m","created":1,"choices":[{"index":0,"message":message,"finish_reason":"stop"}]});
+    for piece in [13, 8192] {
+        let (output, buffered) = response_fragmented(
+            body.to_string().as_bytes(),
+            BodyMode::Buffered,
+            BodyMode::Buffered,
+            piece,
+        );
+        let output: Value = serde_json::from_slice(&output).unwrap();
+        let message = &output["choices"][0]["message"];
+        assert_eq!(message["reasoning_content"], "think", "{piece}-byte pieces");
+        assert_eq!(message["content"], content.as_str());
+        assert_eq!(message["refusal"], refusal.as_str());
+        assert_eq!(block_order(&buffered).first().map(String::as_str), Some("thinking"));
+    }
+}

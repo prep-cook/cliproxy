@@ -301,7 +301,7 @@ fn normalize_message(
         let calls = doc.set(m, "tool_calls", Value::Array)?;
         let call = doc.add(None, Value::Object)?;
         doc.append(calls, call)?;
-        doc.set(call, "id", Value::Id(media::local_id(b'l', m as u64)?))?;
+        doc.set_id(call, "id", media::local_id(b'l', m as u64)?)?;
         doc.set(call, "type", Value::Text("function"))?;
         doc.rename(function, "function")?;
         doc.append(call, function)?;

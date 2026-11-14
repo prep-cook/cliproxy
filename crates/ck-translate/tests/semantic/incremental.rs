@@ -323,8 +323,8 @@ fn buffered_response_collects_unfinished_file_data() {
     }
 }
 
-/// Feeds a buffered response whose message stops inside a media payload, checks that the
-/// payload's data is published before the body ends and that nothing succeeds early, then
+/// Feeds a buffered response whose message stops inside a media payload, checks that a flush
+/// publishes the payload's data before the body ends and that nothing succeeds early, then
 /// completes the body. Returns the buffered output and the canonical records of the prefix.
 fn buffered_unfinished_media(
     opening: &str,
@@ -358,6 +358,8 @@ fn buffered_unfinished_media(
     let begin = std::time::Instant::now();
     ingress.advance(&mut mapped.writer, prefix.as_bytes()).unwrap();
     assert!(begin.elapsed() < std::time::Duration::from_millis(100));
+    assert!(ingress.flush_deadline().is_some());
+    ingress.flush(&mut mapped.writer).unwrap();
     let published = canonical_values(&mapped);
     assert!(
         published

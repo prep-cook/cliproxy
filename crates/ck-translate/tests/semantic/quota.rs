@@ -49,19 +49,19 @@ fn messages(n: usize, message: impl Fn(usize) -> String) -> String {
 #[test]
 fn fragmented_long_messages_fit_the_default_quota() {
     let content = "a".repeat(2048);
-    let input = messages(8, |_| format!(r#"{{"role":"user","content":"{content}"}}"#));
+    let input = messages(512, |_| format!(r#"{{"role":"user","content":"{content}"}}"#));
     fits(&input, 16).unwrap();
 }
 
 #[test]
 fn plain_messages_fit_the_default_quota() {
-    let input = messages(128, |_| r#"{"role":"user","content":"hi"}"#.into());
+    let input = messages(1024, |_| r#"{"role":"user","content":"hi"}"#.into());
     fits(&input, 1 << 20).unwrap();
 }
 
 #[test]
 fn metadata_keys_fit_the_default_quota() {
-    let keys: Vec<_> = (0..512).map(|i| format!(r#""k{i}":"v""#)).collect();
+    let keys: Vec<_> = (0..4096).map(|i| format!(r#""k{i}":"v""#)).collect();
     let input = format!(
         r#"{{"model":"m","metadata":{{{}}},"messages":[{{"role":"user","content":"hi"}}]}}"#,
         keys.join(",")
@@ -72,7 +72,7 @@ fn metadata_keys_fit_the_default_quota() {
 /// Call and result rounds: an assistant tool call and its tool result per round.
 #[test]
 fn tool_rounds_fit_the_default_quota() {
-    let input = messages(32, |i| {
+    let input = messages(256, |i| {
         format!(
             r#"{{"role":"assistant","content":null,"tool_calls":[{{"id":"call_{i}","type":"function","function":{{"name":"f","arguments":"{{}}"}}}}]}},{{"role":"tool","tool_call_id":"call_{i}","content":"ok"}}"#
         )
@@ -83,6 +83,6 @@ fn tool_rounds_fit_the_default_quota() {
 /// Each message carries an unknown member, which the request preserves as its own field.
 #[test]
 fn messages_with_unknown_members_fit_the_default_quota() {
-    let input = messages(150, |i| format!(r#"{{"role":"user","content":"hi","x_vendor":{i}}}"#));
+    let input = messages(1200, |i| format!(r#"{{"role":"user","content":"hi","x_vendor":{i}}}"#));
     fits(&input, 1 << 20).unwrap();
 }

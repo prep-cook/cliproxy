@@ -1,11 +1,5 @@
+use super::super::{FLUSH_DELAY, HELD_BYTES};
 use super::*;
-
-/// Input held per data record, counting an incomplete scalar or escape. Advance feeds at most
-/// 8,192 bytes between steps, and decoding never grows bytes, so held input plus one step stays
-/// within a 36,864-byte decoded chunk.
-const HELD_BYTES: u64 = 36_864 - 8_192;
-/// Collection delay of held input (docs/INTERNAL-STREAM.md, §3.4).
-pub(super) const FLUSH_DELAY: std::time::Duration = std::time::Duration::from_millis(100);
 
 impl Ingress {
     pub(super) fn string_format(
@@ -187,6 +181,36 @@ impl Ingress {
             self.release_string_input(wire)?;
         }
         Ok(())
+    }
+
+    /// Feeds `bytes` to the scanner, or finishes it at the body end. When the step fails, held
+    /// string input the scanner validated before it is published, without ending the string,
+    /// before the error returns; a failed scanner no longer reports positions.
+    pub(super) fn scan(&mut self, owner: &mut Writer, bytes: Option<&[u8]>) -> Result<()> {
+        let scanner = self.scanner.as_ref().ok_or(Error::Closed)?;
+        let held = match &self.string {
+            Some(pending) => Some(scanner.pending_node(self.document.input(), pending.wire)?),
+            None => None,
+        };
+        let result = match bytes {
+            Some(bytes) => self.document.push_input(owner, bytes).and_then(|_| {
+                self.scanner
+                    .as_mut()
+                    .ok_or(Error::Closed)?
+                    .advance_document(&self.document)
+            }),
+            None => self
+                .scanner
+                .as_mut()
+                .ok_or(Error::Closed)?
+                .finish(self.document.input()),
+        };
+        if result.is_err()
+            && let Some(wire) = held
+        {
+            self.append_string(owner, wire, true)?;
+        }
+        result
     }
 
     /// Retires input that the string has published and nothing else still names: everything

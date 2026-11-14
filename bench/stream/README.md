@@ -39,7 +39,7 @@ The total-cap row acquires an active lease after every frame append and retains 
 
 ## Default metadata constraint
 
-The production default metadata limit remains 1 MiB. Consecutive records with identical length, stride, type and correlation share a bounded run index; heterogeneous records still consume individual entries. The heap comparator keeps the same kind of run index: consecutive records of one length at one stride share an entry. Both backends retain identical 50,000-byte payload frames and complete-record semantics. If either workload fails, the benchmark records the byte offset and counters, returns nonzero and still attempts subsequent rows. It never raises `max_metadata_bytes`, releases response prefixes or substitutes another pool to make a row run.
+The production default metadata limit is 8 MiB (1 MiB before 2026-11-15). Consecutive records with identical length, stride, type and correlation share a bounded run index; heterogeneous records still consume individual entries. The heap comparator keeps the same kind of run index: consecutive records of one length at one stride share an entry. Both backends retain identical 50,000-byte payload frames and complete-record semantics. If either workload fails, the benchmark records the byte offset and counters, returns nonzero and still attempts subsequent rows. It never raises `max_metadata_bytes`, releases response prefixes or substitutes another pool to make a row run.
 
 ## Startup reserve diagnostics
 
