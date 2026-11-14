@@ -1,9 +1,5 @@
 use super::*;
 
-fn wire(records: &[Value]) -> String {
-    records.iter().map(|record| format!("data: {record}\n\n")).collect()
-}
-
 #[test]
 fn native_server_execution_preserves_results_and_distinct_tool_identity() {
     let input = json!({"id":"r","model":"m","status":"completed","output":[

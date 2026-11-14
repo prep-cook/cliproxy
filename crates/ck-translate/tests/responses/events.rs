@@ -1,9 +1,5 @@
 use super::*;
 
-fn wire(records: &[Value]) -> String {
-    records.iter().map(|r| format!("data: {r}\n\n")).collect()
-}
-
 fn streamed(records: &[Value]) -> (Value, Vec<Value>) {
     let (out, events) = response(
         wire(records).as_bytes(),

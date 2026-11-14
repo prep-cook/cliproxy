@@ -72,35 +72,8 @@ fn go_responses_requests_preserve_sampling_roles_and_unknowns() {
             let input = parsed.unwrap();
             let Ok(encoded) = result else {
                 // Historical malformed tool arguments and unlinked results now fail the fence.
-                let invalid_history = input["input"].as_array().is_some_and(|items| {
-                    items.iter().any(|item| {
-                        (item["type"] == "function_call"
-                            && item
-                                .get("arguments")
-                                .is_some_and(|a| a.as_str().is_none_or(|s| serde_json::from_str::<Value>(s).is_err())))
-                            || ((item["type"] == "function_call_output" || item["type"] == "custom_tool_call_output")
-                                && !items.iter().any(|call| {
-                                    (call["type"] == "function_call" || call["type"] == "custom_tool_call")
-                                        && call["call_id"] == item["call_id"]
-                                }))
-                            || ((item["type"] == "function_call_output" || item["type"] == "custom_tool_call_output")
-                                && ((!item["output"].is_string() && !item["output"].is_array())
-                                    || item["output"].as_array().is_some_and(|parts| {
-                                        parts.iter().any(|part| {
-                                            !part["type"].is_string()
-                                                || (part["type"] == "input_image"
-                                                    && part.get("image_url").is_some_and(|url| !url.is_string()))
-                                        })
-                                    })))
-                            || ["content", "output"].iter().any(|field| {
-                                item[*field]
-                                    .as_array()
-                                    .is_some_and(|parts| parts.iter().any(invalid_part))
-                            })
-                    })
-                });
                 assert!(
-                    invalid_history,
+                    invalid_history(&input),
                     "{group}/{} unexpectedly failed: {:?}",
                     fixture["name"],
                     result.err()
@@ -109,32 +82,7 @@ fn go_responses_requests_preserve_sampling_roles_and_unknowns() {
             };
             let output: Value = serde_json::from_slice(&bytes(&encoded)).unwrap();
             accepted += 1;
-            for field in [
-                "model",
-                "temperature",
-                "top_p",
-                "metadata",
-                "store",
-                "user",
-                "service_tier",
-                "parallel_tool_calls",
-                "prompt_cache_retention",
-                "instructions",
-            ] {
-                if let Some(value) = input.get(field) {
-                    assert_eq!(output.get(field), Some(value), "{group}/{}: {field}", fixture["name"]);
-                }
-            }
-            if let Some(items) = input["input"].as_array() {
-                let roles: Vec<_> = items.iter().filter_map(|item| item.get("role")).collect();
-                let output_roles: Vec<_> = output["input"]
-                    .as_array()
-                    .unwrap()
-                    .iter()
-                    .filter_map(|item| item.get("role"))
-                    .collect();
-                assert_eq!(output_roles, roles, "{group}/{} roles", fixture["name"]);
-            }
+            assert_preserved(group, &fixture["name"], &input, &output);
             let emitted = events(&m);
             assert_eq!(emitted.last().unwrap()["x_ck"]["direction"], "request");
             assert_eq!(output["stream"], false);
@@ -214,4 +162,66 @@ fn unique_keys(raw: &str) -> bool {
         at += 1;
     }
     true
+}
+
+/// True when a recorded request carries history the fence now refuses: malformed tool
+/// arguments, unlinked or malformed tool outputs, or an invalid content part.
+fn invalid_history(input: &Value) -> bool {
+    input["input"].as_array().is_some_and(|items| {
+        items.iter().any(|item| {
+            (item["type"] == "function_call"
+                && item
+                    .get("arguments")
+                    .is_some_and(|a| a.as_str().is_none_or(|s| serde_json::from_str::<Value>(s).is_err())))
+                || ((item["type"] == "function_call_output" || item["type"] == "custom_tool_call_output")
+                    && !items.iter().any(|call| {
+                        (call["type"] == "function_call" || call["type"] == "custom_tool_call")
+                            && call["call_id"] == item["call_id"]
+                    }))
+                || ((item["type"] == "function_call_output" || item["type"] == "custom_tool_call_output")
+                    && ((!item["output"].is_string() && !item["output"].is_array())
+                        || item["output"].as_array().is_some_and(|parts| {
+                            parts.iter().any(|part| {
+                                !part["type"].is_string()
+                                    || (part["type"] == "input_image"
+                                        && part.get("image_url").is_some_and(|url| !url.is_string()))
+                            })
+                        })))
+                || ["content", "output"].iter().any(|field| {
+                    item[*field]
+                        .as_array()
+                        .is_some_and(|parts| parts.iter().any(invalid_part))
+                })
+        })
+    })
+}
+
+/// Asserts that the sampling fields, instructions and input roles of `input` reach `output`.
+fn assert_preserved(group: &str, name: &Value, input: &Value, output: &Value) {
+    for field in [
+        "model",
+        "temperature",
+        "top_p",
+        "metadata",
+        "store",
+        "user",
+        "service_tier",
+        "parallel_tool_calls",
+        "prompt_cache_retention",
+        "instructions",
+    ] {
+        if let Some(value) = input.get(field) {
+            assert_eq!(output.get(field), Some(value), "{group}/{}: {field}", name);
+        }
+    }
+    if let Some(items) = input["input"].as_array() {
+        let roles: Vec<_> = items.iter().filter_map(|item| item.get("role")).collect();
+        let output_roles: Vec<_> = output["input"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|item| item.get("role"))
+            .collect();
+        assert_eq!(output_roles, roles, "{group}/{} roles", name);
+    }
 }

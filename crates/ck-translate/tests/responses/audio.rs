@@ -1,10 +1,6 @@
 use super::*;
 use base64::Engine;
 
-fn wire(records: &[Value]) -> String {
-    records.iter().map(|record| format!("data: {record}\n\n")).collect()
-}
-
 #[test]
 fn audio_fragments_transcript_and_buffered_extension_preserve_exact_payloads() {
     let native = json!({"id":"r","model":"m","status":"completed","output":[],"audio":{"data":"AAECAwQF","transcript":"hello é","mime_type":"audio/wav","expires_at":12}});
@@ -53,36 +49,7 @@ fn audio_fragments_transcript_and_buffered_extension_preserve_exact_payloads() {
                     assert!(audio.get("mime_type").is_none());
                 }
             } else {
-                let records: Vec<Value> = std::str::from_utf8(&output)
-                    .unwrap()
-                    .lines()
-                    .filter_map(|line| line.strip_prefix("data: "))
-                    .map(|line| serde_json::from_str(line).unwrap())
-                    .collect();
-                let decoded: Vec<u8> = records
-                    .iter()
-                    .filter(|event| event["type"] == "response.audio.delta")
-                    .flat_map(|event| {
-                        base64::engine::general_purpose::STANDARD
-                            .decode(event["delta"].as_str().unwrap())
-                            .unwrap()
-                    })
-                    .collect();
-                assert_eq!(decoded, [0, 1, 2, 3, 4, 5]);
-                assert_eq!(
-                    records
-                        .iter()
-                        .filter(|event| event["type"] == "response.audio.done")
-                        .count(),
-                    1
-                );
-                assert_eq!(
-                    records
-                        .iter()
-                        .filter(|event| event["type"] == "response.audio.transcript.done")
-                        .count(),
-                    1
-                );
+                assert_streamed_audio(&output);
             }
         }
     }
@@ -184,5 +151,40 @@ fn transcript_only_buffered_audio_does_not_invent_data() {
         canonical
             .iter()
             .any(|event| event["timing"] == input["audio"]["timing"])
+    );
+}
+
+/// Asserts that a streamed client response carries the audio bytes and one done event each
+/// for the audio and its transcript.
+fn assert_streamed_audio(output: &[u8]) {
+    let records: Vec<Value> = std::str::from_utf8(output)
+        .unwrap()
+        .lines()
+        .filter_map(|line| line.strip_prefix("data: "))
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    let decoded: Vec<u8> = records
+        .iter()
+        .filter(|event| event["type"] == "response.audio.delta")
+        .flat_map(|event| {
+            base64::engine::general_purpose::STANDARD
+                .decode(event["delta"].as_str().unwrap())
+                .unwrap()
+        })
+        .collect();
+    assert_eq!(decoded, [0, 1, 2, 3, 4, 5]);
+    assert_eq!(
+        records
+            .iter()
+            .filter(|event| event["type"] == "response.audio.done")
+            .count(),
+        1
+    );
+    assert_eq!(
+        records
+            .iter()
+            .filter(|event| event["type"] == "response.audio.transcript.done")
+            .count(),
+        1
     );
 }
