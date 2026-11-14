@@ -154,6 +154,8 @@ struct Choice {
     index: u64,
     item: LocalId,
     blocks: [bool; 3],
+    /// Whether buffered `reasoning_content` was published ahead of a long answer field.
+    reasoning_first: bool,
     next_block: u64,
     audio: media::Base64Fragments,
     audio_output: Option<media_events::Audio>,
@@ -488,6 +490,7 @@ impl State {
             index,
             item,
             blocks: [false; 3],
+            reasoning_first: false,
             next_block: 3,
             audio: media::Base64Fragments::default(),
             audio_output: None,

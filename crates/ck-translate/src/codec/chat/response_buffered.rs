@@ -117,6 +117,10 @@ impl Buffered {
         let doc = &self.input.document;
         state.ensure_start(owner, Some(doc))?;
         let position = state.choice(owner, index)?;
+        if scalar && field != "reasoning_content" {
+            let message = doc.node(value)?.parent.ok_or(Error::Schema)?;
+            state.reasoning_first(owner, doc, message, position)?;
+        }
         let mut scope = state.scope(position);
         state.open_media_block(owner, position, &mut scope, field, scalar)?;
         scope.media_id = Some(media::local_id(b'm', state.serial)?);

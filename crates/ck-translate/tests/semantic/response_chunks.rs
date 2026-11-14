@@ -1,7 +1,8 @@
 //! Chat ingress collects small network reads of media and long strings into shared data
 //! records, and buffered and streamed responses open their blocks in the same order.
 use super::{
-    ChatCapability, Direction, Ingress, Mapped, Operation, RequestIngress, canonical_values, codec, identity, response,
+    ChatCapability, Direction, Ingress, Mapped, Operation, RequestIngress, canonical_values, codec, identity,
+    response_fragmented,
 };
 use base64::Engine;
 use codec::{BodyMode, ResponseIngress};
@@ -178,30 +179,46 @@ fn block_order(events: &[Value]) -> Vec<String> {
         .collect()
 }
 
-/// A buffered message lists `content` before `reasoning_content`, as providers that stream
-/// reasoning first do; buffered ingress opens the blocks in the order streamed ingress does.
-/// Long reasoning publishes while the body is still arriving.
+/// Buffered ingress opens reasoning before the answer, as streamed ingress does, whatever the
+/// member order: short reasoning after short content, long reasoning published while the body
+/// arrives, and short reasoning before a long content published while the body arrives.
 #[test]
 fn buffered_and_streamed_reasoning_open_blocks_in_the_same_order() {
-    for reasoning in ["think".to_owned(), "r".repeat(2048)] {
-        let message = json!({"role":"assistant","content":"answer","reasoning_content":reasoning});
+    let long_content = "a".repeat(2048);
+    let long_reasoning = "r".repeat(2048);
+    for (message, reasoning, content) in [
+        (
+            json!({"role":"assistant","content":"answer","reasoning_content":"think"}),
+            "think",
+            "answer",
+        ),
+        (
+            json!({"role":"assistant","content":"answer","reasoning_content":long_reasoning}),
+            long_reasoning.as_str(),
+            "answer",
+        ),
+        (
+            json!({"role":"assistant","reasoning_content":"think","content":long_content}),
+            "think",
+            long_content.as_str(),
+        ),
+    ] {
         let body =
             json!({"id":"r","model":"m","created":1,"choices":[{"index":0,"message":message,"finish_reason":"stop"}]});
-        let (_, buffered) = response(body.to_string().as_bytes(), BodyMode::Buffered, BodyMode::Buffered);
+        let (output, buffered) =
+            response_fragmented(body.to_string().as_bytes(), BodyMode::Buffered, BodyMode::Buffered, 13);
+        let output: Value = serde_json::from_slice(&output).unwrap();
+        assert_eq!(output["choices"][0]["message"]["reasoning_content"], reasoning);
+        assert_eq!(output["choices"][0]["message"]["content"], content);
         let chunk = |delta: Value, finish: Value| json!({"id":"r","model":"m","created":1,"choices":[{"index":0,"delta":delta,"finish_reason":finish}]});
         let stream = format!(
             "data: {}\n\ndata: {}\n\ndata: {}\n\ndata: [DONE]\n\n",
             chunk(json!({"role":"assistant","reasoning_content":reasoning}), Value::Null),
-            chunk(json!({"content":"answer"}), Value::Null),
+            chunk(json!({"content":content}), Value::Null),
             chunk(json!({}), json!("stop")),
         );
-        let (_, streamed) = response(stream.as_bytes(), BodyMode::Streaming, BodyMode::Buffered);
+        let (_, streamed) = response_fragmented(stream.as_bytes(), BodyMode::Streaming, BodyMode::Buffered, 13);
         assert_eq!(block_order(&streamed), ["thinking", "text"]);
-        assert_eq!(
-            block_order(&buffered),
-            block_order(&streamed),
-            "reasoning of {} bytes",
-            reasoning.len()
-        );
+        assert_eq!(block_order(&buffered), block_order(&streamed), "{message}");
     }
 }

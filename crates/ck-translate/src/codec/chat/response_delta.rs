@@ -19,12 +19,15 @@ impl State {
         // ponytail: a `content` over 1,024 bytes that precedes `reasoning_content` is published,
         // and opens its block, while the body arrives (response_buffered.rs), before reasoning is
         // read. Agreeing there needs that text held to the message end or egress ordering.
+        // Reasoning read before such an answer is published ahead of it (`reasoning_first`).
         let reasoning = if buffered {
             doc.member(body, "reasoning_content")?
         } else {
             None
         };
-        if let Some(field) = reasoning {
+        if let Some(field) = reasoning
+            && !self.choices[position].reasoning_first
+        {
             self.body_field(owner, doc, field, position, buffered)?;
         }
         for field in doc.children(body)? {
@@ -93,6 +96,28 @@ impl State {
             return Ok(());
         }
         self.scalar_field(owner, doc, field, name, position)
+    }
+
+    /// Publishes a buffered message's complete `reasoning_content` before ingress starts
+    /// publishing a long answer field, so the thinking block opens first as it does when
+    /// streamed. Reasoning still to come, or without text, waits for the message end.
+    pub(super) fn reasoning_first(
+        &mut self,
+        owner: &mut Writer,
+        doc: &Document,
+        message: usize,
+        position: usize,
+    ) -> Result<()> {
+        let Some(field) = doc.member(message, "reasoning_content")? else {
+            return Ok(());
+        };
+        if !matches!(doc.node(field)?.value, Value::String(_)) || doc.chars(field)?.next_scalar()?.is_none() {
+            return Ok(());
+        }
+        let name = doc.node(field)?.name.ok_or(Error::Schema)?;
+        self.scalar_field(owner, doc, field, name, position)?;
+        self.choices[position].reasoning_first = true;
+        Ok(())
     }
 
     fn tool_calls(
