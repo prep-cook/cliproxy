@@ -57,6 +57,9 @@ impl State {
         {
             return Ok(());
         }
+        if !matches!(doc.node(field)?.value, Value::Null) {
+            self.publish_audio(owner, position)?;
+        }
         if doc.name_is(name, "images")?
             || (doc.name_is(name, "content")? && matches!(doc.node(field)?.value, Value::Array))
         {

@@ -1,15 +1,85 @@
+use super::super::{FLUSH_DELAY, HELD_BYTES};
 use super::*;
-use crate::codec::media::{Encoding, Media};
+use crate::codec::{
+    document::Text,
+    media::{Encoding, Media},
+    source::Span,
+};
+use std::time::Instant;
 
 pub(super) struct Audio {
     publisher: media::Publisher,
     metadata: Document,
     scope: Scope,
     transcript: bool,
+    /// Decoded bytes awaiting publication. Each SSE record's source is released after the
+    /// record, so the bytes are copied into these scratch frames rather than held as positions.
+    held: Source,
+    /// Offset in `held` of the first unpublished byte.
+    published: u64,
+    /// End in `held` of the bytes from deltas that decoded completely; a terminal error
+    /// publishes only these.
+    complete: u64,
+    /// When collection of the held bytes began.
+    since: Option<Instant>,
 }
 
 impl Audio {
+    fn new(owner: &mut Writer, publisher: media::Publisher, metadata: Document, scope: Scope) -> Result<Self> {
+        Ok(Self {
+            publisher,
+            metadata,
+            scope,
+            transcript: false,
+            held: Source::new(owner)?,
+            published: 0,
+            complete: 0,
+            since: None,
+        })
+    }
+
+    /// Holds a delta's decoded bytes and publishes the held bytes once they fill a data record.
+    /// The bytes count only after the whole delta decodes, so a rejected delta adds none; the
+    /// hold can therefore exceed the threshold by one delta's bytes.
+    fn push(
+        &mut self,
+        emitter: &mut Emitter,
+        owner: &mut Writer,
+        fragments: &mut media::Base64Fragments,
+        input: &Document,
+        data: Text,
+    ) -> Result<()> {
+        let held = &mut self.held;
+        fragments.push(input, data, |bytes| held.push_bytes(owner, bytes).map(drop))?;
+        if self.held.len() > self.complete {
+            self.since.get_or_insert_with(Instant::now);
+        }
+        self.complete = self.held.len();
+        if self.complete - self.published >= HELD_BYTES {
+            self.publish(emitter, owner)?;
+        }
+        Ok(())
+    }
+
+    /// Publishes the held bytes of completely decoded deltas.
+    fn publish(&mut self, emitter: &mut Emitter, owner: &mut Writer) -> Result<()> {
+        let span = Span {
+            start: self.published,
+            end: self.complete,
+        };
+        if !span.is_empty() {
+            let held = &self.held;
+            self.publisher
+                .collect(emitter, owner, |emit| held.visit(span, |bytes| emit(bytes)))?;
+            self.held.release_before(span.end)?;
+            self.published = span.end;
+        }
+        self.since = None;
+        Ok(())
+    }
+
     pub(super) fn finish(&mut self, emitter: &mut Emitter, owner: &mut Writer) -> Result<()> {
+        self.publish(emitter, owner)?;
         if self.transcript {
             emitter.emit(
                 owner,
@@ -240,12 +310,7 @@ impl State {
                 members(&metadata, metadata.root(), e, &[])?;
                 e.bytes(b"}}")
             })?;
-            self.choices[position].audio_output = Some(Audio {
-                publisher,
-                metadata,
-                scope,
-                transcript: false,
-            });
+            self.choices[position].audio_output = Some(Audio::new(owner, publisher, metadata, scope)?);
         } else {
             let audio = self.choices[position].audio_output.as_mut().ok_or(Error::Schema)?;
             audio.metadata = metadata;
@@ -280,9 +345,7 @@ impl State {
         let choice = &mut self.choices[position];
         let audio = choice.audio_output.as_mut().ok_or(Error::Schema)?;
         if let Some(data) = data {
-            audio
-                .publisher
-                .collect(&mut self.emitter, owner, |emit| choice.audio.push(input, data, emit))?;
+            audio.push(&mut self.emitter, owner, &mut choice.audio, input, data)?;
         }
         if let Some(text) = transcript {
             self.audio_transcript(owner, input, text, position, scope)?;
@@ -348,6 +411,7 @@ impl State {
         position: usize,
         scope: Scope,
     ) -> Result<()> {
+        self.publish_audio(owner, position)?;
         let audio = self.choices[position].audio_output.as_mut().ok_or(Error::Schema)?;
         if matches!(input.node(text)?.value, Value::Null) {
             self.emitter.emit(
@@ -377,5 +441,40 @@ impl State {
             )?;
         }
         Ok(())
+    }
+}
+
+impl State {
+    /// Publishes a choice's held audio, so a record that follows the audio in the source
+    /// follows it in the stream.
+    pub(super) fn publish_audio(&mut self, owner: &mut Writer, position: usize) -> Result<()> {
+        match &mut self.choices[position].audio_output {
+            Some(audio) => audio.publish(&mut self.emitter, owner),
+            None => Ok(()),
+        }
+    }
+
+    /// Publishes every choice's held audio when `force`, otherwise the audio whose collection
+    /// delay has passed.
+    pub(super) fn flush_audio(&mut self, owner: &mut Writer, force: bool) -> Result<()> {
+        for position in 0..self.choices.len() {
+            let since = self.choices[position]
+                .audio_output
+                .as_ref()
+                .and_then(|audio| audio.since);
+            if since.is_some_and(|since| force || since.elapsed() >= FLUSH_DELAY) {
+                self.publish_audio(owner, position)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Deadline of the oldest held audio, under the `ResponseIngress::flush_deadline` contract.
+    pub(super) fn audio_deadline(&self) -> Option<Instant> {
+        self.choices
+            .iter()
+            .filter_map(|choice| choice.audio_output.as_ref()?.since)
+            .min()
+            .map(|since| since + FLUSH_DELAY)
     }
 }
