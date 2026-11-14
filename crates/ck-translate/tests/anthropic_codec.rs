@@ -1,3 +1,6 @@
+#[path = "anthropic/review.rs"]
+mod review;
+
 #[path = "anthropic/golden.rs"]
 mod golden;
 
@@ -423,4 +426,51 @@ fn server_results_share_tool_identity_and_preserve_native_payloads() {
         .unwrap();
     assert_eq!(result["x_ck"]["tool_call_id"], call["x_ck"]["tool_call_id"]);
     assert_eq!(result["x_ck"]["source"]["ids"]["tool_use_id"], "srv-1");
+}
+
+#[test]
+fn chat_choices_select_index_zero_not_the_first_array_element() {
+    for downstream in [BodyMode::Buffered, BodyMode::Streaming] {
+        let mut mapped = Mapped::new();
+        let mut reader = mapped.store.reader(mapped.writer.id(), 0).unwrap();
+        let mut ingress = codec::chat::response::Ingress::new(
+            &mut mapped.writer,
+            &mapped.store,
+            identity(Direction::Response),
+            Operation::Generate,
+            BodyMode::Buffered,
+            1024 * 1024,
+        )
+        .unwrap();
+        let mut egress = anthropic::egress::Egress::new(
+            &mut mapped.writer,
+            identity(Direction::Response),
+            Operation::Generate,
+            downstream,
+            |_| {},
+        )
+        .unwrap();
+        ingress.advance(&mut mapped.writer, br#"{"id":"response","model":"m","choices":[{"index":1,"message":{"role":"assistant","content":"discard"},"finish_reason":"length"},{"index":0,"message":{"role":"assistant","content":"selected"},"finish_reason":"stop"}]}"#).unwrap();
+        ingress.finish(&mut mapped.writer).unwrap();
+        let mut output = Vec::new();
+        while let Poll::Ready(Some(ck_stream::Read::Record(lease))) = reader.try_next() {
+            egress
+                .advance(&mut mapped.writer, lease, |part| {
+                    output.extend_from_slice(&bytes(&part));
+                    Ok(())
+                })
+                .unwrap();
+        }
+        egress.finish().unwrap();
+        if downstream == BodyMode::Buffered {
+            let body: Value = serde_json::from_slice(&output).unwrap();
+            assert_eq!(body["content"], json!([{"type":"text","text":"selected"}]));
+            assert_eq!(body["stop_reason"], "end_turn");
+        } else {
+            let rows = events(&output);
+            assert!(rows.iter().any(|v| v["delta"]["text"] == "selected"));
+            assert!(rows.iter().any(|v| v["delta"]["stop_reason"] == "end_turn"));
+            assert!(rows.iter().all(|v| v["delta"]["text"] != "discard"));
+        }
+    }
 }

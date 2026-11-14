@@ -27,6 +27,15 @@ pub(super) fn validate(view: RequestView<'_>) -> Result<()> {
             return Err(Error::Schema);
         }
     }
+    if let Some(stop) = doc.member(root, "stop")? {
+        if matches!(doc.node(stop)?.value, Value::Array) {
+            for value in doc.children(stop)? {
+                super::string(doc, value)?;
+            }
+        } else {
+            super::string(doc, stop)?;
+        }
+    }
     if let Some(stream) = doc.member(root, "stream")? {
         let Value::Bool(stream) = doc.node(stream)?.value else {
             return Err(Error::Schema);
@@ -111,6 +120,19 @@ pub(super) fn validate(view: RequestView<'_>) -> Result<()> {
     let x = doc.required(root, "x_ck")?;
     if doc.member(x, "session")?.is_some() {
         return Err(Error::Unsupported);
+    }
+    if let Some(thinking) = doc.member(x, "thinking")? {
+        if doc.member(thinking, "native")?.is_some() && !super::is(doc, x, "original_protocol", "anthropic")? {
+            return Err(Error::Unsupported);
+        }
+        if let Some(enabled) = doc.member(thinking, "enabled")?
+            && !matches!(doc.node(enabled)?.value, Value::Bool(_))
+        {
+            return Err(Error::Schema);
+        }
+        if let Some(budget) = doc.member(thinking, "budget_tokens")? {
+            doc.unsigned(budget)?;
+        }
     }
     if let Some(replay) = doc.member(x, "replay")? {
         for entry in doc.children(replay)? {

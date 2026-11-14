@@ -82,29 +82,37 @@ fn object(doc: &Document, parent: usize, skip: &[&str], e: &mut Encoder<'_, '_>)
 }
 
 fn unknown(doc: &Document, parent: usize, known: &[&str], e: &mut Encoder<'_, '_>) -> Result<()> {
+    unknown_at(doc, &[(parent, "", known)], e)
+}
+
+fn unknown_at(doc: &Document, groups: &[(usize, &str, &[&str])], e: &mut Encoder<'_, '_>) -> Result<()> {
     let mut first = true;
-    for field in doc.children(parent)? {
-        let name = doc.node(field)?.name.ok_or(Error::Schema)?;
-        if known
-            .iter()
-            .try_fold(false, |found, key| Ok::<_, Error>(found || doc.name_is(name, key)?))?
-        {
-            continue;
-        }
-        e.bytes(if first { b",\"original\":[" } else { b"," })?;
-        first = false;
-        e.bytes(b"{\"protocol\":\"anthropic\",\"pointer\":\"/")?;
-        let mut chars = doc.name_chars(name)?;
-        while let Some(c) = chars.next_scalar()? {
-            match c {
-                '~' => e.bytes(b"~0")?,
-                '/' => e.bytes(b"~1")?,
-                c => e.escaped(c.encode_utf8(&mut [0; 4]))?,
+    for &(parent, prefix, known) in groups {
+        for field in doc.children(parent)? {
+            let name = doc.node(field)?.name.ok_or(Error::Schema)?;
+            if known
+                .iter()
+                .try_fold(false, |found, key| Ok::<_, Error>(found || doc.name_is(name, key)?))?
+            {
+                continue;
             }
+            e.bytes(if first { b",\"original\":[" } else { b"," })?;
+            first = false;
+            e.bytes(b"{\"protocol\":\"anthropic\",\"pointer\":\"")?;
+            e.escaped(prefix)?;
+            e.bytes(b"/")?;
+            let mut chars = doc.name_chars(name)?;
+            while let Some(c) = chars.next_scalar()? {
+                match c {
+                    '~' => e.bytes(b"~0")?,
+                    '/' => e.bytes(b"~1")?,
+                    c => e.escaped(c.encode_utf8(&mut [0; 4]))?,
+                }
+            }
+            e.bytes(b"\",\"value\":")?;
+            doc.write(field, e)?;
+            e.bytes(b"}")?;
         }
-        e.bytes(b"\",\"value\":")?;
-        doc.write(field, e)?;
-        e.bytes(b"}")?;
     }
     if !first {
         e.bytes(b"]")?;

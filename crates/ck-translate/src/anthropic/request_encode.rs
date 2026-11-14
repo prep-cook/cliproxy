@@ -36,7 +36,13 @@ pub(super) fn write(view: RequestView<'_>, streaming: bool, e: &mut Encoder<'_, 
             doc.write_name(name, e)?;
         }
         e.bytes(b":")?;
-        doc.write(field, e)?;
+        if doc.name_is(name, "stop")? && !matches!(doc.node(field)?.value, Value::Array) {
+            e.bytes(b"[")?;
+            doc.write(field, e)?;
+            e.bytes(b"]")?;
+        } else {
+            doc.write(field, e)?;
+        }
     }
     if !first {
         e.bytes(b",")?;
@@ -74,19 +80,38 @@ pub(super) fn write(view: RequestView<'_>, streaming: bool, e: &mut Encoder<'_, 
             || doc.member(thinking, "budget_tokens")?.is_some())
     {
         e.bytes(b",\"thinking\":")?;
-        if let Some(native) = doc.member(thinking, "native")? {
-            doc.write(native, e)?;
+        e.bytes(b"{\"type\":")?;
+        let enabled = doc
+            .member(thinking, "enabled")?
+            .map(|n| doc.node(n))
+            .transpose()?
+            .is_some_and(|n| matches!(n.value, Value::Bool(true)));
+        let native = doc.member(thinking, "native")?;
+        let adaptive = native
+            .map(|n| super::is(doc, n, "type", "adaptive"))
+            .transpose()?
+            .unwrap_or(false);
+        e.string(if !enabled {
+            "disabled"
+        } else if adaptive {
+            "adaptive"
         } else {
-            e.bytes(b"{\"type\":")?;
-            let enabled = doc
-                .member(thinking, "enabled")?
-                .map(|n| doc.node(n))
-                .transpose()?
-                .is_some_and(|n| matches!(n.value, Value::Bool(true)));
-            e.string(if enabled { "enabled" } else { "disabled" })?;
-            super::member(doc, thinking, "budget_tokens", e)?;
-            e.bytes(b"}")?;
+            "enabled"
+        })?;
+        super::member(doc, thinking, "budget_tokens", e)?;
+        if let Some(native) = native {
+            for field in doc.children(native)? {
+                let name = doc.node(field)?.name.ok_or(Error::Schema)?;
+                if doc.name_is(name, "type")? || doc.name_is(name, "budget_tokens")? {
+                    continue;
+                }
+                e.bytes(b",")?;
+                doc.write_name(name, e)?;
+                e.bytes(b":")?;
+                doc.write(field, e)?;
+            }
         }
+        e.bytes(b"}")?;
     }
     if let Some(provider) = doc.member(x, "provider_parameters")?
         && let Some(native) = doc.member(provider, "anthropic")?

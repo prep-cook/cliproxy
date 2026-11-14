@@ -23,6 +23,7 @@ struct Block {
     open: bool,
     started: bool,
     tool: Option<u64>,
+    explicit_block: bool,
 }
 pub struct Egress {
     owner: u64,
@@ -160,7 +161,7 @@ impl Egress {
                 };
                 let mut body = super::mapped(owner, |e| {
                     if let Some(attrs) = doc.member(root, "attributes")? {
-                        super::object(&doc, attrs, &["type", "citations"], e)
+                        super::object(&doc, attrs, &["type"], e)
                     } else {
                         e.bytes(b"{}")
                     }
@@ -189,6 +190,7 @@ impl Egress {
                     open: true,
                     started: false,
                     tool: None,
+                    explicit_block: true,
                 })?;
                 if matches!(native, "text" | "thinking") {
                     self.start_block(owner, index as usize, output)?;
@@ -221,7 +223,7 @@ impl Egress {
                 }
                 let name = body.required(from, "name")?;
                 copy_value(body, body.root(), "name", name)?;
-                if super::is(body, from, "kind", "server")? {
+                if super::is(body, from, "kind", "server")? && super::is(body, body.root(), "type", "tool_use")? {
                     body.set(body.root(), "type", Value::Text("server_tool_use"))?;
                 }
                 if !super::is(body, from, "arguments_format", "json")? {
@@ -402,21 +404,13 @@ impl Egress {
                     body.rename(input, "input")?;
                     body.append(body.root(), input)?;
                 }
+                if !self.blocks.rows[index].explicit_block {
+                    self.close_block(owner, index, output)?;
+                }
             }
             Kind::BlockEnd => {
                 let index = self.find(&doc, x)?;
-                self.start_block(owner, index, output)?;
-                let block = &mut self.blocks.rows[index];
-                if !block.open {
-                    return Err(Error::Schema);
-                }
-                block.open = false;
-                if self.mode == BodyMode::Streaming {
-                    output(event(owner, "content_block_stop", |e| {
-                        e.bytes(b",\"index\":")?;
-                        e.unsigned(block.index)
-                    })?)?;
-                }
+                self.close_block(owner, index, output)?;
             }
             Kind::Usage => {
                 let usage = doc.required(root, "usage")?;
@@ -440,7 +434,29 @@ impl Egress {
                         super::mapped(owner, |e| doc.write(doc.required(root, "value")?, e))?;
                     self.start_block(owner, index, output)?;
                 } else if native && self.mode == BodyMode::Streaming {
-                    output(encode::scratch(owner, |e| write_opaque(&doc, x, e))?)?;
+                    let value = doc.required(root, "value")?;
+                    if matches!(doc.node(value)?.value, Value::Object)
+                        && super::is(&doc, value, "type", "content_block_delta")?
+                    {
+                        let index = self.find(&doc, x)?;
+                        output(native_event(owner, "content_block_delta", Some(&doc), |e| {
+                            e.bytes(b",\"index\":")?;
+                            e.unsigned(self.blocks.rows[index].index)?;
+                            for field in doc.children(value)? {
+                                let name = doc.node(field)?.name.ok_or(Error::Schema)?;
+                                if doc.name_is(name, "type")? || doc.name_is(name, "index")? {
+                                    continue;
+                                }
+                                e.bytes(b",")?;
+                                doc.write_name(name, e)?;
+                                e.bytes(b":")?;
+                                doc.write(field, e)?;
+                            }
+                            Ok(())
+                        })?)?;
+                    } else {
+                        output(encode::scratch(owner, |e| write_opaque(&doc, x, e))?)?;
+                    }
                 } else {
                     self.drop_event(kind, choice, "opaque event has no native buffered carrier");
                 }
@@ -528,6 +544,7 @@ impl Egress {
             open: true,
             started: false,
             tool: None,
+            explicit_block: false,
         })?;
         Ok(index)
     }
@@ -560,6 +577,7 @@ impl Egress {
             open: true,
             started: false,
             tool: None,
+            explicit_block: false,
         })?;
         self.start_block(owner, index, output)?;
         Ok(index)
@@ -586,6 +604,26 @@ impl Egress {
         block.started = true;
         Ok(())
     }
+    fn close_block(
+        &mut self,
+        owner: &mut Writer,
+        index: usize,
+        output: &mut impl FnMut(ScratchLease) -> Result<()>,
+    ) -> Result<()> {
+        self.start_block(owner, index, output)?;
+        let block = &mut self.blocks.rows[index];
+        if !block.open {
+            return Err(Error::Schema);
+        }
+        block.open = false;
+        if self.mode == BodyMode::Streaming {
+            output(event(owner, "content_block_stop", |e| {
+                e.bytes(b",\"index\":")?;
+                e.unsigned(block.index)
+            })?)?;
+        }
+        Ok(())
+    }
     fn fragment(
         &mut self,
         owner: &mut Writer,
@@ -599,7 +637,7 @@ impl Egress {
         self.start_block(owner, index, output)?;
         let block = &mut self.blocks.rows[index];
         if self.mode == BodyMode::Streaming {
-            output(event(owner, "content_block_delta", |e| {
+            output(native_event(owner, "content_block_delta", Some(doc), |e| {
                 e.bytes(b",\"index\":")?;
                 e.unsigned(block.index)?;
                 e.bytes(b",\"delta\":{\"type\":")?;
@@ -608,7 +646,10 @@ impl Egress {
                 e.string(field)?;
                 e.bytes(b":")?;
                 doc.write(value, e)?;
-                e.bytes(b"}")
+                let x = doc.required(doc.root(), "x_ck")?;
+                original_members_at(doc, x, "/delta", e)?;
+                e.bytes(b"}")?;
+                original_members(doc, x, e)
             })?)?;
         }
         // Tool JSON still needs validation at its end; other streamed payloads need no second state copy.
@@ -724,14 +765,49 @@ fn event(
     name: &'static str,
     fields: impl Fn(&mut Encoder<'_, '_>) -> Result<()>,
 ) -> Result<ScratchLease> {
+    native_event(owner, name, None, fields)
+}
+fn native_event(
+    owner: &mut Writer,
+    name: &'static str,
+    doc: Option<&Document>,
+    fields: impl Fn(&mut Encoder<'_, '_>) -> Result<()>,
+) -> Result<ScratchLease> {
     encode::scratch(owner, |e| {
         e.bytes(b"event: ")?;
         e.bytes(name.as_bytes())?;
-        e.bytes(b"\ndata: {\"type\":")?;
+        e.bytes(b"\n")?;
+        if let Some(doc) = doc
+            && let Some(x) = doc.member(doc.root(), "x_ck")?
+            && let Some(source) = doc.member(x, "source")?
+        {
+            native_sse_fields(doc, source, e)?;
+        }
+        e.bytes(b"data: {\"type\":")?;
         e.string(name)?;
         fields(e)?;
         e.bytes(b"}\n\n")
     })
+}
+
+fn native_sse_fields(doc: &Document, source: usize, e: &mut Encoder<'_, '_>) -> Result<()> {
+    if !super::is(doc, source, "protocol", "anthropic")? {
+        return Ok(());
+    }
+    if let Some(fields) = doc.member(source, "sse")? {
+        for field in doc.children(fields)? {
+            let name = doc.required(field, "name")?;
+            // Native IDs stay in provenance; only the gateway may issue a resume cursor.
+            if doc.string_is(name, "id")? {
+                continue;
+            }
+            raw_string(doc, name, e, false)?;
+            e.bytes(b": ")?;
+            raw_string(doc, doc.required(field, "value")?, e, false)?;
+            e.bytes(b"\n")?;
+        }
+    }
+    Ok(())
 }
 fn write_base(doc: &Document, e: &mut Encoder<'_, '_>) -> Result<()> {
     e.bytes(b"\"type\":\"message\",\"role\":\"assistant\"")?;
@@ -771,15 +847,29 @@ fn write_usage(doc: &Document, e: &mut Encoder<'_, '_>) -> Result<()> {
     e.bytes(b"}")
 }
 fn original_members(doc: &Document, x: usize, e: &mut Encoder<'_, '_>) -> Result<()> {
+    original_members_at(doc, x, "", e)
+}
+fn original_members_at(doc: &Document, x: usize, prefix: &str, e: &mut Encoder<'_, '_>) -> Result<()> {
     if let Some(original) = doc.member(x, "original")? {
-        for entry in doc.children(original)? {
+        'entry: for entry in doc.children(original)? {
             if !super::is(doc, entry, "protocol", "anthropic")? {
                 continue;
             }
             let pointer = doc.required(entry, "pointer")?;
             let mut chars = doc.chars(pointer)?;
-            if chars.next_scalar()? != Some('/') {
-                return Err(Error::Schema);
+            for expected in prefix.chars().chain(std::iter::once('/')) {
+                if chars.next_scalar()? != Some(expected) {
+                    continue 'entry;
+                }
+            }
+            let mut probe = doc.chars(pointer)?;
+            for _ in 0..prefix.chars().count() + 1 {
+                probe.next_scalar()?;
+            }
+            while let Some(c) = probe.next_scalar()? {
+                if c == '/' {
+                    continue 'entry;
+                }
             }
             e.bytes(b",\"")?;
             while let Some(c) = chars.next_scalar()? {
@@ -807,14 +897,7 @@ fn write_opaque(doc: &Document, x: usize, e: &mut Encoder<'_, '_>) -> Result<()>
         raw_string(doc, name, e, false)?;
         e.bytes(b"\n")?;
     }
-    if let Some(fields) = doc.member(source, "sse")? {
-        for field in doc.children(fields)? {
-            raw_string(doc, doc.required(field, "name")?, e, false)?;
-            e.bytes(b": ")?;
-            raw_string(doc, doc.required(field, "value")?, e, false)?;
-            e.bytes(b"\n")?;
-        }
-    }
+    native_sse_fields(doc, source, e)?;
     e.bytes(b"data: ")?;
     let value = doc.required(doc.root(), "value")?;
     if super::is(doc, doc.root(), "format", "text")? {

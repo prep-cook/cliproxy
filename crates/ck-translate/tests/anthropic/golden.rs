@@ -1,3 +1,6 @@
+#[path = "streams.rs"]
+mod streams;
+
 use super::{
     BodyMode, Direction, Mapped, Operation, RequestIngress, Value, anthropic, bytes, codec, events, identity, json,
     request_fragmented, response,
@@ -110,13 +113,16 @@ fn recorded_complete_native_messages_preserve_blocks_and_usage() {
                 continue;
             }
             let raw = input(fixture);
-            let Ok(mut expected) = serde_json::from_slice::<Value>(&raw) else {
-                continue;
-            };
-            if !expected["content"].is_array() || !expected["stop_reason"].is_string() {
+            let id = format!("{stem}.json / {} / occurrence {index}", fixture["name"]);
+            let value = serde_json::from_slice::<Value>(&raw).ok();
+            if !value
+                .as_ref()
+                .is_some_and(|v| v["content"].is_array() && v["stop_reason"].is_string())
+            {
+                reject_response(&raw, Operation::Generate, &id);
                 continue;
             }
-            let id = format!("{stem}.json / {} / occurrence {index}", fixture["name"]);
+            let mut expected = value.unwrap();
             if expected.get("role").is_none() {
                 expected["role"] = json!("assistant");
             }
@@ -152,48 +158,38 @@ fn recorded_complete_native_messages_preserve_blocks_and_usage() {
         }
     }
 }
+
+fn reject_response(raw: &[u8], operation: Operation, id: &str) {
+    let mut mapped = Mapped::new();
+    let mut ingress = anthropic::response::Ingress::new(
+        &mut mapped.writer,
+        identity(Direction::Response),
+        operation,
+        BodyMode::Buffered,
+        1024 * 1024,
+    )
+    .unwrap();
+    let result = ingress
+        .advance(&mut mapped.writer, raw)
+        .and_then(|()| ingress.finish(&mut mapped.writer));
+    assert!(result.is_err(), "{id}: incomplete adapter input authorized a response");
+    assert!(!matches!(result, Err(codec::Error::Storage(_))), "{id}");
+    let raw = mapped.output(&mapped.writer);
+    let output = std::str::from_utf8(&raw).unwrap();
+    assert!(output.contains("event: x_ck.error\n"), "{id}");
+    assert!(!output.contains("event: x_ck.done\n"), "{id}");
+}
+
 #[test]
-fn recorded_streams_without_message_stop_are_truncation_not_success() {
+fn count_fixtures_cannot_inject_counts_outside_the_native_body() {
     for (stem, corpus) in RESPONSES {
         let corpus: Value = serde_json::from_str(corpus).unwrap();
         for (index, fixture) in corpus["fixtures"].as_array().unwrap().iter().enumerate() {
-            if fixture["path"] != "stream" {
-                continue;
-            }
-            let Some(lines) = fixture["lines"].as_array() else {
-                continue;
-            };
-            if lines
-                .iter()
-                .any(|line| line.as_str().unwrap_or_default().contains("message_stop"))
-            {
+            if fixture["path"] != "token_count" {
                 continue;
             }
             let id = format!("{stem}.json / {} / occurrence {index}", fixture["name"]);
-            let mut mapped = Mapped::new();
-            let mut ingress = anthropic::response::Ingress::new(
-                &mut mapped.writer,
-                identity(Direction::Response),
-                Operation::Generate,
-                BodyMode::Streaming,
-                1024 * 1024,
-            )
-            .unwrap();
-            let mut failed = false;
-            for line in lines {
-                let line = line.as_str().unwrap_or_default();
-                let mut record = line.as_bytes().to_vec();
-                record.extend_from_slice(b"\n\n");
-                if ingress.advance(&mut mapped.writer, &record).is_err() {
-                    failed = true;
-                    break;
-                }
-            }
-            assert!(failed || ingress.finish(&mut mapped.writer).is_err(), "{id}");
-            let output = mapped.output(&mapped.writer);
-            let output = std::str::from_utf8(&output).unwrap();
-            assert!(!output.contains("event: x_ck.done\n"), "{id}");
-            assert!(output.contains("event: x_ck.error\n"), "{id}");
+            reject_response(&input(fixture), Operation::CountTokens, &id);
         }
     }
 }

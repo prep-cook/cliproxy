@@ -27,6 +27,7 @@ struct Block {
     initial: Option<Document>,
     fragments: bool,
     source_id: Option<Document>,
+    signature_final: Option<bool>,
 }
 struct State {
     emitter: Emitter,
@@ -367,6 +368,7 @@ impl State {
                 &doc,
                 doc.required(root, "delta")?,
                 doc.unsigned(doc.required(root, "index")?)?,
+                (source, event),
             )?;
         } else if doc.string_is(kind, "content_block_stop")? {
             self.require_active()?;
@@ -505,16 +507,18 @@ impl State {
                 e.bytes(b",\"kind\":")?;
                 e.string(kind)?;
                 e.bytes(b",\"attributes\":")?;
-                super::object(
-                    doc,
-                    node,
-                    if kind == "tool_result" {
-                        &["content", "tool_use_id", "is_error"]
-                    } else {
-                        &["text", "thinking", "signature", "data", "input", "id", "name"]
-                    },
-                    e,
-                )
+                if kind == "opaque" {
+                    return e.bytes(b"{}");
+                }
+                let skip: &[&str] = match kind {
+                    "text" => &["text", "citations"],
+                    "thinking" => &["thinking", "signature"],
+                    "redacted" => &["data"],
+                    "function" | "server" => &["input", "id", "name"],
+                    "tool_result" => &["content", "tool_use_id", "is_error"],
+                    _ => &[],
+                };
+                super::object(doc, node, skip, e)
             },
             |e| e.bytes(b",\"source\":{\"protocol\":\"anthropic\"}"),
         )?;
@@ -559,19 +563,27 @@ impl State {
             },
             initial,
             fragments: false,
+            signature_final: None,
             source_id: if tool {
                 Some(super::mapped(owner, |e| doc.write(doc.required(node, "id")?, e))?)
             } else {
                 None
             },
         })?;
-        for (field, target) in [("text", "content"), ("thinking", "reasoning_content")] {
+        if matches!(kind, "text" | "thinking") {
+            let (field, target) = if kind == "text" {
+                ("text", "content")
+            } else {
+                ("thinking", "reasoning_content")
+            };
             if let Some(value) = doc.member(node, field)? {
-                self.chunk(owner, scope, doc, value, target)?;
+                self.chunk(owner, scope, doc, value, target, None)?;
             }
         }
-        if let Some(signature) = doc.member(node, "signature")? {
-            self.signature(owner, scope, doc, signature, true)?;
+        if kind == "thinking"
+            && let Some(signature) = doc.member(node, "signature")?
+        {
+            self.signature(owner, scope, doc, signature, whole, None)?;
         }
         if kind == "redacted" {
             let data = doc.required(node, "data")?;
@@ -616,7 +628,9 @@ impl State {
                 |e| e.bytes(b",\"source\":{\"protocol\":\"anthropic\",\"event\":\"content_block\"}"),
             )?;
         }
-        if let Some(citations) = doc.member(node, "citations")? {
+        if kind == "text"
+            && let Some(citations) = doc.member(node, "citations")?
+        {
             self.emitter.emit(
                 owner,
                 Kind::Annotation,
@@ -631,12 +645,19 @@ impl State {
         if whole && tool {
             let input = doc.member(node, "input")?;
             if let Some(input) = input {
-                self.arguments(owner, index, doc, input, false)?;
+                self.arguments(owner, index, doc, input, false, None)?;
             }
         }
         Ok(())
     }
-    fn delta(&mut self, owner: &mut Writer, doc: &Document, delta: usize, index: u64) -> Result<()> {
+    fn delta(
+        &mut self,
+        owner: &mut Writer,
+        doc: &Document,
+        delta: usize,
+        index: u64,
+        origin: (&Source, &sse::Event),
+    ) -> Result<()> {
         let block = self
             .blocks
             .rows
@@ -645,13 +666,34 @@ impl State {
             .ok_or(Error::Schema)?;
         let scope = block.scope;
         if super::is(doc, delta, "type", "text_delta")? && block.kind == "text" {
-            self.chunk(owner, scope, doc, doc.required(delta, "text")?, "content")
+            self.chunk(owner, scope, doc, doc.required(delta, "text")?, "content", Some(origin))
         } else if super::is(doc, delta, "type", "thinking_delta")? && block.kind == "thinking" {
-            self.chunk(owner, scope, doc, doc.required(delta, "thinking")?, "reasoning_content")
+            self.chunk(
+                owner,
+                scope,
+                doc,
+                doc.required(delta, "thinking")?,
+                "reasoning_content",
+                Some(origin),
+            )
         } else if super::is(doc, delta, "type", "signature_delta")? && block.kind == "thinking" {
-            self.signature(owner, scope, doc, doc.required(delta, "signature")?, false)
+            self.signature(
+                owner,
+                scope,
+                doc,
+                doc.required(delta, "signature")?,
+                false,
+                Some(origin),
+            )
         } else if super::is(doc, delta, "type", "input_json_delta")? && block.arguments.is_some() {
-            self.arguments(owner, index, doc, doc.required(delta, "partial_json")?, true)
+            self.arguments(
+                owner,
+                index,
+                doc,
+                doc.required(delta, "partial_json")?,
+                true,
+                Some(origin),
+            )
         } else if super::is(doc, delta, "type", "citations_delta")? {
             self.emitter.emit(
                 owner,
@@ -661,11 +703,28 @@ impl State {
                     e.bytes(b",\"kind\":\"citation\",\"value\":")?;
                     doc.write(doc.required(delta, "citation")?, e)
                 },
-                |_| Ok(()),
+                |e| delta_origin(doc, Some(origin), "citation", e),
             )?;
             Ok(())
-        } else {
+        } else if ["text_delta", "thinking_delta", "signature_delta", "input_json_delta"]
+            .iter()
+            .try_fold(false, |known, kind| {
+                Ok::<_, Error>(known || super::is(doc, delta, "type", kind)?)
+            })?
+        {
             Err(Error::Schema)
+        } else {
+            self.emitter.emit(
+                owner,
+                Kind::Opaque,
+                scope,
+                |e| {
+                    e.bytes(b",\"format\":\"json\",\"value\":")?;
+                    doc.write(doc.root(), e)
+                },
+                |e| provenance(origin.0, origin.1, e),
+            )?;
+            Ok(())
         }
     }
     fn chunk(
@@ -675,6 +734,7 @@ impl State {
         doc: &Document,
         value: usize,
         field: &'static str,
+        origin: Option<(&Source, &sse::Event)>,
     ) -> Result<()> {
         super::string(doc, value)?;
         let base = self.base.as_ref().ok_or(Error::Schema)?;
@@ -690,7 +750,7 @@ impl State {
                 doc.write(value, e)?;
                 e.bytes(b"},\"finish_reason\":null}]")
             },
-            |_| Ok(()),
+            |e| delta_origin(doc, origin, if field == "content" { "text" } else { "thinking" }, e),
         )?;
         Ok(())
     }
@@ -701,8 +761,16 @@ impl State {
         doc: &Document,
         value: usize,
         final_fragment: bool,
+        origin: Option<(&Source, &sse::Event)>,
     ) -> Result<()> {
         super::string(doc, value)?;
+        let block = self
+            .blocks
+            .rows
+            .iter_mut()
+            .find(|block| block.scope.block_index == scope.block_index)
+            .ok_or(Error::Schema)?;
+        block.signature_final = Some(final_fragment);
         self.emitter.emit(
             owner,
             Kind::ReasoningSignature,
@@ -716,7 +784,7 @@ impl State {
                     b",\"final\":false"
                 })
             },
-            |_| Ok(()),
+            |e| delta_origin(doc, origin, "signature", e),
         )?;
         Ok(())
     }
@@ -727,6 +795,7 @@ impl State {
         doc: &Document,
         value: usize,
         fragment: bool,
+        origin: Option<(&Source, &sse::Event)>,
     ) -> Result<()> {
         let block = self
             .blocks
@@ -768,7 +837,7 @@ impl State {
                 }
                 e.bytes(b"}}]},\"finish_reason\":null}]")
             },
-            |_| Ok(()),
+            |e| delta_origin(doc, origin, "partial_json", e),
         )?;
         Ok(())
     }
@@ -782,7 +851,7 @@ impl State {
         if !self.blocks.rows[position].fragments
             && let Some(initial) = self.blocks.rows[position].initial.take()
         {
-            self.arguments(owner, index, &initial, initial.root(), false)?;
+            self.arguments(owner, index, &initial, initial.root(), false, None)?;
         }
         let block = &mut self.blocks.rows[position];
         if let Some((source, parser)) = &mut block.arguments {
@@ -802,6 +871,16 @@ impl State {
                 },
                 |_| Ok(()),
             )?;
+        }
+        if block.signature_final == Some(false) {
+            self.emitter.emit(
+                owner,
+                Kind::ReasoningSignature,
+                block.scope,
+                |e| e.bytes(b",\"kind\":\"anthropic\",\"fragment\":\"\",\"final\":true"),
+                |_| Ok(()),
+            )?;
+            block.signature_final = Some(true);
         }
         self.emitter
             .emit(owner, Kind::BlockEnd, block.scope, |_| Ok(()), |_| Ok(()))?;
@@ -945,4 +1024,24 @@ fn provenance(source: &Source, event: &sse::Event, e: &mut Encoder<'_, '_>) -> R
         })?;
     }
     e.bytes(b"]}")
+}
+
+fn delta_origin(
+    doc: &Document,
+    origin: Option<(&Source, &sse::Event)>,
+    field: &str,
+    e: &mut Encoder<'_, '_>,
+) -> Result<()> {
+    if let Some((source, event)) = origin {
+        provenance(source, event, e)?;
+        super::unknown_at(
+            doc,
+            &[
+                (doc.root(), "", &["type", "index", "delta"]),
+                (doc.required(doc.root(), "delta")?, "/delta", &["type", field]),
+            ],
+            e,
+        )?;
+    }
+    Ok(())
 }
