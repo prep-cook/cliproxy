@@ -31,7 +31,7 @@ fn recorded_buffered_responses_preserve_items_usage_and_terminal_status() {
             })
         });
         if valid {
-            let body = parsed.unwrap();
+            let body = annotated(parsed.unwrap());
             for downstream in [BodyMode::Buffered, BodyMode::Streaming] {
                 let (output, canonical) = response(raw.as_bytes(), BodyMode::Buffered, downstream, Operation::Generate);
                 let projected: Value = if downstream == BodyMode::Buffered {
@@ -81,6 +81,24 @@ fn recorded_buffered_responses_preserve_items_usage_and_terminal_status() {
             assert_rejected(raw.as_bytes(), BodyMode::Buffered, fixture["name"].as_str().unwrap());
         }
     }
+}
+
+/// `body` with the `annotations` that egress gives every output_text part, as the native schema
+/// requires.
+fn annotated(mut body: Value) -> Value {
+    for item in body["output"].as_array_mut().unwrap() {
+        for part in item
+            .get_mut("content")
+            .and_then(Value::as_array_mut)
+            .into_iter()
+            .flatten()
+        {
+            if part["type"] == "output_text" && part.get("annotations").is_none() {
+                part["annotations"] = json!([]);
+            }
+        }
+    }
+    body
 }
 
 #[test]

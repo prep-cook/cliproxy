@@ -67,7 +67,7 @@ fn a_shorter_terminal_array_contradicts_published_parts() {
         item
     };
     let reasoning = |summary: Value| json!({"id":"i","type":"reasoning","summary":summary});
-    let text = json!([{"type":"output_text","text":"A"}]);
+    let text = json!([{"type":"output_text","text":"A","annotations":[]}]);
     let summary = json!([{"type":"summary_text","text":"s"}]);
     let run = |done: Value, last: Value| {
         try_streamed(

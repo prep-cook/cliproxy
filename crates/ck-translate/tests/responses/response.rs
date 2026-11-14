@@ -209,7 +209,7 @@ fn native_extension_fields_use_noncontrol_carriers_not_incomplete_native_events(
 
 #[test]
 fn interleaved_items_and_content_keep_native_indexes_and_final_order() {
-    let first = json!({"id":"first","type":"message","content":[{"type":"output_text","text":"a"},{"type":"output_text","text":"b"}]});
+    let first = json!({"id":"first","type":"message","content":[{"type":"output_text","text":"a","annotations":[]},{"type":"output_text","text":"b","annotations":[]}]});
     let second = json!({"id":"second","type":"message","content":[]});
     let events = [
         json!({"type":"response.output_item.added","output_index":1,"item":{"id":"second","type":"message"}}),

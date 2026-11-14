@@ -155,7 +155,7 @@ fn buffered_image_results_publish_chunks_before_the_body_ends() {
     // 73,731 bytes: two full 36,864-byte chunks and a short one.
     let raw: Vec<u8> = (0..73_731).map(|i| (i % 251) as u8).collect();
     let encoded = base64::engine::general_purpose::STANDARD.encode(&raw);
-    let message = json!({"id":"m1","type":"message","role":"assistant","status":"completed","content":[{"type":"output_text","text":"hi"}]});
+    let message = json!({"id":"m1","type":"message","role":"assistant","status":"completed","content":[{"type":"output_text","text":"hi","annotations":[]}]});
     let head = format!(
         r#"{{"id":"r","model":"m","created_at":1,"status":"completed","output":[{message},{{"id":"img","type":"image_generation_call","status":"completed","result":""#
     );

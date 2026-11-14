@@ -40,7 +40,7 @@ fn closing_snapshots_merge_nested_and_opaque_members() {
             json!({"type":"output_text","text":"","vendor":{"a":1,"b":2}}),
             json!({"type":"output_text","text":"hi","vendor":{"b":3}})
         ),
-        json!({"type":"output_text","text":"hi","vendor":{"a":1,"b":3}})
+        json!({"type":"output_text","text":"hi","vendor":{"a":1,"b":3},"annotations":[]})
     );
     // The text of an opaque part is an ordinary member.
     assert_eq!(

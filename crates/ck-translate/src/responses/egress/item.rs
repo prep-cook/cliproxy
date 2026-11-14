@@ -160,14 +160,10 @@ impl<F: FnMut(&'static str, u64)> Egress<F> {
             super::super::merge(doc, part, attrs)?;
         }
         part_type(doc, node, part, summary, thinking)?;
-        let native = doc
-            .member(x, "source")?
-            .map(|s| is(doc, s, "protocol", "responses"))
-            .transpose()?;
         if is(doc, node, "kind", "opaque")? {
             doc.bind_origin(part, x, Some(OPAQUE_PART))?;
         } else {
-            initialize_part(doc, part, native != Some(true))?;
+            initialize_part(doc, part)?;
             doc.bind_origin(part, x, None)?;
         }
         let payload = encode::scratch(owner, |e| {
@@ -497,9 +493,9 @@ impl<F: FnMut(&'static str, u64)> Egress<F> {
     }
 }
 
-/// Gives a text part the empty members that native clients append deltas to. A Responses source
-/// supplies its own `annotations` or their absence; any other source gets the native empty array.
-fn initialize_part(doc: &mut Document, part: usize, annotate: bool) -> Result<()> {
+/// Gives a text part the empty members that native clients append deltas to. The native schema
+/// requires `annotations` on `output_text`, so a part whose source omitted it gets the empty array.
+fn initialize_part(doc: &mut Document, part: usize) -> Result<()> {
     let (field, annotated) = if is(doc, part, "type", "output_text")? {
         ("text", true)
     } else if is(doc, part, "type", "refusal")? {
@@ -512,7 +508,7 @@ fn initialize_part(doc: &mut Document, part: usize, annotate: bool) -> Result<()
     if doc.member(part, field)?.is_none() {
         doc.set(part, field, Value::Text(""))?;
     }
-    if annotated && annotate && doc.member(part, "annotations")?.is_none() {
+    if annotated && doc.member(part, "annotations")?.is_none() {
         doc.set(part, "annotations", Value::Array)?;
     }
     Ok(())
