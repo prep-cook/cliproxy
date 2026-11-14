@@ -127,7 +127,9 @@ pub(super) fn project(doc: &mut Document, usage: usize, retained: &mut Option<us
     if let Some(native) = doc.member(usage, "native")?
         && super::is(doc, native, "protocol", "responses")?
     {
-        return doc.required(native, "value");
+        let value = doc.required(native, "value")?;
+        overlay(doc, usage, value)?;
+        return Ok(value);
     }
     let result = doc.add(None, Value::Object)?;
     for name in [
@@ -183,4 +185,77 @@ pub(super) fn project(doc: &mut Document, usage: usize, retained: &mut Option<us
     };
     doc.transplant(slot, usage)?;
     Ok(result)
+}
+
+/// Canonical counts and the native Responses member each one maps to: `(canonical, details
+/// object, native name)`.
+const NATIVE_COUNTS: &[(&str, Option<&str>, &str)] = &[
+    ("input_tokens", None, "input_tokens"),
+    ("output_tokens", None, "output_tokens"),
+    ("total_tokens", None, "total_tokens"),
+    ("input_uncached_tokens", None, "input_uncached_tokens"),
+    ("cache_write_by_ttl", None, "cache_write_by_ttl"),
+    ("cache_read_tokens", Some("input_tokens_details"), "cached_tokens"),
+    ("input_audio_tokens", Some("input_tokens_details"), "audio_tokens"),
+    ("reasoning_tokens", Some("output_tokens_details"), "reasoning_tokens"),
+    ("output_audio_tokens", Some("output_tokens_details"), "audio_tokens"),
+];
+
+/// Writes the canonical counts of `usage` over the preserved native `value`, so a normalized
+/// change or deletion wins (§3.7). Native nulls the snapshot never mapped and derived counts the
+/// source did not report are left alone.
+fn overlay(doc: &mut Document, usage: usize, value: usize) -> Result<()> {
+    if !matches!(doc.node(value)?.value, Value::Object) {
+        return Ok(());
+    }
+    let nested_write = doc.member(value, "cache_write_tokens")?.is_none()
+        && doc
+            .member(value, "input_tokens_details")?
+            .map(|d| doc.member(d, "cache_write_tokens"))
+            .transpose()?
+            .flatten()
+            .is_some();
+    let write = (
+        "cache_write_tokens",
+        nested_write.then_some("input_tokens_details"),
+        "cache_write_tokens",
+    );
+    for &(name, details, field) in NATIVE_COUNTS.iter().chain([&write]) {
+        let mut derived = false;
+        if let Some(list) = doc.member(usage, "derived")? {
+            for entry in doc.children(list)? {
+                derived |= doc.string_is(entry, name)?;
+            }
+        }
+        let parent = match details {
+            Some(d) => doc
+                .member(value, d)?
+                .filter(|&p| matches!(doc.node(p).map(|n| n.value), Ok(Value::Object))),
+            None => Some(value),
+        };
+        let canonical = doc
+            .member(usage, name)?
+            .filter(|&c| !matches!(doc.node(c).map(|n| n.value), Ok(Value::Null)));
+        match canonical {
+            _ if derived => {}
+            Some(count) => {
+                let parent = match (parent, details) {
+                    (Some(p), _) => p,
+                    (None, Some(d)) => doc.set(value, d, Value::Object)?,
+                    (None, None) => return Err(crate::codec::Error::Schema),
+                };
+                let target = doc.set(parent, field, Value::Null)?;
+                doc.transplant(target, count)?;
+            }
+            None => {
+                if let Some(p) = parent
+                    && let Some(n) = doc.member(p, field)?
+                    && !matches!(doc.node(n)?.value, Value::Null)
+                {
+                    doc.remove(p, field)?;
+                }
+            }
+        }
+    }
+    Ok(())
 }

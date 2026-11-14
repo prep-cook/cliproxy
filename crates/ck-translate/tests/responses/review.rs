@@ -422,3 +422,59 @@ fn closed_blocks_and_items_take_no_new_payload() {
     ];
     assert!(ingest(&late_encryption).is_err());
 }
+
+#[test]
+fn canonical_usage_counts_win_over_the_native_value() {
+    use codec::event::{Emitter, Kind, Scope};
+    let mut m = Mapped::new();
+    let mut reader = m.store.reader(m.writer.id(), 0).unwrap();
+    let mut emitter = Emitter::new(identity(Direction::Response));
+    let records: [(Kind, &[u8]); 3] = [
+        (Kind::ResponseStart, br#","id":"r","model":"m","created":1"#),
+        (
+            Kind::Usage,
+            br#","usage":{"input_tokens":9,"output_tokens":2,"total_tokens":11,"reasoning_tokens":1,"native":{"protocol":"responses","value":{"input_tokens":3,"output_tokens":2,"total_tokens":5,"input_tokens_details":{"cached_tokens":1,"vendor":null},"output_tokens_details":{"reasoning_tokens":0}}},"final":true}"#,
+        ),
+        (Kind::Done, b""),
+    ];
+    for (kind, payload) in records {
+        emitter
+            .emit(&mut m.writer, kind, Scope::default(), |e| e.bytes(payload), |_| Ok(()))
+            .unwrap();
+    }
+    let mut egress = responses::egress::Egress::new(
+        &mut m.writer,
+        identity(Direction::Response),
+        Operation::Generate,
+        BodyMode::Buffered,
+        |_, _| {},
+    )
+    .unwrap();
+    let mut out = Vec::new();
+    while let std::task::Poll::Ready(Some(ck_stream::Read::Record(record))) = reader.try_next() {
+        egress
+            .advance(&mut m.writer, record, |chunk| {
+                out.extend_from_slice(&bytes(&chunk));
+                Ok(())
+            })
+            .unwrap();
+    }
+    egress.finish().unwrap();
+    let out: Value = serde_json::from_slice(&out).unwrap();
+    // The cached count was removed from the canonical snapshot; the native null stays.
+    assert_eq!(
+        out["usage"],
+        json!({"input_tokens":9,"output_tokens":2,"total_tokens":11,
+            "input_tokens_details":{"vendor":null},"output_tokens_details":{"reasoning_tokens":1}}),
+    );
+    // Unchanged counts round-trip: no derived total, and a nested cache write stays nested.
+    let usage = json!({"input_tokens":3,"output_tokens":2,"input_tokens_details":{"cache_write_tokens":4}});
+    let body = json!({"id":"r","status":"completed","output":[],"usage":usage});
+    let (out, _) = response(
+        &serde_json::to_vec(&body).unwrap(),
+        BodyMode::Buffered,
+        BodyMode::Buffered,
+        Operation::Generate,
+    );
+    assert_eq!(serde_json::from_slice::<Value>(&out).unwrap()["usage"], usage);
+}
