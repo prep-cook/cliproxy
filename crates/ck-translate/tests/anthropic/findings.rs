@@ -259,3 +259,27 @@ fn results_link_to_the_latest_calls_and_still_reach_older_ones() {
     let (out, _) = request(&serde_json::to_vec(&body).unwrap(), Operation::Generate);
     assert_eq!(out["messages"], body["messages"]);
 }
+
+#[test]
+fn redacted_blocks_record_their_replay_position() {
+    let body = json!({"model":"m","max_tokens":10,"messages":[
+        {"role":"user","content":"x"},
+        {"role":"assistant","content":[{"type":"thinking","thinking":"t","signature":"s"},{"type":"redacted_thinking","data":"a"}]},
+        {"role":"user","content":"y"},
+        {"role":"assistant","content":[{"type":"redacted_thinking","data":"b"}]},
+    ]});
+    let (out, canonical) = request(&serde_json::to_vec(&body).unwrap(), Operation::Generate);
+    assert_eq!(out["messages"], body["messages"]);
+    let indexes: Vec<_> = canonical
+        .iter()
+        .filter(|v| v["pointer"].as_str().is_some_and(|p| p.ends_with("/replay_index")))
+        .map(|v| (v["pointer"].clone(), v["value"].clone()))
+        .collect();
+    assert_eq!(
+        indexes,
+        [
+            (json!("/messages/1/content/1/replay_index"), json!(1)),
+            (json!("/messages/3/content/0/replay_index"), json!(2)),
+        ]
+    );
+}
