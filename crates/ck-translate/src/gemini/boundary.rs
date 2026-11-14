@@ -60,3 +60,16 @@ fn origin(doc: &Document, parent: usize, carrier: &'static str) -> Result<Option
     }
     Ok(None)
 }
+/// Whether two string nodes, possibly of different documents, hold the same characters.
+fn same(a: &Document, x: usize, b: &Document, y: usize) -> Result<bool> {
+    let (mut left, mut right) = (a.chars(x)?, b.chars(y)?);
+    loop {
+        let c = left.next_scalar()?;
+        if c != right.next_scalar()? {
+            return Ok(false);
+        }
+        if c.is_none() {
+            return Ok(true);
+        }
+    }
+}

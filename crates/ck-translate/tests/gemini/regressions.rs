@@ -82,3 +82,36 @@ fn native_error_does_not_expose_payload_or_emit_success() {
     assert!(!raw.contains("credential-secret"));
     assert!(!raw.contains("event: x_ck.done"));
 }
+
+/// Identity that arrives after the first chunk reaches canonical chunks and the Gemini client;
+/// an identity the upstream never sent is not fabricated.
+#[test]
+fn streaming_unknown_metadata_and_late_identity_reach_egress() {
+    let rows = [
+        json!({"candidates":[{"index":3,"content":{"parts":[{"text":"pre"}]}}],"usageMetadata":{"promptTokenCount":1}}),
+        json!({"responseId":"late-id","modelVersion":"late-model","candidates":[{"index":3,"content":{"parts":[{"text":"hi","futurePart":{"n":null}}],"futureContent":[null,1]},"futureCandidate":{"v":0},"finishReason":"STOP"}],"futureRoot":[null,false],"x_ck":{"attempt":99}}),
+    ];
+    let (out, canonical) = response(&sse(&rows), Framing::Sse, Framing::Sse, Operation::Generate);
+    let out = events(&out);
+    assert!(out.iter().any(|v| v["futureRoot"] == json!([null, false])));
+    assert!(out.iter().any(|v| v["x_ck"] == json!({"attempt":99})));
+    assert!(out.iter().any(|v| {
+        v["candidates"]
+            .as_array()
+            .is_some_and(|a| a.iter().any(|c| c["futureCandidate"] == json!({"v":0})))
+    }));
+    let chunk = canonical
+        .iter()
+        .find(|v| v["choices"][0]["delta"]["content"] == "hi")
+        .unwrap();
+    assert_eq!(chunk["id"], "late-id");
+    assert_eq!(chunk["model"], "late-model");
+    assert!(out[0].get("responseId").is_none(), "{}", out[0]);
+    assert!(out[0].get("modelVersion").is_none(), "{}", out[0]);
+    let text = out
+        .iter()
+        .find(|v| v["candidates"][0]["content"]["parts"][0]["text"] == "hi")
+        .unwrap();
+    assert_eq!(text["responseId"], "late-id");
+    assert_eq!(text["modelVersion"], "late-model");
+}

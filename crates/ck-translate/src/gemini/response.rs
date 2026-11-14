@@ -46,6 +46,8 @@ struct State {
     choices: Table<Choice>,
     next_item: u64,
     blocked: bool,
+    /// Whether the base `id` and `model` are synthesized: no body has supplied them yet.
+    synthetic: [bool; 2],
 }
 impl Ingress {
     pub fn new(
@@ -101,6 +103,7 @@ impl Ingress {
                 choices: Table::new(owner)?,
                 next_item: 0,
                 blocked: false,
+                synthetic: [true; 2],
             },
             closed: false,
         })
@@ -262,6 +265,7 @@ impl State {
             },
             |e| {
                 e.bytes(b",\"source\":{\"protocol\":\"gemini\"}")?;
+                synthetic(self.synthetic, false, e)?;
                 provenance(e)
             },
         )?;
@@ -288,4 +292,20 @@ fn sse_source(source: &Source, event: &sse::Event, e: &mut Encoder<'_, '_>) -> R
         e.bytes(b"}")?;
     }
     e.bytes(b"]}")
+}
+/// Lists the synthesized base fields; a chunk names only `id` and `model`, which a later body
+/// can still supply.
+fn synthetic(fields: [bool; 2], created: bool, e: &mut Encoder<'_, '_>) -> Result<()> {
+    let mut first = true;
+    for (name, set) in [("id", fields[0]), ("model", fields[1]), ("created", created)] {
+        if set {
+            e.bytes(if first { b",\"synthetic\":[" } else { b"," })?;
+            first = false;
+            e.string(name)?;
+        }
+    }
+    if !first {
+        e.bytes(b"]")?;
+    }
+    Ok(())
 }

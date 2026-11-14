@@ -50,6 +50,8 @@ impl State {
         }
         if self.base.is_none() {
             self.start(owner, doc)?;
+        } else {
+            self.refresh(owner, doc)?;
         }
         if self.operation == Operation::CountTokens {
             return self.count(owner, doc);
@@ -82,23 +84,8 @@ impl State {
     }
     fn start(&mut self, owner: &mut Writer, doc: &Document) -> Result<()> {
         let root = doc.root();
-        let base = super::super::mapped(owner, |e| {
-            e.bytes(b"{\"id\":")?;
-            if let Some(n) = doc.member(root, "responseId")? {
-                super::super::string(doc, n)?;
-                doc.write(n, e)?;
-            } else {
-                e.string(self.identity.stream_id.as_str())?;
-            }
-            e.bytes(b",\"model\":")?;
-            if let Some(n) = doc.member(root, "modelVersion")? {
-                super::super::string(doc, n)?;
-                doc.write(n, e)?;
-            } else {
-                e.string("")?;
-            }
-            e.bytes(b",\"created\":0}")
-        })?;
+        let base = self.base_fields(owner, doc)?;
+        let synthetic = self.synthetic;
         self.emitter.emit(
             owner,
             Kind::ResponseStart,
@@ -115,10 +102,62 @@ impl State {
                     e.bytes(b",\"timestamp\":")?;
                     doc.write(n, e)?;
                 }
-                e.bytes(b"},\"synthetic\":[\"created\"]")
+                e.bytes(b"}")?;
+                super::synthetic(synthetic, true, e)
             },
         )?;
         self.base = Some(base);
+        Ok(())
+    }
+    /// The base chunk fields: the body's `responseId` and `modelVersion`, else the published
+    /// ones, else the stream id and an empty model, which stay marked synthetic.
+    fn base_fields(&mut self, owner: &mut Writer, doc: &Document) -> Result<Document> {
+        let root = doc.root();
+        let supplied = [doc.member(root, "responseId")?, doc.member(root, "modelVersion")?];
+        let previous = self.base.as_ref();
+        let base = super::super::mapped(owner, |e| {
+            for ((canonical, node), fallback) in ["id", "model"]
+                .into_iter()
+                .zip(supplied)
+                .zip([self.identity.stream_id.as_str(), ""])
+            {
+                e.bytes(if canonical == "id" { b"{" } else { b"," })?;
+                e.string(canonical)?;
+                e.bytes(b":")?;
+                match (node, previous) {
+                    (Some(n), _) => {
+                        super::super::string(doc, n)?;
+                        doc.write(n, e)?;
+                    }
+                    (None, Some(base)) => base.write(base.required(base.root(), canonical)?, e)?,
+                    (None, None) => e.string(fallback)?,
+                }
+            }
+            e.bytes(b",\"created\":0}")
+        })?;
+        for (synthetic, node) in self.synthetic.iter_mut().zip(supplied) {
+            *synthetic &= node.is_none();
+        }
+        Ok(base)
+    }
+    /// Rebuilds the base when a later body supplies an identity that differs from the
+    /// published one, so later chunks carry it.
+    fn refresh(&mut self, owner: &mut Writer, doc: &Document) -> Result<()> {
+        let base = self.base.as_ref().ok_or(Error::Schema)?;
+        let root = doc.root();
+        let mut changed = false;
+        for ((native, canonical), synthetic) in [("responseId", "id"), ("modelVersion", "model")]
+            .into_iter()
+            .zip(self.synthetic)
+        {
+            if let Some(n) = doc.member(root, native)? {
+                super::super::string(doc, n)?;
+                changed |= synthetic || !super::super::same(base, base.required(base.root(), canonical)?, doc, n)?;
+            }
+        }
+        if changed {
+            self.base = Some(self.base_fields(owner, doc)?);
+        }
         Ok(())
     }
     fn count(&mut self, owner: &mut Writer, doc: &Document) -> Result<()> {

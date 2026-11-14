@@ -26,6 +26,9 @@ impl Egress {
         if event.node(choice)?.next.is_some() {
             return Err(Error::Schema);
         }
+        if native(&event, x)? {
+            self.refresh(owner, &event, x)?;
+        }
         let slot = self.open_choice(event.unsigned(event.required(choice, "index")?)?)?;
         let logprobs = match present(&event, choice, "logprobs")? {
             Some(node) => Some(mapped(owner, |e| event.write(node, e))?),
