@@ -12,6 +12,7 @@ mod delta;
 mod envelope;
 mod item;
 mod media;
+mod reasoning;
 
 /// The absorbed event and the output item it belongs to, with that item's native index.
 #[derive(Clone, Copy)]
@@ -155,13 +156,7 @@ impl<F: FnMut(&'static str, u64)> Egress<F> {
             return Err(Error::Schema);
         };
         let at = At { node, x, item, index };
-        // Role-only and finish chunks carry no content; a content chunk follows its block start.
-        if self.pending == Some(item)
-            && !matches!(kind, Kind::ItemEnd | Kind::Chunk)
-            && !(kind == Kind::BlockStart && reasoning(doc, node)?)
-        {
-            self.announce(owner, output)?;
-        }
+        self.announce_for(owner, (kind, node, item), output)?;
         match kind {
             Kind::MediaStart => self.image_start(at),
             Kind::ToolStart => self.tool_start(owner, at, output),
