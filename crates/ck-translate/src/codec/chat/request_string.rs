@@ -1,11 +1,5 @@
+use super::super::{FLUSH_DELAY, HELD_BYTES};
 use super::*;
-
-/// Input held per data record, counting an incomplete scalar or escape. Advance feeds at most
-/// 8,192 bytes between steps, and decoding never grows bytes, so held input plus one step stays
-/// within a 36,864-byte decoded chunk.
-const HELD_BYTES: u64 = 36_864 - 8_192;
-/// Collection delay of held input (docs/INTERNAL-STREAM.md, §3.4).
-pub(super) const FLUSH_DELAY: std::time::Duration = std::time::Duration::from_millis(100);
 
 impl Ingress {
     pub(super) fn string_format(

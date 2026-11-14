@@ -197,6 +197,18 @@ pub trait RequestEgress {
     fn encode(&self, request: &ValidatedRequest<'_>, output: &mut Writer) -> Result<ScratchLease>;
 }
 pub trait ResponseIngress {
+    /// Deadline for the oldest ready payload still awaiting publication, under the
+    /// `RequestIngress::flush_deadline` contract. A codec that publishes every read holds none.
+    fn flush_deadline(&self) -> Option<std::time::Instant> {
+        None
+    }
+
+    /// Publish ready payload without completing the response or an open media object.
+    /// May be called before the deadline; empty advance has the same flush contract.
+    fn flush(&mut self, owner: &mut Writer) -> Result<()> {
+        self.advance(owner, &[])
+    }
+
     fn advance(&mut self, owner: &mut Writer, bytes: &[u8]) -> Result<()>;
     fn finish(&mut self, owner: &mut Writer) -> Result<()>;
 }

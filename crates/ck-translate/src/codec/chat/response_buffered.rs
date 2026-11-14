@@ -1,3 +1,4 @@
+use super::super::{FLUSH_DELAY, HELD_BYTES};
 use super::*;
 use crate::codec::{
     document::pending::Pending,
@@ -22,6 +23,8 @@ pub(super) struct Published {
     publisher: Publisher,
     complete: bool,
     ended: bool,
+    /// When collection of the unpublished input after `offset` began.
+    held: Option<std::time::Instant>,
 }
 
 impl Buffered {
@@ -32,26 +35,39 @@ impl Buffered {
         })
     }
     pub(super) fn advance(&mut self, owner: &mut Writer, state: &mut State, bytes: &[u8]) -> Result<()> {
+        if bytes.is_empty() {
+            return self.flush(owner, state);
+        }
         for bytes in bytes.chunks(8192) {
             self.input.advance(owner, bytes)?;
             if let Some(index) = self.active {
-                self.collect(owner, state, index)?;
+                self.collect(owner, state, index, false)?;
             }
             if self.active.is_none()
                 && let Some(wire) = self.input.string
             {
                 self.begin(owner, state, wire)?;
                 if let Some(index) = self.active {
-                    self.collect(owner, state, index)?;
+                    self.collect(owner, state, index, false)?;
                 }
             }
         }
         Ok(())
     }
+    /// Publishes held media input regardless of its size, as the flush contract requires.
+    pub(super) fn flush(&mut self, owner: &mut Writer, state: &mut State) -> Result<()> {
+        match self.active {
+            Some(index) => self.collect(owner, state, index, true),
+            None => Ok(()),
+        }
+    }
+    pub(super) fn flush_deadline(&self, state: &State) -> Option<std::time::Instant> {
+        Some(state.published[self.active?].held? + FLUSH_DELAY)
+    }
     pub(super) fn finish(mut self, owner: &mut Writer, state: &mut State) -> Result<()> {
         self.input.finish()?;
         if let Some(index) = self.active {
-            self.collect(owner, state, index)?;
+            self.collect(owner, state, index, true)?;
         }
         state.document(owner, &mut self.input.document, true, None)?;
         state.done(owner, None)
@@ -122,16 +138,30 @@ impl Buffered {
             publisher,
             complete: false,
             ended: false,
+            held: None,
         })?);
         Ok(())
     }
 
-    fn collect(&mut self, owner: &mut Writer, state: &mut State, index: usize) -> Result<()> {
+    /// Decodes and publishes the payload input after the published offset. Input stays held, as
+    /// positions in the input source, until it fills a record, the string ends, its collection
+    /// delay passes or `force` asks for a flush; small network reads then share one record.
+    fn collect(&mut self, owner: &mut Writer, state: &mut State, index: usize, force: bool) -> Result<()> {
         let published = &mut state.published[index];
         let wire = self
             .input
             .scanner
             .pending_node(self.input.document.input(), published.wire)?;
+        // An incomplete scalar or escape after the validated end decodes with the next step.
+        let received = self.input.document.input().len();
+        if wire.validated_end > published.offset {
+            let since = *published.held.get_or_insert_with(std::time::Instant::now);
+            if wire.span.end == 0 && !force && received - published.offset < HELD_BYTES && since.elapsed() < FLUSH_DELAY
+            {
+                return Ok(());
+            }
+        }
+        published.held = None;
         let mut chars = json::Decoded::fragment(
             self.input.document.input(),
             Span {

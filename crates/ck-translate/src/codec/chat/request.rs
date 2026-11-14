@@ -154,7 +154,7 @@ impl Ingress {
 impl codec::RequestIngress for Ingress {
     fn flush_deadline(&self) -> Option<std::time::Instant> {
         let held = self.string.as_ref()?.held?;
-        Some(held + string::FLUSH_DELAY)
+        Some(held + super::FLUSH_DELAY)
     }
 
     fn advance(&mut self, owner: &mut Writer, bytes: &[u8]) -> Result<()> {

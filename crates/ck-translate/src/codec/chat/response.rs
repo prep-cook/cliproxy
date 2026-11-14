@@ -83,6 +83,10 @@ impl Ingress {
     }
 }
 impl codec::ResponseIngress for Ingress {
+    fn flush_deadline(&self) -> Option<std::time::Instant> {
+        self.buffered.as_ref()?.flush_deadline(&self.state)
+    }
+
     fn advance(&mut self, owner: &mut Writer, bytes: &[u8]) -> Result<()> {
         if owner.id() != self.owner {
             return Err(Error::Position);
