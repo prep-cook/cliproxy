@@ -9,6 +9,30 @@ pub(super) fn validate(view: RequestView<'_>) -> Result<()> {
     }
     let doc = view.document;
     let root = doc.root();
+    let messages = parameters(doc, root, view.operation)?;
+    let mut conversation = false;
+    let mut system = false;
+    for message in doc.children(messages)? {
+        let role = doc.required(message, "role")?;
+        if doc.string_is(role, "system")? {
+            if conversation || system {
+                return Err(Error::Unsupported);
+            }
+            system = true;
+        } else if doc.string_is(role, "user")? || doc.string_is(role, "assistant")? || doc.string_is(role, "tool")? {
+            conversation = true;
+        } else {
+            return Err(Error::Unsupported);
+        }
+        self::message(view, messages, message, role)?;
+    }
+    let x = doc.required(root, "x_ck")?;
+    extensions(doc, x)?;
+    tools(doc, root, x)?;
+    tool_choice(doc, root)
+}
+/// Checks the top-level generation parameters and returns the messages array.
+fn parameters(doc: &Document, root: usize, operation: Operation) -> Result<usize> {
     super::string(doc, doc.required(root, "model")?)?;
     if doc.chars(doc.required(root, "model")?)?.next_scalar()?.is_none() {
         return Err(Error::Schema);
@@ -17,7 +41,7 @@ pub(super) fn validate(view: RequestView<'_>) -> Result<()> {
     if !matches!(doc.node(messages)?.value, Value::Array) {
         return Err(Error::Schema);
     }
-    if view.operation == Operation::Generate && doc.unsigned(doc.required(root, "max_tokens")?)? == 0 {
+    if operation == Operation::Generate && doc.unsigned(doc.required(root, "max_tokens")?)? == 0 {
         return Err(Error::Schema);
     }
     for key in ["temperature", "top_p"] {
@@ -40,7 +64,7 @@ pub(super) fn validate(view: RequestView<'_>) -> Result<()> {
         let Value::Bool(stream) = doc.node(stream)?.value else {
             return Err(Error::Schema);
         };
-        if stream && view.operation == Operation::CountTokens {
+        if stream && operation == Operation::CountTokens {
             return Err(Error::Unsupported);
         }
     }
@@ -71,61 +95,58 @@ pub(super) fn validate(view: RequestView<'_>) -> Result<()> {
             return Err(Error::Schema);
         }
     }
-    let mut conversation = false;
-    let mut system = false;
-    for message in doc.children(messages)? {
-        let role = doc.required(message, "role")?;
-        if doc.string_is(role, "system")? {
-            if conversation || system {
-                return Err(Error::Unsupported);
-            }
-            system = true;
-        } else if doc.string_is(role, "user")? || doc.string_is(role, "assistant")? || doc.string_is(role, "tool")? {
-            conversation = true;
-        } else {
-            return Err(Error::Unsupported);
-        }
-        if let Some(content) = doc.member(message, "content")? {
-            match doc.node(content)?.value {
-                Value::String(_) | Value::Text(_) | Value::Fragments | Value::Utf8Media => (),
-                Value::Array => {
-                    for part in doc.children(content)? {
-                        validate_part(view, message, part)?;
-                    }
-                }
-                Value::Null if doc.member(message, "tool_calls")?.is_some() => (),
-                _ => return Err(Error::Schema),
-            }
-        }
-        if doc.string_is(role, "tool")? {
-            linked(doc, messages, message, None, doc.required(message, "tool_call_id")?)?;
-        }
-        if let Some(calls) = doc.member(message, "tool_calls")? {
-            if !doc.string_is(role, "assistant")? || !matches!(doc.node(calls)?.value, Value::Array) {
-                return Err(Error::Schema);
-            }
-            for call in doc.children(calls)? {
-                super::string(doc, doc.required(call, "id")?)?;
-                if !super::is(doc, call, "type", "function")? && !super::is(doc, call, "type", "server")? {
-                    return Err(Error::Unsupported);
-                }
-                if let Some(namespace) = doc.member(call, "namespace")? {
-                    super::string(doc, namespace)?;
-                }
-                if !super::is(doc, call, "arguments_format", "json")? {
-                    return Err(Error::Unsupported);
-                }
-                let function = doc.required(call, "function")?;
-                super::string(doc, doc.required(function, "name")?)?;
-                if let Some(input) = doc.member(function, "arguments")?
-                    && !matches!(doc.node(input)?.value, Value::Object)
-                {
-                    return Err(Error::Schema);
+    Ok(messages)
+}
+/// Checks one message's content parts, tool result link and tool calls.
+fn message(view: RequestView<'_>, messages: usize, message: usize, role: usize) -> Result<()> {
+    let doc = view.document;
+    if let Some(content) = doc.member(message, "content")? {
+        match doc.node(content)?.value {
+            Value::String(_) | Value::Text(_) | Value::Fragments | Value::Utf8Media => (),
+            Value::Array => {
+                for part in doc.children(content)? {
+                    validate_part(view, message, part)?;
                 }
             }
+            Value::Null if doc.member(message, "tool_calls")?.is_some() => (),
+            _ => return Err(Error::Schema),
         }
     }
-    let x = doc.required(root, "x_ck")?;
+    if doc.string_is(role, "tool")? {
+        linked(doc, messages, message, None, doc.required(message, "tool_call_id")?)?;
+    }
+    if let Some(calls) = doc.member(message, "tool_calls")? {
+        if !doc.string_is(role, "assistant")? || !matches!(doc.node(calls)?.value, Value::Array) {
+            return Err(Error::Schema);
+        }
+        for call in doc.children(calls)? {
+            tool_call(doc, call)?;
+        }
+    }
+    Ok(())
+}
+fn tool_call(doc: &Document, call: usize) -> Result<()> {
+    super::string(doc, doc.required(call, "id")?)?;
+    if !super::is(doc, call, "type", "function")? && !super::is(doc, call, "type", "server")? {
+        return Err(Error::Unsupported);
+    }
+    if let Some(namespace) = doc.member(call, "namespace")? {
+        super::string(doc, namespace)?;
+    }
+    if !super::is(doc, call, "arguments_format", "json")? {
+        return Err(Error::Unsupported);
+    }
+    let function = doc.required(call, "function")?;
+    super::string(doc, doc.required(function, "name")?)?;
+    if let Some(input) = doc.member(function, "arguments")?
+        && !matches!(doc.node(input)?.value, Value::Object)
+    {
+        return Err(Error::Schema);
+    }
+    Ok(())
+}
+/// Checks the canonical `x_ck` extensions this destination accepts.
+fn extensions(doc: &Document, x: usize) -> Result<()> {
     if doc.member(x, "session")?.is_some() {
         return Err(Error::Unsupported);
     }
@@ -163,59 +184,67 @@ pub(super) fn validate(view: RequestView<'_>) -> Result<()> {
             }
         }
     }
-    if let Some(tools) = doc.member(root, "tools")? {
-        if !matches!(doc.node(tools)?.value, Value::Array) {
-            return Err(Error::Schema);
-        }
-        for tool in doc.children(tools)? {
-            if super::is(doc, tool, "type", "server")? {
-                let declarations = doc.required(x, "tools")?;
-                if !doc.children(declarations)?.any(|entry| {
-                    doc.origin(entry)
-                        .ok()
-                        .flatten()
-                        .is_some_and(|(parent, _)| parent == tool)
-                }) {
-                    return Err(Error::Unsupported);
-                }
-            } else {
-                if !super::is(doc, tool, "type", "function")? {
-                    return Err(Error::Unsupported);
-                }
-                let function = doc.required(tool, "function")?;
-                super::string(doc, doc.required(function, "name")?)?;
-                if !matches!(doc.node(doc.required(function, "parameters")?)?.value, Value::Object) {
-                    return Err(Error::Schema);
-                }
+    Ok(())
+}
+fn tools(doc: &Document, root: usize, x: usize) -> Result<()> {
+    let Some(tools) = doc.member(root, "tools")? else {
+        return Ok(());
+    };
+    if !matches!(doc.node(tools)?.value, Value::Array) {
+        return Err(Error::Schema);
+    }
+    for tool in doc.children(tools)? {
+        if super::is(doc, tool, "type", "server")? {
+            let declarations = doc.required(x, "tools")?;
+            if !doc.children(declarations)?.any(|entry| {
+                doc.origin(entry)
+                    .ok()
+                    .flatten()
+                    .is_some_and(|(parent, _)| parent == tool)
+            }) {
+                return Err(Error::Unsupported);
+            }
+        } else {
+            if !super::is(doc, tool, "type", "function")? {
+                return Err(Error::Unsupported);
+            }
+            let function = doc.required(tool, "function")?;
+            super::string(doc, doc.required(function, "name")?)?;
+            if !matches!(doc.node(doc.required(function, "parameters")?)?.value, Value::Object) {
+                return Err(Error::Schema);
             }
         }
     }
-    if let Some(choice) = doc.member(root, "tool_choice")? {
-        if matches!(doc.node(choice)?.value, Value::Object) {
-            if !super::is(doc, choice, "type", "function")? {
-                return Err(Error::Unsupported);
-            }
-            let function = doc.required(choice, "function")?;
-            let name = doc.required(function, "name")?;
-            if doc.chars(name)?.next_scalar()?.is_none() {
-                return Err(Error::Schema);
-            }
-            let tools = doc.required(root, "tools")?;
-            let mut declared = false;
-            for tool in doc.children(tools)? {
-                if let Some(function) = doc.member(tool, "function")? {
-                    declared |= doc.equal_strings(name, doc.required(function, "name")?)?;
-                }
-            }
-            if !declared {
-                return Err(Error::Schema);
-            }
-        } else if !["auto", "none", "required"]
-            .iter()
-            .try_fold(false, |yes, value| Ok::<_, Error>(yes || doc.string_is(choice, value)?))?
-        {
+    Ok(())
+}
+fn tool_choice(doc: &Document, root: usize) -> Result<()> {
+    let Some(choice) = doc.member(root, "tool_choice")? else {
+        return Ok(());
+    };
+    if matches!(doc.node(choice)?.value, Value::Object) {
+        if !super::is(doc, choice, "type", "function")? {
             return Err(Error::Unsupported);
         }
+        let function = doc.required(choice, "function")?;
+        let name = doc.required(function, "name")?;
+        if doc.chars(name)?.next_scalar()?.is_none() {
+            return Err(Error::Schema);
+        }
+        let tools = doc.required(root, "tools")?;
+        let mut declared = false;
+        for tool in doc.children(tools)? {
+            if let Some(function) = doc.member(tool, "function")? {
+                declared |= doc.equal_strings(name, doc.required(function, "name")?)?;
+            }
+        }
+        if !declared {
+            return Err(Error::Schema);
+        }
+    } else if !["auto", "none", "required"]
+        .iter()
+        .try_fold(false, |yes, value| Ok::<_, Error>(yes || doc.string_is(choice, value)?))?
+    {
+        return Err(Error::Unsupported);
     }
     Ok(())
 }
