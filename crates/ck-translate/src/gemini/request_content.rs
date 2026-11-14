@@ -2,7 +2,7 @@ use super::Table;
 use super::request::{capture, preserve};
 use crate::codec::{
     Error, Result,
-    document::{Document, Text, Value},
+    document::{Document, Name, Text, Value},
     media::{self, Encoding, Registry},
     source::Span,
 };
@@ -27,6 +27,9 @@ pub(super) fn normalize(
             return Err(Error::Schema);
         }
     } else {
+        // A null role marks the absent one; a null source role is refused above.
+        let absent = doc.add(Some(Name::Static("role")), Value::Null)?;
+        preserve(owner, doc, message, absent, Some("role"))?;
         doc.set(message, "role", Value::Text("user"))?;
     }
     capture(owner, doc, message, &["role", "parts"], None)?;

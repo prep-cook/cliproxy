@@ -206,3 +206,49 @@ fn foreign_opaque_signatures_fail_the_gemini_fence() {
     );
     assert!(matches!(validate(&foreign_part), Err(codec::Error::Unsupported)));
 }
+
+/// Roles return as the client spelled them: absent stays absent, a system instruction keeps
+/// its role.
+#[test]
+fn source_role_spelling_round_trips() {
+    for system in [
+        json!({"parts":[{"text":"s"}]}),
+        json!({"role":"user","parts":[{"text":"s"}]}),
+    ] {
+        let input = json!({"systemInstruction":system,"contents":[
+            {"parts":[{"text":"a"}]},
+            {"role":"model","parts":[{"text":"b"}]},
+            {"role":"user","parts":[{"text":"c"}]}
+        ]});
+        let (out, _) = request(&input, Operation::Generate);
+        assert_eq!(out, input);
+    }
+}
+
+/// Gemini has no system role in `contents`; moving it to `systemInstruction` would reorder it.
+#[test]
+fn system_role_in_contents_is_refused() {
+    let mut mapped = Mapped::new();
+    let mut ingress = gemini::request::Ingress::new(
+        &mut mapped.writer,
+        &mapped.store,
+        identity(Direction::Request),
+        Operation::Generate,
+        "m",
+        1024,
+    )
+    .unwrap();
+    let result = ingress
+        .advance(
+            &mut mapped.writer,
+            br#"{"contents":[{"role":"user","parts":[{"text":"a"}]},{"role":"system","parts":[{"text":"s"}]}]}"#,
+        )
+        .and_then(|()| {
+            ingress
+                .finish(&mut mapped.writer, &gemini::request::GeminiCapability)
+                .map(|_| ())
+        });
+    assert!(result.is_err());
+    let raw = String::from_utf8(mapped.output(&mapped.writer)).unwrap();
+    assert!(!raw.contains("event: x_ck.request.end"));
+}

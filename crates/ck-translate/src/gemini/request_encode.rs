@@ -239,7 +239,15 @@ fn comma(first: &mut bool, e: &mut Encoder<'_, '_>) -> Result<()> {
 fn write_message(view: RequestView<'_>, message: usize, system: bool, e: &mut Encoder<'_, '_>) -> Result<()> {
     let doc = view.document;
     e.bytes(b"{")?;
-    if !system {
+    // The source spelling wins: a recorded null role was absent.
+    if let Some(entry) = super::origin(doc, message, "role")? {
+        let role = doc.required(entry, "value")?;
+        if !matches!(doc.node(role)?.value, Value::Null) {
+            e.bytes(b"\"role\":")?;
+            doc.write(role, e)?;
+            e.bytes(b",")?;
+        }
+    } else if !system {
         e.bytes(b"\"role\":")?;
         e.string(if super::is(doc, message, "role", "assistant")? {
             "model"

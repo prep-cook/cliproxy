@@ -287,10 +287,19 @@ fn messages(owner: &mut Writer, doc: &mut Document) -> Result<()> {
     let messages = doc.set(root, "messages", Value::Array)?;
     if let Some(system) = doc.remove(root, "systemInstruction")? {
         super::object(doc, system)?;
+        if let Some(role) = doc.remove(system, "role")? {
+            preserve(owner, doc, system, role, Some("role"))?;
+        }
         doc.set(system, "role", Value::Text("system"))?;
         doc.append(messages, system)?;
     }
     while let Some(message) = doc.node(contents)?.first {
+        // Egress writes a system message as `systemInstruction`, which would reorder it.
+        if let Some(role) = doc.member(message, "role")?
+            && doc.string_is(role, "system")?
+        {
+            return Err(Error::Schema);
+        }
         doc.detach(contents, message)?;
         doc.append(messages, message)?;
     }
