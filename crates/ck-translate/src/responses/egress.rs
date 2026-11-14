@@ -463,17 +463,13 @@ fn restore_originals(doc: &mut Document, x: usize, target: usize) -> Result<()> 
             return Err(Error::Schema);
         };
         let value = doc.remove(entry, "value")?.ok_or(Error::Schema)?;
-        // A later value of a started member replaces it.
-        let mut child = doc.node(target)?.first;
-        while let Some(at) = child {
-            child = doc.node(at)?.next;
-            if doc.names_equal(doc.node(at)?.name.ok_or(Error::Schema)?, Name::Pointer(pointer))? {
-                doc.detach(target, at)?;
-            }
-        }
         let field = doc.add(Some(Name::Pointer(pointer)), Value::Null)?;
         doc.transplant(field, value)?;
-        doc.append(target, field)?;
+        // A later value of a started member is merged into it: omitted nested members keep
+        // their started values (§3.6).
+        let carrier = doc.add(None, Value::Object)?;
+        doc.append(carrier, field)?;
+        super::merge(doc, target, carrier)?;
     }
     Ok(())
 }

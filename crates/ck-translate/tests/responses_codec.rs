@@ -22,6 +22,8 @@ mod media;
 mod recordings;
 #[path = "responses/request.rs"]
 mod request;
+#[path = "responses/rereview.rs"]
+mod rereview;
 #[path = "responses/response.rs"]
 mod response;
 #[path = "responses/review.rs"]

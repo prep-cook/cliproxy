@@ -32,7 +32,7 @@ impl State {
         let item = &mut self.items[at];
         if close && !item.blocks[block].closed {
             // Attributes the closing snapshot adds after the block started travel as originals.
-            let late = late_attributes(owner, &item.doc, item.blocks[block].value, doc, part)?;
+            let late = late_attributes(owner, &item.doc, &item.blocks[block], doc, part)?;
             self.emitter.emit(
                 owner,
                 Kind::BlockEnd,
@@ -335,14 +335,16 @@ impl State {
 }
 
 /// The members of snapshot `part` that the published block value lacks or holds with another
-/// value, other than its text, refusal, annotations and logprobs.
+/// value. A mapped block's text, refusal, annotations and logprobs travel as content instead;
+/// an opaque block maps none of its members.
 fn late_attributes(
     owner: &mut Writer,
     stored: &Document,
-    value: usize,
+    block: &Block,
     doc: &Document,
     part: usize,
 ) -> Result<Document> {
+    let value = block.value;
     super::super::mapped(owner, |e| {
         e.bytes(b"{")?;
         let mut first = true;
@@ -350,7 +352,7 @@ fn late_attributes(
             let name = doc.node(field)?.name.ok_or(Error::Schema)?;
             let mut known = false;
             for content in ["text", "refusal", "annotations", "logprobs"] {
-                known |= doc.name_is(name, content)?;
+                known |= !block.opaque && doc.name_is(name, content)?;
             }
             if known {
                 continue;
