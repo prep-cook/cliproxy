@@ -1,5 +1,7 @@
 #[path = "responses/golden.rs"]
 mod golden;
+#[path = "responses/recordings.rs"]
+mod recordings;
 // Test-only inclusion until the framework owner declares the production module.
 #[path = "../src/codec/mod.rs"]
 pub mod codec;
@@ -126,7 +128,7 @@ fn request_history_preserves_identity_encryption_and_structured_arguments() {
 }
 #[test]
 fn compact_preserves_opaque_items_and_usage_presence() {
-    let input = json!({"id":"c","object":"response.compaction","created_at":4,"model":"m","output":[{"id":"i","type":"compaction","encrypted_content":"secret"}],"usage":{"input_tokens":0,"output_tokens":null,"cache_write_by_ttl":{"300":7,"3600":9}}});
+    let input = json!({"id":"c","object":"response.compaction","created_at":4,"model":"m","output":[{"id":"i","type":"compaction","encrypted_content":"secret"}],"usage":{"input_tokens":0,"output_tokens":null,"cache_write_tokens":0,"input_tokens_details":{"cache_write_tokens":9},"cache_write_by_ttl":{"300":7,"3600":9}}});
     let (out, events) = response(
         &serde_json::to_vec(&input).unwrap(),
         BodyMode::Buffered,
@@ -140,6 +142,7 @@ fn compact_preserves_opaque_items_and_usage_presence() {
     assert_eq!(usage["usage"]["input_tokens"], 0);
     assert!(usage["usage"].get("output_tokens").is_none());
     assert_eq!(usage["usage"]["cache_write_by_ttl"]["3600"], 9);
+    assert_eq!(usage["usage"]["cache_write_tokens"], 0);
 }
 #[test]
 fn buffered_response_decomposes_text_tools_and_encrypted_reasoning() {
@@ -164,9 +167,18 @@ fn buffered_response_decomposes_text_tools_and_encrypted_reasoning() {
         if mode == BodyMode::Buffered {
             let out: Value = serde_json::from_slice(&out).unwrap();
             assert_eq!(out["output"][0]["encrypted_content"], "opaque==");
+            assert!(out["output"][0].get("content").is_none());
             assert_eq!(out["output"][1]["content"][0]["text"], "hello");
             assert_eq!(out["output"][2]["arguments"], "{\"x\":1}");
         } else {
+            assert!(
+                std::str::from_utf8(&out)
+                    .unwrap()
+                    .lines()
+                    .filter_map(|line| line.strip_prefix("data: "))
+                    .map(|line| serde_json::from_str::<Value>(line).unwrap())
+                    .all(|event| event["type"] != "response.content_part.added" || event["item_id"] != "reason")
+            );
             assert!(
                 std::str::from_utf8(&out)
                     .unwrap()
@@ -280,6 +292,7 @@ fn request_media_uses_canonical_data_without_inline_copy() {
 #[test]
 fn malformed_truncated_and_contradictory_responses_never_complete() {
     let cases=[
+        "data: \n\n".to_owned(),
         "data: {broken}\n\n".to_owned(),
         "event: response.output_text.delta\ndata: broken\n\n".to_owned(),
         "data: {\"type\":\"response.created\",\"response\":{\"id\":\"r\"}}\n\n".to_owned(),
@@ -386,6 +399,13 @@ fn full_reasoning_and_summary_have_independent_block_identity() {
             let text = std::str::from_utf8(&output).unwrap();
             assert!(text.contains("response.reasoning_text.delta"));
             assert!(text.contains("response.reasoning_summary_text.delta"));
+            let summary = text
+                .lines()
+                .filter_map(|line| line.strip_prefix("data: "))
+                .map(|line| serde_json::from_str::<Value>(line).unwrap())
+                .find(|event| event["type"] == "response.reasoning_summary_text.delta")
+                .unwrap();
+            assert_eq!(summary["summary_index"], 0);
         }
     }
 }
@@ -395,4 +415,287 @@ fn typed_tool_results_preserve_text_and_file_data() {
     let input = json!({"model":"m","input":[{"type":"function_call","call_id":"c","name":"f","arguments":"{}"},{"type":"function_call_output","call_id":"c","output":[{"type":"input_text","text":"ok"},{"type":"input_file","filename":"a.pdf","file_data":"data:application/pdf;base64,JVBERi0xLjQK"}]}]});
     let (output, _) = request(&input, Operation::Generate);
     assert_eq!(output["input"][1]["output"], input["input"][1]["output"]);
+}
+
+#[test]
+fn generated_images_use_media_data_and_preserve_partial_boundaries() {
+    use base64::Engine;
+    let raw: Vec<_> = (0..80_003).map(|i| (i % 251) as u8).collect();
+    let encoded = base64::engine::general_purpose::STANDARD.encode(&raw);
+    let item =
+        json!({"id":"img","type":"image_generation_call","status":"completed","result":encoded,"output_format":"png"});
+    let body = json!({"id":"r","model":"m","created_at":1,"status":"completed","output":[item],"x_ck_opaque":[]});
+    let wire=[
+        json!({"type":"response.created","response":{"id":"r","model":"m","created_at":1}}),
+        json!({"type":"response.output_item.added","output_index":0,"item":{"id":"img","type":"image_generation_call"}}),
+        json!({"type":"response.image_generation_call.partial_image","output_index":0,"item_id":"img","partial_image_index":3,"partial_image_b64":"AQID"}),
+        json!({"type":"response.output_item.done","output_index":0,"item":item}),
+        json!({"type":"response.completed","response":body}),
+    ].iter().map(|event|format!("data: {event}\n\n")).collect::<String>();
+    for mode in [BodyMode::Buffered, BodyMode::Streaming] {
+        let input = if mode == BodyMode::Buffered {
+            serde_json::to_vec(&body).unwrap()
+        } else {
+            wire.as_bytes().to_vec()
+        };
+        for downstream in [BodyMode::Buffered, BodyMode::Streaming] {
+            let (output, canonical) = response(&input, mode, downstream, Operation::Generate);
+            let media: Vec<_> = canonical.iter().filter(|event| event["kind"] == "image").collect();
+            assert_eq!(media.len(), if mode == BodyMode::Streaming { 2 } else { 1 });
+            let final_id = &media.last().unwrap()["x_ck"]["media_id"];
+            let reconstructed: Vec<_> = canonical
+                .iter()
+                .filter(|event| event["x_ck"]["media_id"] == *final_id && event["bytes"].is_string())
+                .flat_map(|event| {
+                    base64::engine::general_purpose::STANDARD
+                        .decode(event["bytes"].as_str().unwrap())
+                        .unwrap()
+                })
+                .collect();
+            assert_eq!(reconstructed, raw);
+            assert!(
+                canonical
+                    .iter()
+                    .all(|event| event["attributes"].get("result").is_none())
+            );
+            let projected: Value = if downstream == BodyMode::Buffered {
+                serde_json::from_slice(&output).unwrap()
+            } else {
+                let events: Vec<Value> = std::str::from_utf8(&output)
+                    .unwrap()
+                    .lines()
+                    .filter_map(|line| line.strip_prefix("data: "))
+                    .map(|line| serde_json::from_str(line).unwrap())
+                    .collect();
+                if mode == BodyMode::Streaming {
+                    let partial = events
+                        .iter()
+                        .find(|event| event["type"] == "response.image_generation_call.partial_image")
+                        .unwrap();
+                    assert_eq!(partial["partial_image_index"], 3);
+                    assert_eq!(partial["partial_image_b64"], "AQID");
+                }
+                events.last().unwrap()["response"].clone()
+            };
+            assert_eq!(projected["output"][0]["result"], encoded);
+            assert_eq!(projected["output"][0]["output_format"], "png");
+            if mode == BodyMode::Streaming && downstream == BodyMode::Buffered {
+                let carrier = projected["x_ck_opaque"].as_array().unwrap();
+                let preview = carrier
+                    .iter()
+                    .find(|entry| entry["type"] == "response.image_generation_call.partial_image")
+                    .unwrap();
+                assert_eq!(preview["partial_image_index"], 3);
+                assert_eq!(preview["partial_image_b64"], "AQID");
+                let native = carrier
+                    .iter()
+                    .find(|entry| entry["name"] == "responses.fields" && entry["value"].get("x_ck_opaque").is_some())
+                    .unwrap();
+                assert_eq!(native["value"]["x_ck_opaque"], json!([]));
+            }
+        }
+    }
+}
+
+#[test]
+fn compact_requests_replay_compaction_items_without_generation_controls() {
+    let input = json!({"model":"m","instructions":"retain facts","input":[{"id":"c","type":"compaction","encrypted_content":"exact+/=\n","vendor":null}]});
+    let (output, _) = request(&input, Operation::Compact);
+    assert_eq!(output["input"], input["input"]);
+    assert_eq!(output["instructions"], "retain facts");
+    assert!(output.get("stream").is_none());
+}
+
+#[test]
+fn reasoning_request_content_and_empty_reasoning_keep_native_identity() {
+    let input = json!({"model":"m","input":[{"id":"r","type":"reasoning","content":[{"type":"reasoning_text","text":"full","vendor":{"x":null}}],"summary":[{"type":"summary_text","text":"brief","vendor":0}]},{"id":"empty","type":"reasoning","summary":[]}]});
+    let (output, _) = request(&input, Operation::Generate);
+    assert_eq!(output["input"], input["input"]);
+}
+
+#[test]
+fn chat_requests_use_responses_fence_and_streamed_text_projection() {
+    for unsupported in [None, Some(("n", json!(2))), Some(("stop", json!(["end"])))] {
+        let text = "word ".repeat(900);
+        let mut input =
+            json!({"model":"m","messages":[{"role":"user","content":text}],"reasoning_effort":"high","temperature":0});
+        if let Some((field, value)) = &unsupported {
+            input[*field] = value.clone();
+        }
+        let mut m = Mapped::new();
+        let mut ingress = codec::chat::request::Ingress::new(
+            &mut m.writer,
+            &m.store,
+            identity(Direction::Request),
+            Operation::Generate,
+            100_000,
+        )
+        .unwrap();
+        for chunk in serde_json::to_vec(&input).unwrap().chunks(64) {
+            ingress.advance(&mut m.writer, chunk).unwrap();
+        }
+        let ready = ingress.finish(&mut m.writer, &responses::request::ResponsesCapability);
+        if unsupported.is_some() {
+            assert!(matches!(ready, Err(codec::Error::Unsupported)));
+            assert!(
+                !String::from_utf8(m.output(&m.writer))
+                    .unwrap()
+                    .contains("event: x_ck.request.end\n")
+            );
+        } else {
+            let encoded = responses::request::Egress {
+                destination: "responses",
+                upstream_stream: false,
+            }
+            .encode(&ready.unwrap(), &mut m.writer)
+            .unwrap();
+            let output: Value = serde_json::from_slice(&bytes(&encoded)).unwrap();
+            assert_eq!(output["input"][0]["content"], text);
+            assert_eq!(output["reasoning"]["effort"], "high");
+            assert_eq!(output["temperature"], 0);
+        }
+    }
+}
+
+#[test]
+fn native_extension_fields_use_noncontrol_carriers_not_incomplete_native_events() {
+    let input=b"data: {\"type\":\"response.created\",\"response\":{\"id\":\"r\"}}\n\nid: source-id\ndata: {\"type\":\"response.output_item.added\",\"sequence_number\":41,\"output_index\":0,\"item\":{\"id\":\"i\",\"type\":\"message\"},\"vendor\":{\"x_ck\":{\"seq\":900}}}\n\ndata: {\"type\":\"response.completed\",\"sequence_number\":42,\"vendor\":null,\"response\":{\"id\":\"r\",\"status\":\"completed\",\"output\":[{\"id\":\"i\",\"type\":\"message\",\"content\":[]}]}}\n\n";
+    let (output, _) = response(input, BodyMode::Streaming, BodyMode::Streaming, Operation::Generate);
+    let events: Vec<Value> = std::str::from_utf8(&output)
+        .unwrap()
+        .lines()
+        .filter_map(|line| line.strip_prefix("data: "))
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    assert!(
+        events
+            .iter()
+            .filter(|event| event["type"] == "response.output_item.added")
+            .all(|event| event["item"].is_object())
+    );
+    let carrier = events
+        .iter()
+        .find(|event| event["type"] == "x_ck_opaque" && event["source"]["sequence"] == 41)
+        .unwrap();
+    assert_eq!(carrier["value"]["vendor"]["x_ck"]["seq"], 900);
+    assert_eq!(carrier["source"]["event"], "response.output_item.added");
+    let terminal = events
+        .iter()
+        .find(|event| event["type"] == "x_ck_opaque" && event["source"]["sequence"] == 42)
+        .unwrap();
+    assert!(terminal["value"].get("vendor").unwrap().is_null());
+    assert_eq!(events.last().unwrap()["type"], "response.completed");
+}
+
+#[test]
+fn image_previews_require_an_open_image_item() {
+    for closed_image in [false, true] {
+        let item = if closed_image {
+            json!({"id":"i","type":"image_generation_call","result":"AQID"})
+        } else {
+            json!({"id":"i","type":"message","content":[]})
+        };
+        let mut records = vec![json!({"type":"response.output_item.added","output_index":0,"item":item})];
+        if closed_image {
+            records.push(json!({"type":"response.output_item.done","output_index":0,"item":item}));
+        }
+        records.push(json!({"type":"response.image_generation_call.partial_image","output_index":0,"item_id":"i","partial_image_index":0,"partial_image_b64":"AQID"}));
+        records.push(json!({"type":"response.completed","response":{"id":"r","status":"completed","output":[item]}}));
+        let wire = records
+            .iter()
+            .map(|event| format!("data: {event}\n\n"))
+            .collect::<String>();
+        let mut m = Mapped::new();
+        let mut ingress = responses::response::Ingress::new(
+            &mut m.writer,
+            identity(Direction::Response),
+            Operation::Generate,
+            BodyMode::Streaming,
+            100_000,
+        )
+        .unwrap();
+        let result = ingress
+            .advance(&mut m.writer, wire.as_bytes())
+            .and_then(|()| ingress.finish(&mut m.writer));
+        assert!(result.is_err());
+        let canonical = String::from_utf8(m.output(&m.writer)).unwrap();
+        assert!(canonical.contains("event: x_ck.error\n"));
+        assert!(!canonical.contains("event: x_ck.done\n"));
+    }
+}
+
+#[test]
+fn interleaved_items_and_content_keep_native_indexes_and_final_order() {
+    let first = json!({"id":"first","type":"message","content":[{"type":"output_text","text":"a"},{"type":"output_text","text":"b"}]});
+    let second = json!({"id":"second","type":"message","content":[]});
+    let events = [
+        json!({"type":"response.output_item.added","output_index":1,"item":{"id":"second","type":"message"}}),
+        json!({"type":"response.output_item.added","output_index":0,"item":{"id":"first","type":"message"}}),
+        json!({"type":"response.output_text.delta","output_index":0,"item_id":"first","content_index":1,"delta":"b"}),
+        json!({"type":"response.output_text.delta","output_index":0,"item_id":"first","content_index":0,"delta":"a"}),
+        json!({"type":"response.completed","response":{"id":"r","status":"completed","output":[first,second]}}),
+    ];
+    let wire = events
+        .iter()
+        .map(|event| format!("data: {event}\n\n"))
+        .collect::<String>();
+    for mode in [BodyMode::Buffered, BodyMode::Streaming] {
+        let (output, _) = response(wire.as_bytes(), BodyMode::Streaming, mode, Operation::Generate);
+        let body: Value = if mode == BodyMode::Buffered {
+            serde_json::from_slice(&output).unwrap()
+        } else {
+            let events: Vec<Value> = std::str::from_utf8(&output)
+                .unwrap()
+                .lines()
+                .filter_map(|line| line.strip_prefix("data: "))
+                .map(|line| serde_json::from_str(line).unwrap())
+                .collect();
+            let starts: Vec<_> = events
+                .iter()
+                .filter(|event| event["type"] == "response.output_item.added")
+                .map(|event| event["output_index"].as_u64().unwrap())
+                .collect();
+            assert_eq!(starts, [1, 0]);
+            let b = events
+                .iter()
+                .find(|event| event["type"] == "response.output_text.delta" && event["delta"] == "b")
+                .unwrap();
+            assert_eq!(b["output_index"], 0);
+            assert_eq!(b["content_index"], 1);
+            events.last().unwrap()["response"].clone()
+        };
+        assert_eq!(body["output"][0]["id"], "first");
+        assert_eq!(body["output"][1]["id"], "second");
+        assert_eq!(body["output"][0]["content"], first["content"]);
+    }
+}
+
+#[test]
+fn legacy_redacted_thinking_is_not_reclassified_as_an_encryption_signature() {
+    let carrier = "claude-redacted-thinking:opaque\n+/=";
+    let body = json!({"id":"r","status":"completed","output":[{"id":"reason","type":"reasoning","encrypted_content":carrier,"summary":[]}]});
+    for mode in [BodyMode::Buffered, BodyMode::Streaming] {
+        let (output, canonical) = response(
+            &serde_json::to_vec(&body).unwrap(),
+            BodyMode::Buffered,
+            mode,
+            Operation::Generate,
+        );
+        assert!(canonical.iter().any(|event| event["data"] == "opaque\n+/="));
+        assert!(!canonical.iter().any(|event| event["kind"] == "responses_encrypted"));
+        let projected: Value = if mode == BodyMode::Buffered {
+            serde_json::from_slice(&output).unwrap()
+        } else {
+            std::str::from_utf8(&output)
+                .unwrap()
+                .lines()
+                .filter_map(|line| line.strip_prefix("data: "))
+                .map(|line| serde_json::from_str::<Value>(line).unwrap())
+                .next_back()
+                .unwrap()["response"]
+                .clone()
+        };
+        assert_eq!(projected["output"][0]["encrypted_content"], carrier);
+        assert!(projected["output"][0].get("content").is_none());
+    }
 }

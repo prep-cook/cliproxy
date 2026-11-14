@@ -7,6 +7,15 @@ use crate::codec::{
 pub(super) fn write(doc: &Document, e: &mut Encoder<'_, '_>) -> Result<()> {
     let root = doc.root();
     let x = doc.required(root, "x_ck")?;
+    if super::is(doc, root, "name", "responses.fields")? {
+        e.bytes(b"event: x_ck_opaque\ndata: {\"type\":\"x_ck_opaque\",\"name\":\"responses.fields\",\"value\":")?;
+        doc.write(doc.required(root, "value")?, e)?;
+        if let Some(source) = doc.member(x, "source")? {
+            e.bytes(b",\"source\":")?;
+            doc.write(source, e)?;
+        }
+        return e.bytes(b"}\n\n");
+    }
     if let Some(source) = doc.member(x, "source")?
         && let Some(fields) = doc.member(source, "sse")?
     {
@@ -70,5 +79,23 @@ pub(super) fn retain(doc: &mut Document, incoming: Document) -> Result<()> {
     }
     let x = doc.required(event, "x_ck")?;
     super::move_field(doc, x, "source", entry, "source")?;
+    Ok(())
+}
+
+pub(super) fn preserve_carrier_collision(doc: &mut Document, incoming: usize) -> Result<()> {
+    let Some(carrier) = doc.member(doc.root(), "x_ck_opaque")? else {
+        return Ok(());
+    };
+    let Some(native) = doc.remove(incoming, "x_ck_opaque")? else {
+        return Ok(());
+    };
+    let entry = doc.add(None, Value::Object)?;
+    doc.append(carrier, entry)?;
+    doc.set(entry, "name", Value::Text("responses.fields"))?;
+    doc.set(entry, "format", Value::Text("json"))?;
+    let value = doc.set(entry, "value", Value::Object)?;
+    doc.append(value, native)?;
+    let source = doc.set(entry, "source", Value::Object)?;
+    doc.set(source, "protocol", Value::Text("responses"))?;
     Ok(())
 }

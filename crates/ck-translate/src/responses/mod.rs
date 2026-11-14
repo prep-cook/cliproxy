@@ -2,11 +2,14 @@
 
 mod content;
 pub mod egress;
+mod image;
 mod opaque;
 pub mod request;
 pub mod response;
 mod snapshot;
 mod usage;
+
+const REDACTED_PREFIX: &str = "claude-redacted-thinking:";
 
 use crate::codec::{
     Error, Result,
@@ -28,7 +31,7 @@ fn mapped(owner: &mut Writer, write: impl Fn(&mut Encoder<'_, '_>) -> Result<()>
 fn string(doc: &Document, node: usize) -> Result<()> {
     if matches!(
         doc.node(node)?.value,
-        Value::String(_) | Value::Text(_) | Value::Id(_) | Value::Fragments
+        Value::String(_) | Value::Text(_) | Value::Id(_) | Value::Fragments | Value::Utf8Media
     ) {
         Ok(())
     } else {

@@ -90,6 +90,10 @@ impl Usage {
                     for (from, to) in fields {
                         if let Some(n) = doc.member(details, from)?
                             && !matches!(doc.node(n)?.value, Value::Null)
+                            && (to != &"cache_write_tokens"
+                                || doc
+                                    .member(root, to)?
+                                    .is_none_or(|n| matches!(doc.node(n).map(|n| n.value), Ok(Value::Null))))
                         {
                             doc.unsigned(n)?;
                             e.bytes(b",")?;

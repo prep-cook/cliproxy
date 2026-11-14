@@ -51,6 +51,7 @@ impl Ingress {
                 metadata: owner.reserve_metadata(0)?,
                 usage: Usage::default(),
                 terminal: false,
+                next_media: 0,
             },
             failed: false,
         })
@@ -133,6 +134,7 @@ struct Item {
     arguments: Option<usize>,
     tool_closed: bool,
     encrypted: bool,
+    image: Option<[u8; 32]>,
 }
 struct State {
     emitter: Emitter,
@@ -143,6 +145,7 @@ struct State {
     metadata: MetadataPermit,
     usage: Usage,
     terminal: bool,
+    next_media: u64,
 }
 impl Item {
     fn scope(&self, block: Option<u64>) -> Scope {
@@ -227,11 +230,16 @@ impl State {
             }
             return Ok(());
         }
-        let lease = encode::scratch(owner, |e| event.write_data(source, |b| e.bytes(b)))?;
-        let mut data = Source::new(owner)?;
-        data.push_scratch(lease)?;
-        let len = data.len();
-        let doc = match Document::parse(owner, data, len) {
+        let parsed = if event.data_len(source)? == 0 {
+            Err(Error::Json)
+        } else {
+            let lease = encode::scratch(owner, |e| event.write_data(source, |b| e.bytes(b)))?;
+            let mut data = Source::new(owner)?;
+            data.push_scratch(lease)?;
+            let len = data.len();
+            Document::parse(owner, data, len)
+        };
+        let doc = match parsed {
             Ok(doc) => doc,
             Err(Error::Json | Error::Truncated) => {
                 let name = event.name(source)?.ok_or(Error::Json)?;
@@ -290,6 +298,7 @@ impl State {
         }
         if is(&doc, root, "type", "response.completed")? || is(&doc, root, "type", "response.incomplete")? {
             let response = doc.required(root, "response")?;
+            self.unknown(owner, &doc, &["type", "response", "sequence_number"], source, event)?;
             return self.complete(owner, &doc, response);
         }
         if is(&doc, root, "type", "response.created")? || is(&doc, root, "type", "response.in_progress")? {
@@ -322,6 +331,11 @@ impl State {
             let part = doc.required(root, "part")?;
             self.block(owner, at, (index, summary), &doc, part, (true, true))?;
         } else if self.text_event(owner, &doc)? {
+        } else if is(&doc, root, "type", "response.image_generation_call.partial_image")? {
+            let at = self.find_event(&doc)?;
+            let data = doc.required(root, "partial_image_b64")?;
+            let partial = doc.unsigned(doc.required(root, "partial_image_index")?)?;
+            self.image(owner, at, &doc, data, Some(partial))?;
         } else if is(&doc, root, "type", "response.function_call_arguments.delta")?
             || is(&doc, root, "type", "response.custom_tool_call_input.delta")?
         {
@@ -385,6 +399,8 @@ impl State {
                 "input",
                 "annotation",
                 "sequence_number",
+                "partial_image_b64",
+                "partial_image_index",
             ],
             source,
             event,
@@ -477,14 +493,7 @@ impl State {
         if self.items.iter().any(|item| item.index == index) {
             return Err(Error::Schema);
         }
-        let native = super::mapped(owner, |e| {
-            write_except(
-                doc,
-                node,
-                e,
-                &["content", "summary", "arguments", "input", "encrypted_content"],
-            )
-        })?;
+        let native = super::mapped(owner, |e| item_metadata(doc, node, e))?;
         let root = native.root();
         let id = media::local_id(b'i', index)?;
         let tool = is(&native, root, "type", "function_call")? || is(&native, root, "type", "custom_tool_call")?;
@@ -542,6 +551,7 @@ impl State {
             arguments: None,
             tool_closed: false,
             encrypted: false,
+            image: None,
         };
         if tool {
             let custom = item.custom()?;
@@ -871,6 +881,12 @@ impl State {
                 return Err(Error::Schema);
             }
         }
+        if is(doc, node, "type", "image_generation_call")?
+            && let Some(data) = doc.member(node, "result")?
+            && !matches!(doc.node(data)?.value, Value::Null)
+        {
+            self.image(owner, at, doc, data, None)?;
+        }
         for (name, summary) in [("content", false), ("summary", true)] {
             if let Some(parts) = doc.member(node, name)? {
                 for (index, part) in doc.children(parts)?.enumerate() {
@@ -890,20 +906,48 @@ impl State {
             string(doc, encrypted)?;
             let item = &mut self.items[at];
             if !item.encrypted {
+                let mut chars = doc.chars(encrypted)?;
+                let mut redacted = true;
+                for c in super::REDACTED_PREFIX.chars() {
+                    redacted &= chars.next_scalar()? == Some(c);
+                }
                 let index = u64::MAX;
                 let scope = item.scope(Some(index));
                 self.emitter.emit(
                     owner,
                     Kind::BlockStart,
                     scope,
-                    |e| e.bytes(b",\"kind\":\"thinking\""),
+                    |e| {
+                        e.bytes(if redacted {
+                            b",\"kind\":\"thinking\",\"attributes\":{\"type\":\"redacted\"}"
+                        } else {
+                            b",\"kind\":\"thinking\",\"attributes\":{\"type\":\"encrypted\"}"
+                        })
+                    },
                     |_| Ok(()),
                 )?;
                 self.emitter.emit(
                     owner,
-                    Kind::ReasoningSignature,
+                    if redacted {
+                        Kind::ReasoningRedacted
+                    } else {
+                        Kind::ReasoningSignature
+                    },
                     scope,
                     |e| {
+                        if redacted {
+                            e.bytes(b",\"data\":")?;
+                            return e.quoted_json(|e| {
+                                let mut chars = doc.chars(encrypted)?;
+                                for _ in super::REDACTED_PREFIX.chars() {
+                                    chars.next_scalar()?;
+                                }
+                                while let Some(c) = chars.next_scalar()? {
+                                    e.bytes(c.encode_utf8(&mut [0; 4]).as_bytes())?;
+                                }
+                                Ok(())
+                            });
+                        }
                         e.bytes(b",\"kind\":\"responses_encrypted\",\"fragment\":")?;
                         doc.write(encrypted, e)?;
                         e.bytes(b",\"final\":true")
@@ -945,16 +989,48 @@ impl State {
                         "completed"
                     })?;
                     e.bytes(b",\"attributes\":")?;
-                    write_except(
-                        doc,
-                        node,
-                        e,
-                        &["content", "summary", "arguments", "input", "encrypted_content"],
-                    )
+                    item_metadata(doc, node, e)
                 },
                 |_| Ok(()),
             )?;
             item.closed = true;
+        }
+        Ok(())
+    }
+    fn image(
+        &mut self,
+        owner: &mut Writer,
+        at: usize,
+        doc: &Document,
+        data: usize,
+        partial: Option<u64>,
+    ) -> Result<()> {
+        let item = &self.items[at];
+        if !is(&item.doc, item.doc.root(), "type", "image_generation_call")? || (partial.is_some() && item.closed) {
+            return Err(Error::Schema);
+        }
+        if partial.is_none()
+            && let Some(previous) = self.items[at].image
+        {
+            return if previous == super::image::digest(doc, data)? {
+                Ok(())
+            } else {
+                Err(Error::Schema)
+            };
+        }
+        let id = media::local_id(b'm', self.next_media)?;
+        self.next_media = self.next_media.checked_add(1).ok_or(Error::Limit)?;
+        let digest = super::image::publish(
+            owner,
+            &mut self.emitter,
+            doc,
+            data,
+            self.items[at].scope(None),
+            id,
+            partial,
+        )?;
+        if partial.is_none() {
+            self.items[at].image = Some(digest);
         }
         Ok(())
     }
@@ -1079,7 +1155,7 @@ fn validate_arguments(owner: &mut Writer, item: &Item) -> Result<()> {
     Document::parse(owner, source, len)?;
     Ok(())
 }
-fn reserve<T>(values: &mut Vec<T>, metadata: &mut MetadataPermit) -> Result<()> {
+pub(super) fn reserve<T>(values: &mut Vec<T>, metadata: &mut MetadataPermit) -> Result<()> {
     if values.len() == values.capacity() {
         let capacity = values.capacity().max(4).checked_mul(2).ok_or(Error::Limit)?;
         metadata.resize(capacity.checked_mul(std::mem::size_of::<T>()).ok_or(Error::Limit)?)?;
@@ -1133,6 +1209,11 @@ fn sse_source(source: &Source, event: &sse::Event, native: Option<&Document>, e:
     if let Some(name) = event.name(source)? {
         e.bytes(b",\"event\":")?;
         e.quoted_json(|e| e.span(source, name))?;
+    } else if let Some(doc) = native
+        && let Some(kind) = doc.member(doc.root(), "type")?
+    {
+        e.bytes(b",\"event\":")?;
+        doc.write(kind, e)?;
     }
     e.bytes(b",\"sse\":[")?;
     let mut first = true;
@@ -1247,4 +1328,20 @@ fn equal(a: &Document, an: usize, b: &Document, bn: usize) -> Result<bool> {
             return Ok(true);
         }
     }
+}
+
+fn item_metadata(doc: &Document, node: usize, e: &mut Encoder<'_, '_>) -> Result<()> {
+    let fields: &[&str] = if is(doc, node, "type", "image_generation_call")? {
+        &[
+            "content",
+            "summary",
+            "arguments",
+            "input",
+            "encrypted_content",
+            "result",
+        ]
+    } else {
+        &["content", "summary", "arguments", "input", "encrypted_content"]
+    };
+    write_except(doc, node, e, fields)
 }

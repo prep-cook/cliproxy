@@ -15,6 +15,8 @@ pub struct Egress<F: FnMut(&'static str, u64)> {
     terminal: bool,
     sequence: u64,
     diagnostic: F,
+    images: Vec<super::image::Projection>,
+    image_metadata: ck_stream::MetadataPermit,
 }
 impl<F: FnMut(&'static str, u64)> Egress<F> {
     pub fn new(
@@ -45,6 +47,8 @@ impl<F: FnMut(&'static str, u64)> Egress<F> {
             terminal: false,
             sequence: 0,
             diagnostic,
+            images: Vec::new(),
+            image_metadata: owner.reserve_metadata(0)?,
         })
     }
     fn emit(
@@ -128,12 +132,16 @@ impl<F: FnMut(&'static str, u64)> Egress<F> {
             );
         }
         if kind == Kind::Done {
+            if self.images.iter().any(|image| !image.closed) {
+                return Err(Error::Truncated);
+            }
             self.terminal = true;
             let doc = &mut self.document;
             let root = doc.root();
             if is(doc, root, "status", "in_progress")? {
                 doc.set(root, "status", Value::Text("completed"))?;
             }
+            order_array(doc, doc.required(root, "output")?, "output_index", owner)?;
             let response = encode::scratch(owner, |e| write_response(doc, e))?;
             if self.mode == BodyMode::Buffered {
                 return output(response);
@@ -158,6 +166,7 @@ impl<F: FnMut(&'static str, u64)> Egress<F> {
                 let doc = &mut self.document;
                 let node = doc.absorb(incoming)?;
                 let value = doc.required(node, "value")?;
+                super::opaque::preserve_carrier_collision(doc, value)?;
                 super::merge(doc, doc.root(), value)?;
                 return Ok(());
             }
@@ -177,6 +186,55 @@ impl<F: FnMut(&'static str, u64)> Egress<F> {
         let doc = &mut self.document;
         let x = doc.required(node, "x_ck")?;
         let output_node = doc.required(doc.root(), "output")?;
+        if matches!(kind, Kind::Data | Kind::MediaEnd) {
+            let id = doc.required(x, "media_id")?;
+            let mut found = None;
+            for (index, image) in self.images.iter().enumerate() {
+                if super::snapshot::equal(doc, image.id, doc, id)? {
+                    found = Some(index);
+                    break;
+                }
+            }
+            let image = &mut self.images[found.ok_or(Error::Schema)?];
+            if kind == Kind::Data {
+                return image.append(doc, node);
+            }
+            image.end(doc, node)?;
+            if let Some(partial) = image.partial {
+                if self.mode == BodyMode::Buffered {
+                    let array = match doc.member(doc.root(), "x_ck_opaque")? {
+                        Some(n) => n,
+                        None => doc.set(doc.root(), "x_ck_opaque", Value::Array)?,
+                    };
+                    let entry = doc.add(None, Value::Object)?;
+                    doc.append(array, entry)?;
+                    doc.set(
+                        entry,
+                        "type",
+                        Value::Text("response.image_generation_call.partial_image"),
+                    )?;
+                    doc.set(entry, "output_index", Value::Unsigned(image.output_index))?;
+                    doc.set(entry, "partial_image_index", Value::Unsigned(partial))?;
+                    doc.rename(image.data, "partial_image_b64")?;
+                    doc.append(entry, image.data)?;
+                    return Ok(());
+                }
+                let payload = encode::scratch(owner, |e| {
+                    item_fields(doc, image.item, image.output_index, e)?;
+                    e.bytes(b",\"partial_image_index\":")?;
+                    e.unsigned(partial)?;
+                    e.bytes(b",\"partial_image_b64\":")?;
+                    doc.write(image.data, e)
+                })?;
+                return self.emit(
+                    owner,
+                    "response.image_generation_call.partial_image",
+                    |e| write_lease(&payload, e),
+                    output,
+                );
+            }
+            return Ok(());
+        }
         if kind == Kind::Usage {
             let usage = doc.required(node, "usage")?;
             let value = if let Some(native) = doc.member(usage, "native")? {
@@ -221,7 +279,7 @@ impl<F: FnMut(&'static str, u64)> Egress<F> {
                 doc.set(item, "summary", Value::Array)?;
             }
             doc.bind_origin(item, x, None)?;
-            let index = doc.children(output_node)?.count() as u64 - 1;
+            let index = native_index(doc, item, "output_index", doc.children(output_node)?.count() as u64 - 1)?;
             let payload = encode::scratch(owner, |e| {
                 e.bytes(b",\"output_index\":")?;
                 e.unsigned(index)?;
@@ -241,6 +299,12 @@ impl<F: FnMut(&'static str, u64)> Egress<F> {
             }
             return Err(Error::Schema);
         };
+        if kind == Kind::MediaStart {
+            super::response::reserve(&mut self.images, &mut self.image_metadata)?;
+            self.images
+                .push(super::image::Projection::start(doc, node, item, index)?);
+            return Ok(());
+        }
         if kind == Kind::ToolStart {
             if is(doc, node, "kind", "custom")? {
                 doc.set(item, "type", Value::Text("custom_tool_call"))?;
@@ -272,6 +336,12 @@ impl<F: FnMut(&'static str, u64)> Egress<F> {
         if kind == Kind::BlockStart {
             let summary = is(doc, node, "kind", "reasoning_summary")?;
             let thinking = is(doc, node, "kind", "thinking")? || is(doc, node, "kind", "reasoning")?;
+            if thinking
+                && let Some(attributes) = doc.member(node, "attributes")?
+                && (is(doc, attributes, "type", "encrypted")? || is(doc, attributes, "type", "redacted")?)
+            {
+                return Ok(());
+            }
             let parts = match doc.member(item, if summary { "summary" } else { "content" })? {
                 Some(p) => p,
                 None => doc.set(item, if summary { "summary" } else { "content" }, Value::Array)?,
@@ -303,7 +373,12 @@ impl<F: FnMut(&'static str, u64)> Egress<F> {
                 } else {
                     b",\"content_index\":"
                 })?;
-                doc.write(doc.required(x, "block_index")?, e)?;
+                e.unsigned(native_index(
+                    doc,
+                    part,
+                    if summary { "summary_index" } else { "content_index" },
+                    doc.children(parts)?.count() as u64 - 1,
+                )?)?;
                 e.bytes(b",\"part\":")?;
                 write_part(doc, part, e)
             })?;
@@ -412,7 +487,8 @@ impl<F: FnMut(&'static str, u64)> Egress<F> {
         if kind == Kind::ReasoningRedacted {
             let data = doc.required(node, "data")?;
             let lease = encode::scratch(owner, |e| {
-                e.bytes(b"\"claude-redacted-thinking:")?;
+                e.bytes(b"\"")?;
+                e.bytes(super::REDACTED_PREFIX.as_bytes())?;
                 doc.write_contents(data, e)?;
                 e.bytes(b"\"")
             })?;
@@ -501,6 +577,11 @@ impl<F: FnMut(&'static str, u64)> Egress<F> {
                     "completed"
                 }),
             )?;
+            for (field, index_field) in [("content", "content_index"), ("summary", "summary_index")] {
+                if let Some(parts) = doc.member(item, field)? {
+                    order_array(doc, parts, index_field, owner)?;
+                }
+            }
             let payload = encode::scratch(owner, |e| {
                 e.bytes(b",\"output_index\":")?;
                 e.unsigned(index)?;
@@ -565,7 +646,7 @@ fn find_item(doc: &Document, output: usize, x: usize) -> Result<Option<(usize, u
         if let Some((origin, _)) = doc.origin(item)?
             && doc.equal_strings(doc.required(origin, "item_id")?, local)?
         {
-            return Ok(Some((item, index as u64)));
+            return Ok(Some((item, native_index(doc, item, "output_index", index as u64)?)));
         }
     }
     Ok(None)
@@ -577,11 +658,20 @@ fn find_part(doc: &Document, item: usize, x: usize) -> Result<Option<(usize, boo
     let block = doc.unsigned(block)?;
     for (name, summary) in [("content", false), ("summary", true)] {
         if let Some(parts) = doc.member(item, name)? {
-            for part in doc.children(parts)? {
+            for (index, part) in doc.children(parts)?.enumerate() {
                 if let Some((origin, _)) = doc.origin(part)?
                     && doc.unsigned(doc.required(origin, "block_index")?)? == block
                 {
-                    return Ok(Some((part, summary, block)));
+                    return Ok(Some((
+                        part,
+                        summary,
+                        native_index(
+                            doc,
+                            part,
+                            if summary { "summary_index" } else { "content_index" },
+                            index as u64,
+                        )?,
+                    )));
                 }
             }
         }
@@ -646,4 +736,45 @@ fn write_response(doc: &Document, e: &mut Encoder<'_, '_>) -> Result<()> {
         }
     }
     e.bytes(b"}")
+}
+
+fn native_index(doc: &Document, node: usize, field: &str, fallback: u64) -> Result<u64> {
+    if let Some((origin, _)) = doc.origin(node)?
+        && let Some(source) = doc.member(origin, "source")?
+        && is(doc, source, "protocol", "responses")?
+        && let Some(index) = doc.member(source, field)?
+    {
+        return doc.unsigned(index);
+    }
+    Ok(fallback)
+}
+
+fn order_array(doc: &mut Document, array: usize, field: &str, owner: &mut Writer) -> Result<()> {
+    let mut previous = None;
+    let mut unordered = false;
+    for (index, node) in doc.children(array)?.enumerate() {
+        let index = native_index(doc, node, field, index as u64)?;
+        unordered |= previous.is_some_and(|previous| previous >= index);
+        previous = Some(index);
+    }
+    if !unordered {
+        return Ok(());
+    }
+    let mut order = Vec::new();
+    let mut metadata = owner.reserve_metadata(0)?;
+    for (index, node) in doc.children(array)?.enumerate() {
+        super::response::reserve(&mut order, &mut metadata)?;
+        order.push((native_index(doc, node, field, index as u64)?, node));
+    }
+    order.sort_unstable_by_key(|entry| entry.0);
+    if order.windows(2).any(|pair| pair[0].0 == pair[1].0) {
+        return Err(Error::Schema);
+    }
+    while let Some(node) = doc.node(array)?.first {
+        doc.detach(array, node)?;
+    }
+    for (_, node) in order {
+        doc.append(array, node)?;
+    }
+    Ok(())
 }

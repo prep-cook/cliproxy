@@ -392,14 +392,36 @@ fn normalize_item(
         }
         preserve_unknown(doc, owner, original, item, &["role", "tool_call_id", "content", "name"])?;
     } else if is(doc, item, "type", "reasoning")? || is(doc, item, "type", "compaction")? {
+        let compaction = is(doc, item, "type", "compaction")?;
+        doc.bind_origin(
+            item,
+            original,
+            Some(if compaction {
+                "responses.compaction"
+            } else {
+                "responses.reasoning"
+            }),
+        )?;
         doc.append(messages, item)?;
         doc.set(item, "role", Value::Text("assistant"))?;
+        let native_content = doc.remove(item, "content")?;
         let content = doc.set(item, "content", Value::Array)?;
+        if let Some(parts) = native_content {
+            while let Some(part) = doc.node(parts)?.first {
+                doc.detach(parts, part)?;
+                if is(doc, part, "type", "reasoning_text")? {
+                    doc.set(part, "type", Value::Text("reasoning"))?;
+                }
+                preserve_unknown(doc, owner, original, part, &["type", "text"])?;
+                doc.append(content, part)?;
+            }
+        }
         if let Some(summary) = doc.remove(item, "summary")? {
             while let Some(part) = doc.node(summary)?.first {
                 doc.detach(summary, part)?;
                 doc.set(part, "type", Value::Text("reasoning_summary"))?;
                 doc.append(content, part)?;
+                preserve_unknown(doc, owner, original, part, &["type", "text"])?;
             }
         }
         if let Some(data) = doc.remove(item, "encrypted_content")? {
@@ -618,7 +640,7 @@ fn validate(view: RequestView<'_>) -> Result<()> {
         }
         if let Some(content) = doc.member(message, "content")? {
             match doc.node(content)?.value {
-                Value::String(_) | Value::Text(_) => (),
+                Value::String(_) | Value::Text(_) | Value::Fragments | Value::Utf8Media => (),
                 Value::Array => {
                     for part in doc.children(content)? {
                         let kind = doc.required(part, "type")?;
@@ -859,27 +881,62 @@ fn write_request(view: RequestView<'_>, streaming: bool, e: &mut Encoder<'_, '_>
                 && doc.children(content)?.any(|p| {
                     is(doc, p, "type", "encrypted").unwrap_or(false)
                         || is(doc, p, "type", "reasoning_summary").unwrap_or(false)
+                        || is(doc, p, "type", "reasoning").unwrap_or(false)
+                })
+                || doc.origin(message)?.is_some_and(|(_, carrier)| {
+                    matches!(carrier, Some("responses.compaction" | "responses.reasoning"))
                 });
             if !first {
                 e.bytes(b",")?;
             }
             first = false;
             if reasoning {
-                e.bytes(b"{\"type\":\"reasoning\",\"summary\":[")?;
-                let mut comma = false;
-                for part in doc.children(content)? {
-                    if is(doc, part, "type", "reasoning_summary")? {
-                        if comma {
-                            e.bytes(b",")?;
+                let compaction = doc
+                    .origin(message)?
+                    .is_some_and(|(_, carrier)| carrier == Some("responses.compaction"));
+                e.bytes(b"{\"type\":")?;
+                e.string(if compaction { "compaction" } else { "reasoning" })?;
+                let summary = !compaction
+                    || doc
+                        .children(content)?
+                        .any(|part| is(doc, part, "type", "reasoning_summary").unwrap_or(false));
+                if summary {
+                    e.bytes(b",\"summary\":[")?;
+                    let mut comma = false;
+                    for part in doc.children(content)? {
+                        if is(doc, part, "type", "reasoning_summary")? {
+                            if comma {
+                                e.bytes(b",")?;
+                            }
+                            comma = true;
+                            e.bytes(b"{\"type\":\"summary_text\",\"text\":")?;
+                            doc.write(doc.required(part, "text")?, e)?;
+                            originals(doc, part, e, &[])?;
+                            e.bytes(b"}")?;
                         }
-                        comma = true;
-                        e.bytes(b"{\"type\":\"summary_text\",\"text\":")?;
-                        doc.write(doc.required(part, "text")?, e)?;
-                        originals(doc, part, e, &[])?;
-                        e.bytes(b"}")?;
                     }
+                    e.bytes(b"]")?;
                 }
-                e.bytes(b"]")?;
+                if doc
+                    .children(content)?
+                    .any(|part| is(doc, part, "type", "reasoning").unwrap_or(false))
+                {
+                    e.bytes(b",\"content\":[")?;
+                    let mut comma = false;
+                    for part in doc.children(content)? {
+                        if is(doc, part, "type", "reasoning")? {
+                            if comma {
+                                e.bytes(b",")?;
+                            }
+                            comma = true;
+                            e.bytes(b"{\"type\":\"reasoning_text\",\"text\":")?;
+                            doc.write(doc.required(part, "text")?, e)?;
+                            originals(doc, part, e, &[])?;
+                            e.bytes(b"}")?;
+                        }
+                    }
+                    e.bytes(b"]")?;
+                }
                 if let Some(x) = doc.member(root, "x_ck")?
                     && let Some(replay) = doc.member(x, "replay")?
                 {
@@ -913,8 +970,11 @@ fn write_request(view: RequestView<'_>, streaming: bool, e: &mut Encoder<'_, '_>
             }
         }
     }
-    e.bytes(b"],\"stream\":")?;
-    e.bytes(if streaming { b"true" } else { b"false" })?;
+    e.bytes(b"]")?;
+    if view.operation != Operation::Compact {
+        e.bytes(b",\"stream\":")?;
+        e.bytes(if streaming { b"true" } else { b"false" })?;
+    }
     for message in doc.children(doc.required(root, "messages")?)? {
         if doc
             .origin(message)?
