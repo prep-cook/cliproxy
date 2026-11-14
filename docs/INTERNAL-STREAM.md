@@ -585,7 +585,7 @@ Stages hold only start/current/end positions for byte access; retention position
 No `Vec<Bytes>`, body-sized String, JSON tree, tool-argument accumulator or media queue may store stream content on the heap.
 Network/TLS library scratch is not a second stream store: consume it immediately into mapped storage, bound it by transport settings and include it in measurements.
 Codecs scan borrowed mapped spans and write encoding output into mapped frames; string escaping/base64 and cross-block tokens are incremental, never assembled into a heap event.
-Request records, normalized events, boundary framing scratch, unknown payloads, replacement records and aggregation output all charge their actual live mapped frames to stream and pool limits.
+Request records, normalized events, boundary framing scratch, unknown payloads, replacement records and aggregation output all charge their actual live mapped frames to stream and pool limits. Scratch leases shorter than a frame are packed into the stream's open scratch frame, so many small leases share frames; a shared frame returns to the pool when its last lease drops.
 General records may span frames; readers parse across positions. A text SSE event larger than a frame occupies consecutive frames, addressed as (frame, offset). Custom-data records start at a fresh frame boundary and fit one frame; unused tail space is padding, not stream bytes.
 A separate event index stores only start/end positions and type/correlation indexes; retained index metadata has a configured ceiling too.
 
