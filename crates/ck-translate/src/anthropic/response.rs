@@ -1,4 +1,9 @@
-use super::{Table, usage::Usage};
+use super::{
+    Table, equal_text, failure, is, mapped, member, object, server_result, string, unknown, unknown_at, usage::Usage,
+};
+
+mod block;
+mod event;
 use crate::codec::{
     self, BodyMode, Error, Operation, Result,
     document::{Document, Value},
@@ -86,7 +91,7 @@ impl Ingress {
         if let Err(error) = result {
             self.failed = true;
             if !self.state.terminal && !matches!(error, Error::Storage(_)) {
-                super::failure(&mut self.state.emitter, owner, false)?;
+                failure(&mut self.state.emitter, owner, false)?;
                 self.state.terminal = true;
             }
             return Err(error);
@@ -153,7 +158,7 @@ impl State {
         if self.base.is_some() {
             return Ok(());
         }
-        let base = super::mapped(owner, |e| {
+        let base = mapped(owner, |e| {
             e.bytes(b"{\"id\":")?;
             if let Some((d, n)) = doc {
                 string_or(d, n, "id", self.identity.stream_id.as_str(), e)?;
@@ -174,14 +179,14 @@ impl State {
             Scope::default(),
             |e| {
                 for key in ["id", "model", "created"] {
-                    super::member(&base, base.root(), key, e)?;
+                    member(&base, base.root(), key, e)?;
                 }
                 Ok(())
             },
             |e| {
                 e.bytes(b",\"source\":{\"protocol\":\"anthropic\"},\"synthetic\":[\"created\"]")?;
                 if let Some((d, n)) = doc {
-                    super::unknown(
+                    unknown(
                         d,
                         n,
                         &[
@@ -212,220 +217,6 @@ impl State {
         }
         Ok(())
     }
-    fn event(&mut self, owner: &mut Writer, source: &Source, event: &sse::Event) -> Result<()> {
-        if self.terminal {
-            return Err(Error::Closed);
-        }
-        if !event.has_data(source)? {
-            // Keep source metadata without making a heartbeat client-deliverable.
-            self.start(owner, None)?;
-            self.emitter.emit(
-                owner,
-                Kind::Heartbeat,
-                Scope::default(),
-                |_| Ok(()),
-                |e| provenance(source, event, e),
-            )?;
-            return Ok(());
-        }
-        let Some(doc) = self.data(owner, source, event)? else {
-            return Ok(());
-        };
-        let root = doc.root();
-        let kind = doc.required(root, "type")?;
-        if let Some(name) = event.name(source)? {
-            names_type(&doc, kind, source, name)?;
-        }
-        if doc.string_is(kind, "error")? {
-            return Err(Error::Schema);
-        }
-        if doc.string_is(kind, "ping")? {
-            self.start(owner, None)?;
-            self.emitter.emit(
-                owner,
-                Kind::Heartbeat,
-                Scope::default(),
-                |_| Ok(()),
-                |e| event_origin(Some((&doc, source, event)), "ping", &["type"], e),
-            )?;
-        } else if doc.string_is(kind, "message_start")? {
-            self.message_start(owner, (&doc, source, event))?;
-        } else if doc.string_is(kind, "content_block_start")? {
-            self.require_active()?;
-            self.block_start(
-                owner,
-                &doc,
-                doc.required(root, "content_block")?,
-                doc.unsigned(doc.required(root, "index")?)?,
-                false,
-                Some((&doc, source, event)),
-            )?;
-        } else if doc.string_is(kind, "content_block_delta")? {
-            self.require_active()?;
-            self.delta(
-                owner,
-                &doc,
-                doc.required(root, "delta")?,
-                doc.unsigned(doc.required(root, "index")?)?,
-                (source, event),
-            )?;
-        } else if doc.string_is(kind, "content_block_stop")? {
-            self.require_active()?;
-            self.block_stop(
-                owner,
-                doc.unsigned(doc.required(root, "index")?)?,
-                Some((&doc, source, event)),
-            )?;
-        } else if doc.string_is(kind, "message_delta")? {
-            self.message_delta(owner, (&doc, source, event))?;
-        } else if doc.string_is(kind, "message_stop")? {
-            self.done(owner, Some((&doc, source, event)))?;
-        } else {
-            self.opaque(owner, source, event, |e| {
-                e.bytes(b",\"format\":\"json\",\"value\":")?;
-                doc.write(root, e)
-            })?;
-        }
-        Ok(())
-    }
-    /// Parses the event data. Data under an event name this codec does not map is published as
-    /// opaque text or JSON instead, and yields `None`.
-    fn data(&mut self, owner: &mut Writer, source: &Source, event: &sse::Event) -> Result<Option<Document>> {
-        let raw = encode::scratch(owner, |e| event.write_data(source, |b| e.bytes(b)))?;
-        let mut data = Source::new(owner)?;
-        data.push_scratch(raw)?;
-        let len = data.len();
-        let recognized = [
-            "message_start",
-            "content_block_start",
-            "content_block_delta",
-            "content_block_stop",
-            "message_delta",
-            "message_stop",
-            "error",
-            "ping",
-        ];
-        let named_known = match event.name(source)? {
-            Some(n) => recognized.iter().try_fold(false, |yes, key| {
-                Ok::<_, Error>(yes || source.equals(n, key.as_bytes())?)
-            })?,
-            None => true,
-        };
-        let doc = match Document::parse(owner, data, len) {
-            Ok(doc) => doc,
-            Err(Error::Json | Error::Truncated) if !named_known => {
-                self.opaque(owner, source, event, |e| {
-                    e.bytes(b",\"format\":\"text\",\"value\":")?;
-                    e.quoted_json(|e| event.write_data(source, |b| e.bytes(b)))
-                })?;
-                return Ok(None);
-            }
-            Err(error) => return Err(error),
-        };
-        if !named_known {
-            self.opaque(owner, source, event, |e| {
-                e.bytes(b",\"format\":\"json\",\"value\":")?;
-                doc.write(doc.root(), e)
-            })?;
-            return Ok(None);
-        }
-        Ok(Some(doc))
-    }
-    fn opaque(
-        &mut self,
-        owner: &mut Writer,
-        source: &Source,
-        event: &sse::Event,
-        value: impl Fn(&mut Encoder<'_, '_>) -> Result<()>,
-    ) -> Result<()> {
-        self.start(owner, None)?;
-        self.emitter.emit(owner, Kind::Opaque, Scope::default(), value, |e| {
-            provenance(source, event, e)
-        })?;
-        Ok(())
-    }
-    fn message_start(&mut self, owner: &mut Writer, origin: (&Document, &Source, &sse::Event)) -> Result<()> {
-        let doc = origin.0;
-        if self.message_started {
-            return Err(Error::Schema);
-        }
-        self.message_started = true;
-        let message = doc.required(doc.root(), "message")?;
-        if let Some(role) = doc.member(message, "role")?
-            && !doc.string_is(role, "assistant")?
-        {
-            return Err(Error::Schema);
-        }
-        // A leading heartbeat may have created synthetic identity; replace it with supplied metadata.
-        if self.base.is_some() {
-            if self.blocks.iter().any(|b| b.open) || self.finished {
-                return Err(Error::Schema);
-            }
-            self.base = Some(super::mapped(owner, |e| {
-                e.bytes(b"{\"id\":")?;
-                string_or(doc, message, "id", self.identity.stream_id.as_str(), e)?;
-                e.bytes(b",\"model\":")?;
-                string_or(doc, message, "model", "", e)?;
-                e.bytes(b",\"created\":0}")
-            })?);
-        } else {
-            self.start(owner, Some((doc, message)))?;
-        }
-        let base = self.base.as_ref().ok_or(Error::Schema)?;
-        self.emitter.emit(
-            owner,
-            Kind::Chunk,
-            self.scope()?,
-            |e| {
-                base_fields(base, e)?;
-                e.bytes(b",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\"},\"finish_reason\":null}]")
-            },
-            |e| event_origin(Some(origin), "message_start", &["type", "message"], e),
-        )?;
-        if let Some(content) = doc.member(message, "content")? {
-            if !matches!(doc.node(content)?.value, Value::Array) {
-                return Err(Error::Schema);
-            }
-            for (index, block) in doc.children(content)?.enumerate() {
-                self.block_start(owner, doc, block, index as u64, true, None)?;
-                self.block_stop(owner, index as u64, None)?;
-            }
-        }
-        self.update_usage(owner, doc, message)
-    }
-    fn message_delta(&mut self, owner: &mut Writer, origin: (&Document, &Source, &sse::Event)) -> Result<()> {
-        let (doc, source, event) = origin;
-        if !self.message_started {
-            return Err(Error::Schema);
-        }
-        let root = doc.root();
-        self.update_usage(owner, doc, root)?;
-        let delta = doc.required(root, "delta")?;
-        if let Some(reason) = doc.member(delta, "stop_reason")?
-            && !matches!(doc.node(reason)?.value, Value::Null)
-        {
-            return self.finish_choice(owner, doc, delta, Some(origin));
-        }
-        let base = self.base.as_ref().ok_or(Error::Schema)?;
-        self.emitter.emit(
-            owner,
-            Kind::Chunk,
-            self.scope()?,
-            |e| {
-                base_fields(base, e)?;
-                e.bytes(b",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":null}]")
-            },
-            |e| {
-                provenance_as(source, event, Some("message_delta"), e)?;
-                super::unknown_at(
-                    doc,
-                    &[(root, "", &["type", "delta", "usage"]), (delta, "/delta", &[])],
-                    e,
-                )
-            },
-        )?;
-        Ok(())
-    }
     fn require_active(&self) -> Result<()> {
         if !self.message_started || self.finished {
             Err(Error::Schema)
@@ -435,7 +226,7 @@ impl State {
     }
     fn buffered(&mut self, owner: &mut Writer, doc: &Document) -> Result<()> {
         let root = doc.root();
-        if doc.member(root, "error")?.is_some() || super::is(doc, root, "type", "error")? {
+        if doc.member(root, "error")?.is_some() || is(doc, root, "type", "error")? {
             return Err(Error::Schema);
         }
         self.message_started = true;
@@ -458,7 +249,7 @@ impl State {
                     e.bytes(b",\"input_tokens\":")?;
                     doc.write(count, e)
                 },
-                |e| super::unknown(doc, root, &["input_tokens"], e),
+                |e| unknown(doc, root, &["input_tokens"], e),
             )?;
             self.finished = true;
         } else {
@@ -474,471 +265,6 @@ impl State {
             self.finish_choice(owner, doc, root, None)?;
         }
         self.done(owner, None)
-    }
-    fn block_start(
-        &mut self,
-        owner: &mut Writer,
-        doc: &Document,
-        node: usize,
-        index: u64,
-        whole: bool,
-        origin: Origin<'_>,
-    ) -> Result<()> {
-        if self.blocks.iter().any(|b| b.index == index) {
-            return Err(Error::Schema);
-        }
-        let kind = block_kind(doc, node)?;
-        let tool = matches!(kind, "function" | "server");
-        let scope = self.block_scope(doc, node, kind, index)?;
-        if tool {
-            self.next_tool += 1;
-        }
-        self.emitter.emit(
-            owner,
-            Kind::BlockStart,
-            scope,
-            |e| {
-                e.bytes(b",\"kind\":")?;
-                e.string(kind)?;
-                e.bytes(b",\"attributes\":")?;
-                if kind == "opaque" {
-                    return e.bytes(b"{}");
-                }
-                let skip: &[&str] = match kind {
-                    "text" => &["text", "citations"],
-                    "thinking" => &["thinking", "signature"],
-                    "redacted" => &["data"],
-                    "function" | "server" => &["input", "id", "name"],
-                    "tool_result" => &["content", "tool_use_id", "is_error"],
-                    _ => &[],
-                };
-                super::object(doc, node, skip, e)
-            },
-            |e| event_origin(origin, "content_block_start", &["type", "index", "content_block"], e),
-        )?;
-        if tool {
-            self.tool_start(owner, doc, node, kind, scope)?;
-        }
-        let initial = if tool {
-            doc.member(node, "input")?
-                .map(|n| super::mapped(owner, |e| doc.write(n, e)))
-                .transpose()?
-        } else {
-            None
-        };
-        self.blocks.push(Block {
-            index,
-            scope,
-            kind,
-            open: true,
-            arguments: if tool {
-                Some((Source::new(owner)?, json::Scanner::new(owner, u64::MAX)?))
-            } else {
-                None
-            },
-            initial,
-            fragments: false,
-            signature_final: None,
-            source_id: if tool {
-                Some(super::mapped(owner, |e| doc.write(doc.required(node, "id")?, e))?)
-            } else {
-                None
-            },
-        })?;
-        self.block_content(owner, doc, node, kind, scope, whole)?;
-        if whole && tool {
-            let input = doc.member(node, "input")?;
-            if let Some(input) = input {
-                self.arguments(owner, index, doc, input, false, None)?;
-            }
-        }
-        Ok(())
-    }
-    /// Scope of a new block: tool blocks take the next tool index, and a server tool result
-    /// joins the scope of the tool block whose id it names.
-    fn block_scope(&self, doc: &Document, node: usize, kind: &str, index: u64) -> Result<Scope> {
-        let tool = matches!(kind, "function" | "server");
-        let result_scope = if kind == "tool_result" {
-            let id = doc.required(node, "tool_use_id")?;
-            let mut matched = None;
-            for block in self.blocks.iter() {
-                if let Some(source) = &block.source_id
-                    && super::equal_text(source, source.root(), doc, id)?
-                {
-                    matched = Some(block.scope);
-                    break;
-                }
-            }
-            Some(matched.ok_or(Error::Schema)?)
-        } else {
-            None
-        };
-        Ok(Scope {
-            block_index: Some(index),
-            tool_index: if tool {
-                Some(self.next_tool)
-            } else {
-                result_scope.and_then(|s| s.tool_index)
-            },
-            tool_call_id: if tool {
-                Some(media::local_id(b't', self.next_tool)?)
-            } else {
-                result_scope.and_then(|s| s.tool_call_id)
-            },
-            ..self.scope()?
-        })
-    }
-    fn tool_start(&mut self, owner: &mut Writer, doc: &Document, node: usize, kind: &str, scope: Scope) -> Result<()> {
-        let name = doc.required(node, "name")?;
-        super::string(doc, name)?;
-        let id = doc.required(node, "id")?;
-        super::string(doc, id)?;
-        self.emitter.emit(
-            owner,
-            Kind::ToolStart,
-            scope,
-            |e| {
-                e.bytes(b",\"kind\":")?;
-                e.string(if kind == "server" { "server" } else { "function" })?;
-                e.bytes(b",\"arguments_format\":\"json\",\"name\":")?;
-                doc.write(name, e)
-            },
-            |e| {
-                e.bytes(b",\"source\":{\"protocol\":\"anthropic\",\"ids\":{\"id\":")?;
-                doc.write(id, e)?;
-                e.bytes(b"}}")
-            },
-        )?;
-        Ok(())
-    }
-    /// Publishes the content a block start carries: text, thinking and its signature, redacted
-    /// data, a server tool result, an opaque block or text citations.
-    fn block_content(
-        &mut self,
-        owner: &mut Writer,
-        doc: &Document,
-        node: usize,
-        kind: &str,
-        scope: Scope,
-        whole: bool,
-    ) -> Result<()> {
-        if matches!(kind, "text" | "thinking") {
-            let (field, target) = if kind == "text" {
-                ("text", "content")
-            } else {
-                ("thinking", "reasoning_content")
-            };
-            if let Some(value) = doc.member(node, field)? {
-                self.chunk(owner, scope, doc, value, target, None)?;
-            }
-        }
-        if kind == "thinking"
-            && let Some(signature) = doc.member(node, "signature")?
-        {
-            self.signature(owner, scope, doc, signature, whole, None)?;
-        }
-        if kind == "redacted" {
-            let data = doc.required(node, "data")?;
-            super::string(doc, data)?;
-            self.emitter.emit(
-                owner,
-                Kind::ReasoningRedacted,
-                scope,
-                |e| {
-                    e.bytes(b",\"data\":")?;
-                    doc.write(data, e)
-                },
-                |_| Ok(()),
-            )?;
-        }
-        if kind == "tool_result" {
-            self.tool_result(owner, doc, node, scope)?;
-        }
-        if kind == "opaque" {
-            self.emitter.emit(
-                owner,
-                Kind::Opaque,
-                scope,
-                |e| {
-                    e.bytes(b",\"format\":\"json\",\"value\":")?;
-                    doc.write(node, e)
-                },
-                |e| e.bytes(b",\"source\":{\"protocol\":\"anthropic\",\"event\":\"content_block\"}"),
-            )?;
-        }
-        if kind == "text"
-            && let Some(citations) = doc.member(node, "citations")?
-        {
-            self.emitter.emit(
-                owner,
-                Kind::Annotation,
-                scope,
-                |e| {
-                    e.bytes(b",\"kind\":\"citations\",\"value\":")?;
-                    doc.write(citations, e)
-                },
-                |_| Ok(()),
-            )?;
-        }
-        Ok(())
-    }
-    fn tool_result(&mut self, owner: &mut Writer, doc: &Document, node: usize, scope: Scope) -> Result<()> {
-        self.emitter.emit(
-            owner,
-            Kind::ToolResult,
-            scope,
-            |e| {
-                e.bytes(b",\"value\":")?;
-                doc.write(doc.required(node, "content")?, e)?;
-                super::member(doc, node, "is_error", e)
-            },
-            |e| {
-                e.bytes(b",\"source\":{\"protocol\":\"anthropic\",\"ids\":{\"tool_use_id\":")?;
-                doc.write(doc.required(node, "tool_use_id")?, e)?;
-                e.bytes(b"}}")
-            },
-        )?;
-        Ok(())
-    }
-    fn delta(
-        &mut self,
-        owner: &mut Writer,
-        doc: &Document,
-        delta: usize,
-        index: u64,
-        origin: (&Source, &sse::Event),
-    ) -> Result<()> {
-        let block = self
-            .blocks
-            .iter()
-            .find(|b| b.index == index && b.open)
-            .ok_or(Error::Schema)?;
-        let scope = block.scope;
-        if super::is(doc, delta, "type", "text_delta")? && block.kind == "text" {
-            self.chunk(owner, scope, doc, doc.required(delta, "text")?, "content", Some(origin))
-        } else if super::is(doc, delta, "type", "thinking_delta")? && block.kind == "thinking" {
-            self.chunk(
-                owner,
-                scope,
-                doc,
-                doc.required(delta, "thinking")?,
-                "reasoning_content",
-                Some(origin),
-            )
-        } else if super::is(doc, delta, "type", "signature_delta")? && block.kind == "thinking" {
-            self.signature(
-                owner,
-                scope,
-                doc,
-                doc.required(delta, "signature")?,
-                false,
-                Some(origin),
-            )
-        } else if super::is(doc, delta, "type", "input_json_delta")? && block.arguments.is_some() {
-            self.arguments(
-                owner,
-                index,
-                doc,
-                doc.required(delta, "partial_json")?,
-                true,
-                Some(origin),
-            )
-        } else if super::is(doc, delta, "type", "citations_delta")? {
-            self.emitter.emit(
-                owner,
-                Kind::Annotation,
-                scope,
-                |e| {
-                    e.bytes(b",\"kind\":\"citation\",\"value\":")?;
-                    doc.write(doc.required(delta, "citation")?, e)
-                },
-                |e| delta_origin(doc, Some(origin), "citation", e),
-            )?;
-            Ok(())
-        } else if ["text_delta", "thinking_delta", "signature_delta", "input_json_delta"]
-            .iter()
-            .try_fold(false, |known, kind| {
-                Ok::<_, Error>(known || super::is(doc, delta, "type", kind)?)
-            })?
-        {
-            Err(Error::Schema)
-        } else {
-            self.emitter.emit(
-                owner,
-                Kind::Opaque,
-                scope,
-                |e| {
-                    e.bytes(b",\"format\":\"json\",\"value\":")?;
-                    doc.write(doc.root(), e)
-                },
-                |e| provenance(origin.0, origin.1, e),
-            )?;
-            Ok(())
-        }
-    }
-    fn chunk(
-        &mut self,
-        owner: &mut Writer,
-        scope: Scope,
-        doc: &Document,
-        value: usize,
-        field: &'static str,
-        origin: Option<(&Source, &sse::Event)>,
-    ) -> Result<()> {
-        super::string(doc, value)?;
-        let base = self.base.as_ref().ok_or(Error::Schema)?;
-        self.emitter.emit(
-            owner,
-            Kind::Chunk,
-            scope,
-            |e| {
-                base_fields(base, e)?;
-                e.bytes(b",\"choices\":[{\"index\":0,\"delta\":{")?;
-                e.string(field)?;
-                e.bytes(b":")?;
-                doc.write(value, e)?;
-                e.bytes(b"},\"finish_reason\":null}]")
-            },
-            |e| delta_origin(doc, origin, if field == "content" { "text" } else { "thinking" }, e),
-        )?;
-        Ok(())
-    }
-    fn signature(
-        &mut self,
-        owner: &mut Writer,
-        scope: Scope,
-        doc: &Document,
-        value: usize,
-        final_fragment: bool,
-        origin: Option<(&Source, &sse::Event)>,
-    ) -> Result<()> {
-        super::string(doc, value)?;
-        let block = self
-            .blocks
-            .iter_mut()
-            .find(|block| block.scope.block_index == scope.block_index)
-            .ok_or(Error::Schema)?;
-        block.signature_final = Some(final_fragment);
-        self.emitter.emit(
-            owner,
-            Kind::ReasoningSignature,
-            scope,
-            |e| {
-                e.bytes(b",\"kind\":\"anthropic\",\"fragment\":")?;
-                doc.write(value, e)?;
-                e.bytes(if final_fragment {
-                    b",\"final\":true"
-                } else {
-                    b",\"final\":false"
-                })
-            },
-            |e| delta_origin(doc, origin, "signature", e),
-        )?;
-        Ok(())
-    }
-    fn arguments(
-        &mut self,
-        owner: &mut Writer,
-        index: u64,
-        doc: &Document,
-        value: usize,
-        fragment: bool,
-        origin: Option<(&Source, &sse::Event)>,
-    ) -> Result<()> {
-        let block = self
-            .blocks
-            .iter_mut()
-            .find(|b| b.index == index && b.open)
-            .ok_or(Error::Schema)?;
-        let (source, parser) = block.arguments.as_mut().ok_or(Error::Schema)?;
-        let lease = encode::scratch(owner, |e| {
-            if fragment {
-                let mut chars = doc.chars(value)?;
-                while let Some(c) = chars.next_scalar()? {
-                    e.bytes(c.encode_utf8(&mut [0; 4]).as_bytes())?;
-                }
-                Ok(())
-            } else {
-                doc.write(value, e)
-            }
-        })?;
-        source.push_scratch(lease)?;
-        parser.advance(source)?;
-        block.fragments = true;
-        block.initial = None;
-        let scope = block.scope;
-        let base = self.base.as_ref().ok_or(Error::Schema)?;
-        self.emitter.emit(
-            owner,
-            Kind::Chunk,
-            scope,
-            |e| {
-                base_fields(base, e)?;
-                e.bytes(b",\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":")?;
-                e.unsigned(scope.tool_index.ok_or(Error::Schema)?)?;
-                e.bytes(b",\"function\":{\"arguments\":")?;
-                if fragment {
-                    doc.write(value, e)?;
-                } else {
-                    e.quoted_json(|e| doc.write(value, e))?;
-                }
-                e.bytes(b"}}]},\"finish_reason\":null}]")
-            },
-            |e| delta_origin(doc, origin, "partial_json", e),
-        )?;
-        Ok(())
-    }
-    fn block_stop(&mut self, owner: &mut Writer, index: u64, origin: Origin<'_>) -> Result<()> {
-        let position = self
-            .blocks
-            .iter()
-            .position(|b| b.index == index && b.open)
-            .ok_or(Error::Schema)?;
-        if !self.blocks[position].fragments
-            && let Some(initial) = self.blocks[position].initial.take()
-        {
-            self.arguments(owner, index, &initial, initial.root(), false, None)?;
-        }
-        let block = &mut self.blocks[position];
-        if let Some((source, parser)) = &mut block.arguments {
-            if block.fragments {
-                parser.finish(source)?;
-            }
-            self.emitter.emit(
-                owner,
-                Kind::ToolEnd,
-                block.scope,
-                |e| {
-                    e.bytes(if block.fragments {
-                        b",\"status\":\"completed\",\"valid_json\":true"
-                    } else {
-                        b",\"status\":\"completed\""
-                    })
-                },
-                |_| Ok(()),
-            )?;
-        }
-        if block.signature_final == Some(false) {
-            self.emitter.emit(
-                owner,
-                Kind::ReasoningSignature,
-                block.scope,
-                |e| e.bytes(b",\"kind\":\"anthropic\",\"fragment\":\"\",\"final\":true"),
-                |_| Ok(()),
-            )?;
-            block.signature_final = Some(true);
-        }
-        self.emitter.emit(
-            owner,
-            Kind::BlockEnd,
-            block.scope,
-            |_| Ok(()),
-            |e| event_origin(origin, "content_block_stop", &["type", "index"], e),
-        )?;
-        block.open = false;
-        block.arguments = None;
-        block.initial = None;
-        Ok(())
     }
     fn update_usage(&mut self, owner: &mut Writer, doc: &Document, parent: usize) -> Result<()> {
         if let Some(usage) = doc.member(parent, "usage")? {
@@ -962,7 +288,7 @@ impl State {
             return Err(Error::Truncated);
         }
         let reason = doc.required(parent, "stop_reason")?;
-        super::string(doc, reason)?;
+        string(doc, reason)?;
         let mapped = if doc.string_is(reason, "max_tokens")? {
             "length"
         } else if doc.string_is(reason, "tool_use")? {
@@ -995,7 +321,7 @@ impl State {
                 doc.write(reason, e)?;
                 if let Some((_, source, event)) = origin {
                     provenance_as(source, event, Some("message_delta"), e)?;
-                    super::unknown_at(
+                    unknown_at(
                         doc,
                         &[
                             (doc.root(), "", &["type", "delta", "usage"]),
@@ -1014,7 +340,7 @@ impl State {
                     }
                     Ok(())
                 } else {
-                    super::unknown(doc, parent, &["stop_reason"], e)
+                    unknown(doc, parent, &["stop_reason"], e)
                 }
             },
         )?;
@@ -1048,41 +374,9 @@ impl State {
         Ok(())
     }
 }
-/// Canonical kind of a native content block.
-fn block_kind(doc: &Document, node: usize) -> Result<&'static str> {
-    Ok(if super::is(doc, node, "type", "text")? {
-        "text"
-    } else if super::is(doc, node, "type", "thinking")? {
-        "thinking"
-    } else if super::is(doc, node, "type", "redacted_thinking")? {
-        "redacted"
-    } else if super::is(doc, node, "type", "tool_use")? {
-        "function"
-    } else if super::is(doc, node, "type", "server_tool_use")? || super::is(doc, node, "type", "mcp_tool_use")? {
-        "server"
-    } else if super::server_result(doc, node)? {
-        "tool_result"
-    } else {
-        "opaque"
-    })
-}
-/// Requires the SSE event name, when present, to equal the data's `type`.
-fn names_type(doc: &Document, kind: usize, source: &Source, name: Span) -> Result<()> {
-    let mut chars = doc.chars(kind)?;
-    let mut bytes = source.cursor(name)?;
-    while let Some(c) = chars.next_scalar()? {
-        if !c.is_ascii() || bytes.next_byte()? != Some(c as u8) {
-            return Err(Error::Schema);
-        }
-    }
-    if bytes.next_byte()?.is_some() {
-        return Err(Error::Schema);
-    }
-    Ok(())
-}
 fn string_or(doc: &Document, parent: usize, key: &str, default: &str, e: &mut Encoder<'_, '_>) -> Result<()> {
     if let Some(node) = doc.member(parent, key)? {
-        super::string(doc, node)?;
+        string(doc, node)?;
         doc.write(node, e)
     } else {
         e.string(default)
@@ -1091,7 +385,7 @@ fn string_or(doc: &Document, parent: usize, key: &str, default: &str, e: &mut En
 fn base_fields(doc: &Document, e: &mut Encoder<'_, '_>) -> Result<()> {
     e.bytes(b",\"object\":\"chat.completion.chunk\"")?;
     for key in ["id", "model", "created"] {
-        super::member(doc, doc.root(), key, e)?;
+        member(doc, doc.root(), key, e)?;
     }
     Ok(())
 }
@@ -1138,7 +432,7 @@ fn delta_origin(
 ) -> Result<()> {
     if let Some((source, event)) = origin {
         provenance(source, event, e)?;
-        super::unknown_at(
+        unknown_at(
             doc,
             &[
                 (doc.root(), "", &["type", "index", "delta"]),
@@ -1153,7 +447,7 @@ fn delta_origin(
 fn event_origin(origin: Origin<'_>, kind: &str, known: &[&str], e: &mut Encoder<'_, '_>) -> Result<()> {
     if let Some((doc, source, event)) = origin {
         provenance_as(source, event, Some(kind), e)?;
-        super::unknown(doc, doc.root(), known, e)
+        unknown(doc, doc.root(), known, e)
     } else {
         e.bytes(b",\"source\":{\"protocol\":\"anthropic\"}")
     }
