@@ -635,7 +635,7 @@ fn validate(view: RequestView<'_>) -> Result<()> {
         }
         if let Some(content) = doc.member(message, "content")? {
             match doc.node(content)?.value {
-                Value::String(_) | Value::Text(_) | Value::Fragments | Value::Utf8Media => (),
+                Value::Null | Value::String(_) | Value::Text(_) | Value::Fragments | Value::Utf8Media => (),
                 Value::Array => {
                     for part in doc.children(content)? {
                         let kind = doc.required(part, "type")?;
@@ -825,174 +825,8 @@ fn write_request(view: RequestView<'_>, streaming: bool, e: &mut Encoder<'_, '_>
     e.bytes(b"{\"input\":[")?;
     let mut first = true;
     for (index, message) in doc.children(doc.required(root, "messages")?)?.enumerate() {
-        if doc
-            .origin(message)?
-            .is_some_and(|(_, carrier)| carrier == Some("responses.instructions"))
-            && is(doc, message, "role", "developer")?
-        {
-            continue;
-        }
-        if let Some(calls) = doc.member(message, "tool_calls")? {
-            for call in doc.children(calls)? {
-                if !first {
-                    e.bytes(b",")?;
-                }
-                first = false;
-                let custom = is(doc, call, "arguments_format", "text")?;
-                e.bytes(b"{\"type\":")?;
-                e.string(if custom { "custom_tool_call" } else { "function_call" })?;
-                e.bytes(b",\"call_id\":")?;
-                doc.write(doc.required(call, "id")?, e)?;
-                let function = doc.required(call, "function")?;
-                super::member(doc, function, "name", e)?;
-                super::member(doc, function, "namespace", e)?;
-                if let Some(arguments) = doc.member(function, "arguments")? {
-                    e.bytes(b",")?;
-                    e.string(if custom { "input" } else { "arguments" })?;
-                    e.bytes(b":")?;
-                    if custom {
-                        doc.write(arguments, e)?;
-                    } else {
-                        e.quoted_json(|e| doc.write(arguments, e))?;
-                    }
-                }
-                originals(doc, call, e, &[])?;
-                e.bytes(b"}")?;
-            }
-        } else if is(doc, message, "role", "tool")? {
-            if !first {
-                e.bytes(b",")?;
-            }
-            first = false;
-            e.bytes(b"{\"type\":")?;
-            e.string(if is(doc, message, "name", "custom")? {
-                "custom_tool_call_output"
-            } else {
-                "function_call_output"
-            })?;
-            e.bytes(b",\"call_id\":")?;
-            doc.write(doc.required(message, "tool_call_id")?, e)?;
-            e.bytes(b",\"output\":")?;
-            let content = doc.required(message, "content")?;
-            if matches!(doc.node(content)?.value, Value::Array) {
-                e.bytes(b"[")?;
-                for (index, part) in doc.children(content)?.enumerate() {
-                    if index != 0 {
-                        e.bytes(b",")?;
-                    }
-                    write_part(view, part, false, e)?;
-                }
-                e.bytes(b"]")?;
-            } else {
-                doc.write(content, e)?;
-            }
-            originals(doc, message, e, &["type"])?;
-            e.bytes(b"}")?;
-        } else if let Some(content) = doc.member(message, "content")? {
-            if let Some(part) = doc.node(content)?.first
-                && doc
-                    .origin(part)?
-                    .is_some_and(|(_, carrier)| carrier == Some("responses.item"))
-                && is(doc, part, "type", "opaque")?
-            {
-                if !first {
-                    e.bytes(b",")?;
-                }
-                first = false;
-                doc.write(doc.required(part, "value")?, e)?;
-                continue;
-            }
-            let reasoning = matches!(doc.node(content)?.value, Value::Array)
-                && doc.children(content)?.any(|p| {
-                    is(doc, p, "type", "encrypted").unwrap_or(false)
-                        || is(doc, p, "type", "reasoning_summary").unwrap_or(false)
-                        || is(doc, p, "type", "reasoning").unwrap_or(false)
-                })
-                || doc.origin(message)?.is_some_and(|(_, carrier)| {
-                    matches!(carrier, Some("responses.compaction" | "responses.reasoning"))
-                });
-            if !first {
-                e.bytes(b",")?;
-            }
-            first = false;
-            if reasoning {
-                let compaction = doc
-                    .origin(message)?
-                    .is_some_and(|(_, carrier)| carrier == Some("responses.compaction"));
-                e.bytes(b"{\"type\":")?;
-                e.string(if compaction { "compaction" } else { "reasoning" })?;
-                let summary = !compaction
-                    || doc
-                        .children(content)?
-                        .any(|part| is(doc, part, "type", "reasoning_summary").unwrap_or(false));
-                if summary {
-                    e.bytes(b",\"summary\":[")?;
-                    let mut comma = false;
-                    for part in doc.children(content)? {
-                        if is(doc, part, "type", "reasoning_summary")? {
-                            if comma {
-                                e.bytes(b",")?;
-                            }
-                            comma = true;
-                            e.bytes(b"{\"type\":\"summary_text\",\"text\":")?;
-                            doc.write(doc.required(part, "text")?, e)?;
-                            originals(doc, part, e, &[])?;
-                            e.bytes(b"}")?;
-                        }
-                    }
-                    e.bytes(b"]")?;
-                }
-                if doc
-                    .children(content)?
-                    .any(|part| is(doc, part, "type", "reasoning").unwrap_or(false))
-                {
-                    e.bytes(b",\"content\":[")?;
-                    let mut comma = false;
-                    for part in doc.children(content)? {
-                        if is(doc, part, "type", "reasoning")? {
-                            if comma {
-                                e.bytes(b",")?;
-                            }
-                            comma = true;
-                            e.bytes(b"{\"type\":\"reasoning_text\",\"text\":")?;
-                            doc.write(doc.required(part, "text")?, e)?;
-                            originals(doc, part, e, &[])?;
-                            e.bytes(b"}")?;
-                        }
-                    }
-                    e.bytes(b"]")?;
-                }
-                if let Some(x) = doc.member(root, "x_ck")?
-                    && let Some(replay) = doc.member(x, "replay")?
-                {
-                    for entry in doc.children(replay)? {
-                        if doc.unsigned(doc.required(entry, "message_index")?)? == index as u64 {
-                            e.bytes(b",\"encrypted_content\":")?;
-                            doc.write(doc.required(entry, "signature")?, e)?;
-                        }
-                    }
-                }
-                originals(doc, message, e, &["type"])?;
-                e.bytes(b"}")?;
-            } else {
-                e.bytes(b"{\"type\":\"message\",\"role\":")?;
-                doc.write(doc.required(message, "role")?, e)?;
-                e.bytes(b",\"content\":")?;
-                if matches!(doc.node(content)?.value, Value::Array) {
-                    e.bytes(b"[")?;
-                    for (i, part) in doc.children(content)?.enumerate() {
-                        if i > 0 {
-                            e.bytes(b",")?;
-                        }
-                        write_part(view, part, is(doc, message, "role", "assistant")?, e)?;
-                    }
-                    e.bytes(b"]")?;
-                } else {
-                    doc.write(content, e)?;
-                }
-                originals(doc, message, e, &["type", "instructions"])?;
-                e.bytes(b"}")?;
-            }
+        if !instructions(doc, message)? {
+            write_message(view, message, index as u64, &mut first, e)?;
         }
     }
     e.bytes(b"]")?;
@@ -1001,11 +835,7 @@ fn write_request(view: RequestView<'_>, streaming: bool, e: &mut Encoder<'_, '_>
         e.bytes(if streaming { b"true" } else { b"false" })?;
     }
     for message in doc.children(doc.required(root, "messages")?)? {
-        if doc
-            .origin(message)?
-            .is_some_and(|(_, carrier)| carrier == Some("responses.instructions"))
-            && is(doc, message, "role", "developer")?
-        {
+        if instructions(doc, message)? {
             e.bytes(b",\"instructions\":")?;
             doc.write(doc.required(message, "content")?, e)?;
         }
@@ -1102,6 +932,231 @@ fn write_request(view: RequestView<'_>, streaming: bool, e: &mut Encoder<'_, '_>
     }
     originals(doc, root, e, &[])?;
     e.bytes(b"}")
+}
+/// True for the developer message that carries the Responses `instructions` field.
+fn instructions(doc: &Document, message: usize) -> Result<bool> {
+    Ok(doc
+        .origin(message)?
+        .is_some_and(|(_, carrier)| carrier == Some("responses.instructions"))
+        && is(doc, message, "role", "developer")?)
+}
+/// Starts the next input item.
+fn separate(first: &mut bool, e: &mut Encoder<'_, '_>) -> Result<()> {
+    if !*first {
+        e.bytes(b",")?;
+    }
+    *first = false;
+    Ok(())
+}
+/// Writes the input items of one message: a tool output; or its reasoning item, its message
+/// item and its calls, in that order.
+fn write_message(
+    view: RequestView<'_>,
+    message: usize,
+    index: u64,
+    first: &mut bool,
+    e: &mut Encoder<'_, '_>,
+) -> Result<()> {
+    let doc = view.document;
+    if is(doc, message, "role", "tool")? {
+        separate(first, e)?;
+        return write_tool_output(view, message, e);
+    }
+    let calls = doc.member(message, "tool_calls")?;
+    if let Some(content) = doc.member(message, "content")? {
+        if let Some(part) = doc.node(content)?.first
+            && doc
+                .origin(part)?
+                .is_some_and(|(_, carrier)| carrier == Some("responses.item"))
+            && is(doc, part, "type", "opaque")?
+        {
+            separate(first, e)?;
+            return doc.write(doc.required(part, "value")?, e);
+        }
+        let native = doc.origin(message)?.and_then(|(_, carrier)| carrier);
+        let native = matches!(native, Some("responses.compaction" | "responses.reasoning"));
+        let reasoning = native || any_part(doc, content, true)?;
+        if reasoning {
+            separate(first, e)?;
+            write_reasoning(doc, message, content, index, e)?;
+        }
+        let text = match doc.node(content)?.value {
+            Value::Array => any_part(doc, content, false)? || (!reasoning && calls.is_none()),
+            Value::Null => calls.is_none(),
+            _ => calls.is_none() || doc.chars(content)?.next_scalar()?.is_some(),
+        };
+        if text {
+            separate(first, e)?;
+            write_message_item(view, message, content, e)?;
+        }
+    }
+    if let Some(calls) = calls {
+        for call in doc.children(calls)? {
+            separate(first, e)?;
+            write_call(doc, call, e)?;
+        }
+    }
+    Ok(())
+}
+/// True when array `content` has a reasoning part (`reasoning`) or a part of any other kind.
+fn any_part(doc: &Document, content: usize, reasoning: bool) -> Result<bool> {
+    if !matches!(doc.node(content)?.value, Value::Array) {
+        return Ok(false);
+    }
+    for part in doc.children(content)? {
+        let kind = doc.required(part, "type")?;
+        let found = doc.string_is(kind, "reasoning")?
+            || doc.string_is(kind, "reasoning_summary")?
+            || doc.string_is(kind, "encrypted")?;
+        if found == reasoning {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+fn write_call(doc: &Document, call: usize, e: &mut Encoder<'_, '_>) -> Result<()> {
+    let custom = is(doc, call, "arguments_format", "text")?;
+    e.bytes(b"{\"type\":")?;
+    e.string(if custom { "custom_tool_call" } else { "function_call" })?;
+    e.bytes(b",\"call_id\":")?;
+    doc.write(doc.required(call, "id")?, e)?;
+    let function = doc.required(call, "function")?;
+    super::member(doc, function, "name", e)?;
+    super::member(doc, function, "namespace", e)?;
+    if let Some(arguments) = doc.member(function, "arguments")? {
+        e.bytes(b",")?;
+        e.string(if custom { "input" } else { "arguments" })?;
+        e.bytes(b":")?;
+        if custom {
+            doc.write(arguments, e)?;
+        } else {
+            e.quoted_json(|e| doc.write(arguments, e))?;
+        }
+    }
+    originals(doc, call, e, &[])?;
+    e.bytes(b"}")
+}
+fn write_tool_output(view: RequestView<'_>, message: usize, e: &mut Encoder<'_, '_>) -> Result<()> {
+    let doc = view.document;
+    e.bytes(b"{\"type\":")?;
+    e.string(if is(doc, message, "name", "custom")? {
+        "custom_tool_call_output"
+    } else {
+        "function_call_output"
+    })?;
+    e.bytes(b",\"call_id\":")?;
+    doc.write(doc.required(message, "tool_call_id")?, e)?;
+    e.bytes(b",\"output\":")?;
+    write_content(view, doc.required(message, "content")?, false, e)?;
+    originals(doc, message, e, &["type"])?;
+    e.bytes(b"}")
+}
+/// Writes string content as is and array content as Responses parts.
+fn write_content(view: RequestView<'_>, content: usize, assistant: bool, e: &mut Encoder<'_, '_>) -> Result<()> {
+    let doc = view.document;
+    if !matches!(doc.node(content)?.value, Value::Array) {
+        return doc.write(content, e);
+    }
+    e.bytes(b"[")?;
+    for (i, part) in doc.children(content)?.enumerate() {
+        if i > 0 {
+            e.bytes(b",")?;
+        }
+        write_part(view, part, assistant, e)?;
+    }
+    e.bytes(b"]")
+}
+/// Writes a message item with the content parts that are not reasoning.
+fn write_message_item(view: RequestView<'_>, message: usize, content: usize, e: &mut Encoder<'_, '_>) -> Result<()> {
+    let doc = view.document;
+    let assistant = is(doc, message, "role", "assistant")?;
+    e.bytes(b"{\"type\":\"message\",\"role\":")?;
+    doc.write(doc.required(message, "role")?, e)?;
+    e.bytes(b",\"content\":")?;
+    if matches!(doc.node(content)?.value, Value::Array) {
+        e.bytes(b"[")?;
+        let mut first = true;
+        for part in doc.children(content)? {
+            let kind = doc.required(part, "type")?;
+            if doc.string_is(kind, "reasoning")?
+                || doc.string_is(kind, "reasoning_summary")?
+                || doc.string_is(kind, "encrypted")?
+            {
+                continue;
+            }
+            separate(&mut first, e)?;
+            write_part(view, part, assistant, e)?;
+        }
+        e.bytes(b"]")?;
+    } else {
+        doc.write(content, e)?;
+    }
+    originals(doc, message, e, &["type", "instructions"])?;
+    e.bytes(b"}")
+}
+/// Writes the reasoning or compaction item of `message` with its summary, full reasoning and
+/// encrypted content.
+fn write_reasoning(doc: &Document, message: usize, content: usize, index: u64, e: &mut Encoder<'_, '_>) -> Result<()> {
+    let compaction = doc
+        .origin(message)?
+        .is_some_and(|(_, carrier)| carrier == Some("responses.compaction"));
+    e.bytes(b"{\"type\":")?;
+    e.string(if compaction { "compaction" } else { "reasoning" })?;
+    let has = |kind: &str| -> Result<bool> {
+        if !matches!(doc.node(content)?.value, Value::Array) {
+            return Ok(false);
+        }
+        for part in doc.children(content)? {
+            if is(doc, part, "type", kind)? {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    };
+    if !compaction || has("reasoning_summary")? {
+        write_reasoning_parts(doc, content, ("summary", "reasoning_summary", "summary_text"), e)?;
+    }
+    if has("reasoning")? {
+        write_reasoning_parts(doc, content, ("content", "reasoning", "reasoning_text"), e)?;
+    }
+    if let Some(x) = doc.member(doc.root(), "x_ck")?
+        && let Some(replay) = doc.member(x, "replay")?
+    {
+        for entry in doc.children(replay)? {
+            if doc.unsigned(doc.required(entry, "message_index")?)? == index {
+                e.bytes(b",\"encrypted_content\":")?;
+                doc.write(doc.required(entry, "signature")?, e)?;
+            }
+        }
+    }
+    originals(doc, message, e, &["type"])?;
+    e.bytes(b"}")
+}
+/// Writes member `field` listing the `kind` parts of `content` as `native` parts.
+fn write_reasoning_parts(
+    doc: &Document,
+    content: usize,
+    (field, kind, native): (&str, &str, &str),
+    e: &mut Encoder<'_, '_>,
+) -> Result<()> {
+    e.bytes(b",")?;
+    e.string(field)?;
+    e.bytes(b":[")?;
+    let mut first = true;
+    if matches!(doc.node(content)?.value, Value::Array) {
+        for part in doc.children(content)? {
+            if is(doc, part, "type", kind)? {
+                separate(&mut first, e)?;
+                e.bytes(b"{\"type\":")?;
+                e.string(native)?;
+                e.bytes(b",\"text\":")?;
+                doc.write(doc.required(part, "text")?, e)?;
+                originals(doc, part, e, &[])?;
+                e.bytes(b"}")?;
+            }
+        }
+    }
+    e.bytes(b"]")
 }
 fn write_part(view: RequestView<'_>, part: usize, assistant: bool, e: &mut Encoder<'_, '_>) -> Result<()> {
     let doc = view.document;
