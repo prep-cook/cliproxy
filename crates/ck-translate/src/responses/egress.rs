@@ -414,3 +414,66 @@ fn order_array(doc: &mut Document, array: usize, field: &str, owner: &mut Writer
     }
     Ok(())
 }
+
+/// Whether block start `node` opens a summary part: a summary, or an unmapped part that a
+/// Responses source correlates to a summary index, which returns to the summary it came from.
+fn summary_part(doc: &Document, node: usize, x: usize) -> Result<bool> {
+    if is(doc, node, "kind", "reasoning_summary")? {
+        return Ok(true);
+    }
+    Ok(match doc.member(x, "source")? {
+        Some(source) if is(doc, node, "kind", "opaque")? => {
+            is(doc, source, "protocol", "responses")? && doc.member(source, "summary_index")?.is_some()
+        }
+        _ => false,
+    })
+}
+
+/// Sets the native type of new part `part` from block start `node`; an opaque part keeps the
+/// type its attributes carry.
+fn part_type(doc: &mut Document, node: usize, part: usize, summary: bool, thinking: bool) -> Result<()> {
+    if is(doc, node, "kind", "opaque")? && doc.member(part, "type")?.is_some() {
+        return Ok(());
+    }
+    let kind = if is(doc, node, "kind", "refusal")? {
+        "refusal"
+    } else if summary {
+        "summary_text"
+    } else if thinking {
+        "reasoning_text"
+    } else {
+        "output_text"
+    };
+    doc.set(part, "type", Value::Text(kind))?;
+    Ok(())
+}
+
+/// Adds the Responses originals of event `x` to `target`.
+fn restore_originals(doc: &mut Document, x: usize, target: usize) -> Result<()> {
+    let Some(original) = doc.member(x, "original")? else {
+        return Ok(());
+    };
+    let mut next = doc.node(original)?.first;
+    while let Some(entry) = next {
+        next = doc.node(entry)?.next;
+        if !is(doc, entry, "protocol", "responses")? {
+            continue;
+        }
+        let Value::String(pointer) = doc.node(doc.required(entry, "pointer")?)?.value else {
+            return Err(Error::Schema);
+        };
+        let value = doc.remove(entry, "value")?.ok_or(Error::Schema)?;
+        // A later value of a started member replaces it.
+        let mut child = doc.node(target)?.first;
+        while let Some(at) = child {
+            child = doc.node(at)?.next;
+            if doc.names_equal(doc.node(at)?.name.ok_or(Error::Schema)?, Name::Pointer(pointer))? {
+                doc.detach(target, at)?;
+            }
+        }
+        let field = doc.add(Some(Name::Pointer(pointer)), Value::Null)?;
+        doc.transplant(field, value)?;
+        doc.append(target, field)?;
+    }
+    Ok(())
+}

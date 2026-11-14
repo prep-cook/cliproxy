@@ -287,10 +287,9 @@ fn scope(block: Option<u64>) -> codec::event::Scope {
     }
 }
 
+/// Native encrypted content is a signature whatever its spelling.
 #[test]
-fn redacted_reasoning_has_no_responses_carrier() {
-    use codec::event::{Kind, Scope};
-    // Native encrypted content is a signature whatever its spelling.
+fn a_legacy_redacted_prefix_is_native_encrypted_content() {
     let carrier = "claude-redacted-thinking:opaque";
     let body = json!({"id":"r","status":"completed","output":[{"id":"rs","type":"reasoning","summary":[],"encrypted_content":carrier}]});
     let (out, canonical) = response(
@@ -309,7 +308,12 @@ fn redacted_reasoning_has_no_responses_carrier() {
         serde_json::from_slice::<Value>(&out).unwrap()["output"][0]["encrypted_content"],
         carrier
     );
-    // Redacted reasoning from another protocol has no place in Responses and is dropped.
+}
+
+/// Redacted reasoning from another protocol has no place in Responses and is dropped.
+#[test]
+fn redacted_reasoning_has_no_responses_carrier() {
+    use codec::event::{Kind, Scope};
     let chunk = r#","object":"chat.completion.chunk","id":"r","model":"m","created":1,"choices":[{"index":0,"delta":{"content":"hi"},"finish_reason":null}]"#;
     let finish = r#","object":"chat.completion.chunk","id":"r","model":"m","created":1,"choices":[{"index":0,"delta":{},"finish_reason":"stop"}]"#;
     for start in [
@@ -417,7 +421,7 @@ pub(super) fn try_raw(input: &[u8], downstream: BodyMode) -> codec::Result<(Vec<
 }
 
 #[test]
-fn encrypted_content_may_be_null_or_provisional() {
+fn encrypted_content_may_be_null() {
     let item = |encrypted: Value| json!({"id":"i","type":"reasoning","summary":[],"encrypted_content":encrypted});
     let body = json!({"id":"r","status":"completed","output":[item(Value::Null)]});
     for mode in [BodyMode::Buffered, BodyMode::Streaming] {
@@ -435,6 +439,11 @@ fn encrypted_content_may_be_null_or_provisional() {
         assert_eq!(body["output"][0]["encrypted_content"], Value::Null);
         assert!(body["output"][0].as_object().unwrap().contains_key("encrypted_content"));
     }
+}
+
+#[test]
+fn encrypted_content_may_be_provisional() {
+    let item = |encrypted: Value| json!({"id":"i","type":"reasoning","summary":[],"encrypted_content":encrypted});
     let lifecycle = |done: Option<Value>, last: Value| {
         let mut records = vec![json!({"type":"response.output_item.added","output_index":0,"item":item(json!("abc"))})];
         if let Some(done) = done {

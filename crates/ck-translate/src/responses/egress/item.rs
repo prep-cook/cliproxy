@@ -132,9 +132,7 @@ impl<F: FnMut(&'static str, u64)> Egress<F> {
         output: &mut impl FnMut(ScratchLease) -> Result<()>,
     ) -> Result<()> {
         let At { node, x, .. } = at;
-        // An unmapped Responses summary part returns to the summary it came from.
-        let summary = is(&self.document, node, "kind", "reasoning_summary")?
-            || (is(&self.document, node, "kind", "opaque")? && from_summary(&self.document, x)?);
+        let summary = summary_part(&self.document, node, x)?;
         let thinking = is(&self.document, node, "kind", "thinking")? || is(&self.document, node, "kind", "reasoning")?;
         if super::redacted(&self.document, node)? {
             // Its data is dropped by `redacted`; no reasoning item is split out for it.
@@ -161,23 +159,7 @@ impl<F: FnMut(&'static str, u64)> Egress<F> {
         if let Some(attrs) = doc.member(node, "attributes")? {
             super::super::merge(doc, part, attrs)?;
         }
-        let refusal = is(doc, node, "kind", "refusal")?;
-        // An opaque part keeps the type its attributes carry.
-        if !is(doc, node, "kind", "opaque")? || doc.member(part, "type")?.is_none() {
-            doc.set(
-                part,
-                "type",
-                Value::Text(if refusal {
-                    "refusal"
-                } else if summary {
-                    "summary_text"
-                } else if thinking {
-                    "reasoning_text"
-                } else {
-                    "output_text"
-                }),
-            )?;
-        }
+        part_type(doc, node, part, summary, thinking)?;
         let native = doc
             .member(x, "source")?
             .map(|s| is(doc, s, "protocol", "responses"))
@@ -506,44 +488,6 @@ impl<F: FnMut(&'static str, u64)> Egress<F> {
         })?;
         self.emit(owner, "response.output_item.done", |e| write_lease(&payload, e), output)
     }
-}
-
-/// Whether event `x` correlates a Responses summary part.
-fn from_summary(doc: &Document, x: usize) -> Result<bool> {
-    Ok(match doc.member(x, "source")? {
-        Some(source) => is(doc, source, "protocol", "responses")? && doc.member(source, "summary_index")?.is_some(),
-        None => false,
-    })
-}
-
-/// Adds the Responses originals of event `x` to `target`.
-fn restore_originals(doc: &mut Document, x: usize, target: usize) -> Result<()> {
-    let Some(original) = doc.member(x, "original")? else {
-        return Ok(());
-    };
-    let mut next = doc.node(original)?.first;
-    while let Some(entry) = next {
-        next = doc.node(entry)?.next;
-        if !is(doc, entry, "protocol", "responses")? {
-            continue;
-        }
-        let Value::String(pointer) = doc.node(doc.required(entry, "pointer")?)?.value else {
-            return Err(Error::Schema);
-        };
-        let value = doc.remove(entry, "value")?.ok_or(Error::Schema)?;
-        // A later value of a started member replaces it.
-        let mut child = doc.node(target)?.first;
-        while let Some(at) = child {
-            child = doc.node(at)?.next;
-            if doc.names_equal(doc.node(at)?.name.ok_or(Error::Schema)?, Name::Pointer(pointer))? {
-                doc.detach(target, at)?;
-            }
-        }
-        let field = doc.add(Some(Name::Pointer(pointer)), Value::Null)?;
-        doc.transplant(field, value)?;
-        doc.append(target, field)?;
-    }
-    Ok(())
 }
 
 /// Gives a text part the empty members that native clients append deltas to. A Responses source
