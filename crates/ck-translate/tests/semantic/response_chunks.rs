@@ -222,3 +222,27 @@ fn buffered_and_streamed_reasoning_open_blocks_in_the_same_order() {
         assert_eq!(block_order(&buffered), block_order(&streamed), "{message}");
     }
 }
+
+/// Reasoning published ahead of one long answer field is not published again ahead of the next.
+#[test]
+fn early_reasoning_is_published_once_before_several_long_fields() {
+    let content = "a".repeat(2048);
+    let refusal = "r".repeat(2048);
+    let message = json!({"role":"assistant","reasoning_content":"think","content":content,"refusal":refusal});
+    let body =
+        json!({"id":"r","model":"m","created":1,"choices":[{"index":0,"message":message,"finish_reason":"stop"}]});
+    for piece in [13, 8192] {
+        let (output, buffered) = response_fragmented(
+            body.to_string().as_bytes(),
+            BodyMode::Buffered,
+            BodyMode::Buffered,
+            piece,
+        );
+        let output: Value = serde_json::from_slice(&output).unwrap();
+        let message = &output["choices"][0]["message"];
+        assert_eq!(message["reasoning_content"], "think", "{piece}-byte pieces");
+        assert_eq!(message["content"], content.as_str());
+        assert_eq!(message["refusal"], refusal.as_str());
+        assert_eq!(block_order(&buffered).first().map(String::as_str), Some("thinking"));
+    }
+}

@@ -108,6 +108,9 @@ impl State {
         message: usize,
         position: usize,
     ) -> Result<()> {
+        if self.choices[position].reasoning_first {
+            return Ok(());
+        }
         let Some(field) = doc.member(message, "reasoning_content")? else {
             return Ok(());
         };
