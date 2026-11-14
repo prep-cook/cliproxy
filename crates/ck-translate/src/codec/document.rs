@@ -12,6 +12,7 @@ use super::{
     encode::Encoder,
     json,
     source::{Source, Span},
+    table::grown,
 };
 
 #[derive(Clone, Copy, Debug)]
@@ -72,6 +73,8 @@ pub struct Document {
     metadata: MetadataPermit,
     /// Charges transient indexes that read-only validation builds; see [`Self::with_table`].
     scratch: std::sync::Mutex<Option<MetadataPermit>>,
+    /// The source that holds every adopted record's lease, so a record costs one segment.
+    records: Option<usize>,
     root: usize,
 }
 
@@ -93,6 +96,7 @@ impl Document {
             nodes: Vec::new(),
             metadata: owner.reserve_metadata(0)?,
             scratch: std::sync::Mutex::new(Some(owner.reserve_metadata(0)?)),
+            records: None,
             root: 0,
         };
         doc.import(source, &scanner)?;
@@ -105,6 +109,7 @@ impl Document {
             nodes: Vec::new(),
             metadata: owner.reserve_metadata(0)?,
             scratch: std::sync::Mutex::new(Some(owner.reserve_metadata(0)?)),
+            records: None,
             root: 0,
         };
         doc.reserve(1, 1)?;
@@ -127,6 +132,11 @@ impl Document {
         let permit = table.into_permit()?;
         *self.scratch.lock().map_err(|_| Error::Closed)? = Some(permit);
         result
+    }
+
+    #[cfg(test)]
+    pub(crate) fn source_count(&self) -> usize {
+        self.sources.len()
     }
 
     pub(crate) fn input(&self) -> &Source {
@@ -163,17 +173,11 @@ impl Document {
         Ok(target)
     }
 
+    /// Makes room for `nodes` and `sources` more entries. The permit is charged for the new
+    /// capacity before the tables grow, then for the capacity actually allocated.
     fn reserve(&mut self, nodes: usize, sources: usize) -> Result<()> {
-        let n = (self.nodes.len() + nodes)
-            .max(self.nodes.capacity())
-            .max(8)
-            .checked_next_power_of_two()
-            .ok_or(Error::Limit)?;
-        let s = (self.sources.len() + sources)
-            .max(self.sources.capacity())
-            .max(2)
-            .checked_next_power_of_two()
-            .ok_or(Error::Limit)?;
+        let n = grown(self.nodes.len(), nodes, self.nodes.capacity(), 4)?;
+        let s = grown(self.sources.len(), sources, self.sources.capacity(), 4)?;
         self.metadata.resize(
             n.checked_mul(std::mem::size_of::<Node>())
                 .and_then(|v| v.checked_add(s * std::mem::size_of::<Source>()))

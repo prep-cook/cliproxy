@@ -55,7 +55,7 @@ fn snapshot_under_budget(budget: usize) -> (Option<(usize, codec::Error)>, usize
 /// The duplicate-index table of a snapshot keeps its metadata quota until the suffix edits
 /// are applied, so the snapshot step needs the table and the edits' scratch together. Since
 /// multi-frame lease frame lists count against the metadata cap, that step is the peak of the
-/// whole stream: 8 more bytes than the step needs lets every later step through. Dropping the
+/// whole stream: 1 byte more than the step needs lets every later step through. Dropping the
 /// table before the edits lowers the step's need by 256 bytes, and the smaller budget then
 /// completes the stream. The exact budgets move with any metadata accounting change and must
 /// then be re-measured against the previous behaviour.
@@ -66,6 +66,6 @@ fn snapshot_index_table_quota_lasts_until_suffix_edits_apply() {
         (Some((step, error)), _) => panic!("step {step} failed with {error:?}"),
         (None, records) => (None, records),
     };
-    assert_eq!(outcome(459_640), (Some(1), 71));
-    assert_eq!(outcome(459_648), (None, 141));
+    assert_eq!(outcome(356_827), (Some(1), 71));
+    assert_eq!(outcome(356_828), (None, 141));
 }

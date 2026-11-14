@@ -233,7 +233,7 @@ pub(super) fn members(doc: &Document, parent: usize, first: &mut bool, e: &mut E
                 continue;
             };
             let pointer = doc.required(entry, "pointer")?;
-            let name = leaf(doc, pointer)?;
+            let name = leaf(doc.chars(pointer)?)?;
             let mut exists = false;
             for child in doc.children(parent)? {
                 exists |= name.matches(doc, doc.node(child)?.name.ok_or(Error::Schema)?)?;

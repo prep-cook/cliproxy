@@ -1,6 +1,6 @@
 //! Iterators over a document's children, provenance origins and decoded scalars.
 
-use super::{Document, Value};
+use super::{Document, Text, Value};
 use crate::codec::{Error, Result, json};
 
 impl Document {
@@ -9,6 +9,11 @@ impl Document {
             doc: self,
             next: self.node(parent)?.first,
         })
+    }
+
+    /// The decoded characters of a string text.
+    pub(crate) fn text_chars(&self, text: Text) -> Result<Characters<'_>> {
+        Ok(Characters::Mapped(json::Decoded::new(self.source(text)?, text.span)?))
     }
 
     pub fn chars(&self, index: usize) -> Result<Characters<'_>> {

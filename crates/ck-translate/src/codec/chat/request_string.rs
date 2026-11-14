@@ -1,5 +1,12 @@
 use super::*;
 
+/// Input held per data record, counting an incomplete scalar or escape. Advance feeds at most
+/// 8,192 bytes between steps, and decoding never grows bytes, so held input plus one step stays
+/// within a 36,864-byte decoded chunk.
+const HELD_BYTES: u64 = 36_864 - 8_192;
+/// Collection delay of held input (docs/INTERNAL-STREAM.md, §3.4).
+pub(super) const FLUSH_DELAY: std::time::Duration = std::time::Duration::from_millis(100);
+
 impl Ingress {
     pub(super) fn string_format(
         &mut self,
@@ -92,7 +99,7 @@ impl Ingress {
         if self.string.as_ref().ok_or(Error::Schema)?.wire != wire_index {
             return Err(Error::Schema);
         }
-        self.append_string(owner, wire)?;
+        let published = self.append_string(owner, wire, false)?;
         let pending = self.string.as_mut().ok_or(Error::Schema)?;
         // Keys and topology stay fixed while one string streams, and the string node's own span
         // bounds the floor, so the whole-document floor is computed once per string.
@@ -102,16 +109,12 @@ impl Ingress {
         if opened {
             let scanner = self.scanner.as_mut().ok_or(Error::Closed)?;
             self.document.rebind_keys(scanner)?;
-            let floor = self
-                .document
-                .raw_floor(self.document.root(), scanner.raw_floor().min(pending.offset))?;
-            self.document.release_input_before(floor)?;
+            pending.floor = self.document.raw_floor(self.document.root(), u64::MAX)?;
         }
-        self.document.release_input_range(codec::source::Span {
-            start: wire.span.start + 1,
-            end: pending.offset,
-        })?;
         let node = pending.node;
+        if opened || published {
+            self.release_string_input(wire)?;
+        }
         if wire.span.end != 0 {
             self.string = None;
             return Ok((Some(node), true));
@@ -166,13 +169,57 @@ impl Ingress {
             node,
             media: media_index,
             offset: wire.span.start + 1,
+            floor: 0,
+            held: None,
             publisher,
             decoder: media::InputDecoder::new(encoding),
         }))
     }
 
-    fn append_string(&mut self, owner: &mut Writer, wire: json::Node) -> Result<()> {
+    /// Publishes held string input regardless of its size, as the flush contract requires.
+    pub(super) fn flush_string(&mut self, owner: &mut Writer) -> Result<()> {
+        let Some(pending) = self.string.as_ref() else {
+            return Ok(());
+        };
+        let scanner = self.scanner.as_ref().ok_or(Error::Closed)?;
+        let wire = scanner.pending_node(self.document.input(), pending.wire)?;
+        if self.append_string(owner, wire, true)? {
+            self.release_string_input(wire)?;
+        }
+        Ok(())
+    }
+
+    /// Retires input that the string has published and nothing else still names: everything
+    /// before the document and scanner floors, and the string's own published span.
+    fn release_string_input(&mut self, wire: json::Node) -> Result<()> {
+        let pending = self.string.as_ref().ok_or(Error::Schema)?;
+        let scanner = self.scanner.as_ref().ok_or(Error::Closed)?;
+        let floor = pending.floor.min(scanner.raw_floor()).min(pending.offset);
+        let base = self.document.input().whole().start;
+        self.document.release_input_before(floor.max(base))?;
+        self.document.release_input_range(codec::source::Span {
+            start: wire.span.start + 1,
+            end: pending.offset,
+        })
+    }
+
+    /// Decodes and publishes the string input after the published offset. Input stays held, as
+    /// positions in the input source, until it fills a record, the string ends, its collection
+    /// delay passes or `force` asks for a flush; small network pieces then share one record.
+    /// Returns whether the published offset advanced.
+    fn append_string(&mut self, owner: &mut Writer, wire: json::Node, force: bool) -> Result<bool> {
         let pending = self.string.as_mut().ok_or(Error::Schema)?;
+        let ended = wire.span.end != 0;
+        // An incomplete scalar or escape after the validated end decodes with the next step.
+        let received = self.document.input().len();
+        if wire.validated_end > pending.offset {
+            let since = *pending.held.get_or_insert_with(std::time::Instant::now);
+            if !ended && !force && received - pending.offset < HELD_BYTES && since.elapsed() < FLUSH_DELAY {
+                return Ok(false);
+            }
+        }
+        pending.held = None;
+        let published = wire.validated_end > pending.offset;
         let mut cursor = self.document.input().cursor(codec::source::Span {
             start: pending.offset,
             end: wire.validated_end,
@@ -209,6 +256,6 @@ impl Ingress {
             self.media
                 .retain_record(&mut self.document, pending.media, owner, &mut self.reader)?;
         }
-        Ok(())
+        Ok(published)
     }
 }

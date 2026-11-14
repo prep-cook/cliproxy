@@ -148,8 +148,7 @@ pub fn segment<'a>(chars: &mut Characters<'a>) -> Result<(Segment<'a>, bool)> {
 }
 
 /// The last segment of a non-empty pointer.
-pub fn leaf(doc: &Document, pointer: usize) -> Result<Segment<'_>> {
-    let mut chars = doc.chars(pointer)?;
+pub fn leaf(mut chars: Characters<'_>) -> Result<Segment<'_>> {
     if chars.next_scalar()? != Some('/') {
         return Err(Error::Schema);
     }
@@ -172,18 +171,18 @@ pub fn write_segment(mut name: Segment<'_>, e: &mut Encoder<'_, '_>) -> Result<(
 
 /// The node a pointer names; the empty pointer is the root.
 pub fn resolve(doc: &Document, pointer: usize) -> Result<usize> {
-    resolve_to(doc, pointer, false, &mut |_, _| Ok(None))
+    resolve_to(doc, doc.chars(pointer)?, false, &mut |_, _| Ok(None))
 }
 
 /// The container that holds the node a pointer names.
 pub fn resolve_parent(doc: &Document, pointer: usize) -> Result<usize> {
-    resolve_to(doc, pointer, true, &mut |_, _| Ok(None))
+    resolve_to(doc, doc.chars(pointer)?, true, &mut |_, _| Ok(None))
 }
 
 /// Like [`resolve_parent`]; `element(array, index)` may name an array element without a walk.
 pub(crate) fn resolve_parent_indexed(
     doc: &Document,
-    pointer: usize,
+    pointer: Characters<'_>,
     element: &mut dyn FnMut(usize, usize) -> Result<Option<usize>>,
 ) -> Result<usize> {
     resolve_to(doc, pointer, true, element)
@@ -191,11 +190,10 @@ pub(crate) fn resolve_parent_indexed(
 
 fn resolve_to(
     doc: &Document,
-    pointer: usize,
+    mut chars: Characters<'_>,
     parent_only: bool,
     element: &mut dyn FnMut(usize, usize) -> Result<Option<usize>>,
 ) -> Result<usize> {
-    let mut chars = doc.chars(pointer)?;
     match chars.next_scalar()? {
         None => return Ok(doc.root()),
         Some('/') => (),
