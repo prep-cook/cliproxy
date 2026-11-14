@@ -54,6 +54,8 @@ enum Source {
     Responses(BodyMode),
     /// An Anthropic Messages event stream.
     Anthropic,
+    /// A Chat Completions chunk stream.
+    Chat,
 }
 
 /// Client egress under test.
@@ -90,6 +92,21 @@ fn run(source: Source, input: &[u8], client: Client, mode: BodyMode) -> Run {
         Source::Anthropic => {
             let mut ingress = anthropic::response::Ingress::new(
                 &mut m.writer,
+                identity(),
+                Operation::Generate,
+                BodyMode::Streaming,
+                1 << 20,
+            )
+            .unwrap();
+            Box::new(move |writer, chunk| match chunk {
+                Some(chunk) => ingress.advance(writer, chunk).unwrap(),
+                None => ingress.finish(writer).unwrap(),
+            })
+        }
+        Source::Chat => {
+            let mut ingress = codec::chat::response::Ingress::new(
+                &mut m.writer,
+                &m.store,
                 identity(),
                 Operation::Generate,
                 BodyMode::Streaming,
@@ -390,4 +407,40 @@ fn anthropic_source_id_after_a_ping_reaches_chat_clients() {
     let ((body, _), (chunks, _)) = chat_ids_from_anthropic(&anthropic_stream(true, Some("msg_real")));
     assert_eq!(body, "msg_real");
     assert!(chunks.iter().all(|id| *id == "msg_real"), "{chunks:?}");
+}
+
+/// A Chat chunk stream whose chunks carry no id.
+fn chat_stream_without_id() -> Vec<u8> {
+    let records = [
+        json!({"object":"chat.completion.chunk","model":"m","created":5,"choices":[{"index":0,"delta":{"role":"assistant","content":"hi"},"finish_reason":null}]}),
+        json!({"object":"chat.completion.chunk","model":"m","created":5,"choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}),
+    ];
+    let mut input: String = records.iter().map(|record| format!("data: {record}\n\n")).collect();
+    input.push_str("data: [DONE]\n\n");
+    input.into_bytes()
+}
+
+#[test]
+fn chat_source_without_an_id_gets_native_ids() {
+    let input = chat_stream_without_id();
+    for (client, prefix) in [(Client::Anthropic, "msg_s"), (Client::Responses, "resp_s")] {
+        let buffered = run(Source::Chat, &input, client, BodyMode::Buffered);
+        let body: Value = serde_json::from_slice(&buffered.output).unwrap();
+        assert_eq!(body["id"], format!("{prefix}{}", buffered.writer));
+        let streamed = run(Source::Chat, &input, client, BodyMode::Streaming);
+        let events = data(&streamed.output);
+        let ids: Vec<_> = events
+            .iter()
+            .filter_map(|event| event.get("message").or(event.get("response")))
+            .map(|carrier| carrier["id"].clone())
+            .collect();
+        assert!(!ids.is_empty(), "{events:?}");
+        assert!(
+            ids.iter().all(|id| *id == format!("{prefix}{}", streamed.writer)),
+            "{ids:?}"
+        );
+    }
+    // The premise: ingress marks the stream id it fills in.
+    let canonical = run(Source::Chat, &input, Client::Anthropic, BodyMode::Buffered).canonical;
+    assert!(canonical.contains("\"synthetic\":[\"id\"]"), "{canonical}");
 }
