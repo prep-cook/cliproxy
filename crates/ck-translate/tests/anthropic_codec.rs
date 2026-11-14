@@ -254,6 +254,11 @@ fn count_tokens_is_not_generation_usage_and_compact_is_unsupported() {
     );
     assert!(out.get("stream").is_none());
     assert!(canonical.iter().any(|v| v["operation"] == "count_tokens"));
+    assert!(
+        canonical
+            .iter()
+            .any(|v| v["pointer"] == "/x_ck/operation" && v["value"] == "count_tokens")
+    );
     let (out, canonical) = response(
         br#"{"input_tokens":0,"detail":{"unknown":null}}"#,
         BodyMode::Buffered,
@@ -416,7 +421,7 @@ fn whole_request_preserves_signed_tool_history() {
 
 #[test]
 fn native_controls_and_colliding_unknowns_remain_distinct() {
-    let input = json!({"model":"m","max_tokens":100,"stop_sequences":["done"],"stop":"literal","response_format":{"foreign":true},"parallel_tool_calls":"literal","output_config":{"effort":"high","format":{"type":"json_schema","schema":{"type":"object"}},"future":null},"cache_control":{"type":"ephemeral"},"tools":[{"type":"custom","name":"f","input_schema":{"type":"object"},"cache_control":{"type":"ephemeral","ttl":"1h"}}],"messages":[{"role":"assistant","tool_calls":"literal","content":[{"type":"thinking","thinking":"real","text":"shadow","signature":"signed=="}]},{"role":"user","content":[{"type":"image","mime":"literal","source":{"type":"base64","media_type":"image/png","data":"AA==","kind":"literal"}}]}]});
+    let input = json!({"model":"m","max_tokens":100,"stop_sequences":["done"],"stop":"literal","thinking":{"type":"enabled","budget_tokens":1024},"response_format":{"foreign":true},"parallel_tool_calls":"literal","output_config":{"effort":"high","format":{"type":"json_schema","schema":{"type":"object"}},"future":null},"cache_control":{"type":"ephemeral"},"tools":[{"type":"custom","name":"f","input_schema":{"type":"object"},"cache_control":{"type":"ephemeral","ttl":"1h"}}],"messages":[{"role":"assistant","tool_calls":"literal","content":[{"type":"thinking","thinking":"real","text":"shadow","signature":"signed=="}]},{"role":"user","content":[{"type":"image","mime":"literal","source":{"type":"base64","media_type":"image/png","data":"AA==","kind":"literal"}}]}]});
     let raw = serde_json::to_vec(&input).unwrap();
     let (out, canonical) = request_fragmented(&raw, Operation::Generate, raw.len());
     let mut expected = input;
@@ -431,6 +436,11 @@ fn native_controls_and_colliding_unknowns_remain_distinct() {
         canonical
             .iter()
             .any(|v| v["pointer"] == "/x_ck/thinking/effort" && v["value"] == "high")
+    );
+    assert!(
+        canonical
+            .iter()
+            .any(|v| v["pointer"] == "/x_ck/thinking/budget_tokens" && v["value"] == 1024)
     );
     assert!(
         !canonical
