@@ -3,9 +3,10 @@
 use crate::FRAME_BYTES;
 use std::cell::Cell;
 use std::io;
+use std::ops::{Deref, DerefMut};
 use std::path::Path;
 use std::ptr::NonNull;
-use std::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering, fence};
 use std::sync::{Mutex, MutexGuard};
 
 mod os;
@@ -27,6 +28,17 @@ pub(crate) struct Header {
 #[repr(align(128))]
 struct Padded<T>(T);
 
+/// Per-frame counters, one cache line per frame. Leases on different threads update the
+/// counts of neighbouring frames; packed, every update moved a shared line between cores.
+#[repr(align(64))]
+struct FrameState {
+    /// References: the owner's plus one per reader lease. Zero means free.
+    refs: AtomicU32,
+    /// Bytes from the frame's start whose pages are populated, so writing them cannot
+    /// fault on tmpfs exhaustion. Only the frame's current owner changes it.
+    ready: AtomicU32,
+}
+
 struct FreeList {
     frames: Vec<u32>,
     // The bottom of a LIFO stack below this mark was never popped this interval.
@@ -41,6 +53,61 @@ impl FreeList {
     }
 }
 
+/// One worker's free list. `len` mirrors its length so that allocation can pass over
+/// empty lists without locking them; every change goes through `ShardGuard`.
+struct Shard {
+    free: Mutex<FreeList>,
+    len: AtomicUsize,
+}
+
+impl Shard {
+    fn new() -> Self {
+        Self {
+            free: Mutex::new(FreeList {
+                frames: Vec::new(),
+                low_water: 0,
+            }),
+            len: AtomicUsize::new(0),
+        }
+    }
+
+    fn lock(&self) -> ShardGuard<'_> {
+        ShardGuard {
+            free: lock(&self.free),
+            len: &self.len,
+        }
+    }
+
+    /// A stale answer costs one lock, or one cold frame taken while a warm one waited.
+    fn occupied(&self) -> bool {
+        self.len.load(Ordering::Relaxed) != 0
+    }
+}
+
+struct ShardGuard<'a> {
+    free: MutexGuard<'a, FreeList>,
+    len: &'a AtomicUsize,
+}
+
+impl Deref for ShardGuard<'_> {
+    type Target = FreeList;
+    fn deref(&self) -> &FreeList {
+        &self.free
+    }
+}
+
+impl DerefMut for ShardGuard<'_> {
+    fn deref_mut(&mut self) -> &mut FreeList {
+        &mut self.free
+    }
+}
+
+impl Drop for ShardGuard<'_> {
+    fn drop(&mut self) {
+        self.len.store(self.free.frames.len(), Ordering::Relaxed);
+    }
+}
+
 struct Slow {
     backed: u32,
     cold: Vec<u32>,
@@ -50,6 +117,96 @@ struct Slow {
 struct Mapping {
     base: NonNull<u8>,
     len: usize,
+}
+
+impl Mapping {
+    /// Map `len` bytes of the file, populate the first `populated` and initialize the
+    /// header slots at the start.
+    fn new(file: &os::Backing, len: usize, populated: usize, slots: u32) -> io::Result<Self> {
+        // SAFETY: fd owns a writable regular file. The entire VA range is reserved
+        // once; only fallocate-backed extents are accessed before later growth.
+        let base = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                len,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_SHARED,
+                file.fd(),
+                0,
+            )
+        };
+        if base == libc::MAP_FAILED {
+            return Err(io::Error::last_os_error());
+        }
+        let mapping = Mapping {
+            base: NonNull::new(base.cast()).ok_or_else(invalid)?,
+            len,
+        };
+        os::populate(mapping.base.as_ptr(), populated)?;
+        // SAFETY: fallocate/populate succeeded; the page-aligned header is private
+        // during construction. Initialize atomic objects, not references to zero bytes.
+        unsafe {
+            for slot in 0..slots {
+                mapping
+                    .base
+                    .as_ptr()
+                    .add(slot as usize * 128)
+                    .cast::<Header>()
+                    .write(Header {
+                        committed: AtomicU64::new(0),
+                    });
+            }
+        }
+        Ok(mapping)
+    }
+}
+
+/// Per-frame states in private anonymous memory, which stays unbacked until a frame is
+/// first used; a heap allocation with this alignment would be written zero in full.
+struct FrameStates {
+    mapping: Mapping,
+    len: usize,
+}
+
+impl FrameStates {
+    /// States for `len` frames with the first `populated` marked wholly populated.
+    fn new(len: usize, populated: u32) -> io::Result<Self> {
+        let bytes = len.checked_mul(std::mem::size_of::<FrameState>()).ok_or_else(invalid)?;
+        // SAFETY: a fresh private anonymous mapping aliases nothing.
+        let base = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                bytes,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+                -1,
+                0,
+            )
+        };
+        if base == libc::MAP_FAILED {
+            return Err(io::Error::last_os_error());
+        }
+        let states = Self {
+            mapping: Mapping {
+                base: NonNull::new(base.cast()).ok_or_else(invalid)?,
+                len: bytes,
+            },
+            len,
+        };
+        for state in &states[..populated as usize] {
+            state.ready.store(FRAME_BYTES as u32, Ordering::Relaxed);
+        }
+        Ok(states)
+    }
+}
+
+impl Deref for FrameStates {
+    type Target = [FrameState];
+    fn deref(&self) -> &[FrameState] {
+        // SAFETY: the page-aligned mapping holds `len` states for its whole life. Zero
+        // bytes are valid atomics, and all access goes through them.
+        unsafe { std::slice::from_raw_parts(self.mapping.base.as_ptr().cast(), self.len) }
+    }
 }
 
 impl Drop for Mapping {
@@ -70,7 +227,8 @@ pub(crate) struct Pool {
     reserve_frames: u32,
     slots: u32,
     free_slots: Mutex<Vec<u32>>,
-    shards: Box<[Padded<Mutex<FreeList>>]>,
+    states: FrameStates,
+    shards: Box<[Padded<Shard>]>,
     slow: Padded<Mutex<Slow>>,
     used: Padded<AtomicU32>,
     backed: Padded<AtomicU32>,
@@ -127,49 +285,14 @@ impl Pool {
         let initial = frames.min(EXTENT).max(reserve_frames);
         let initial_bytes = round_up(header_bytes + initial as usize * FRAME_BYTES, page)?;
         file.grow(0, initial_bytes)?;
-        // SAFETY: fd owns a writable regular file. The entire VA range is reserved
-        // once; only fallocate-backed extents are accessed before later growth.
-        let base = unsafe {
-            libc::mmap(
-                std::ptr::null_mut(),
-                len,
-                libc::PROT_READ | libc::PROT_WRITE,
-                libc::MAP_SHARED,
-                file.fd(),
-                0,
-            )
-        };
-        if base == libc::MAP_FAILED {
-            return Err(io::Error::last_os_error());
-        }
-        let mapping = Mapping {
-            base: NonNull::new(base.cast()).ok_or_else(invalid)?,
-            len,
-        };
-        os::populate(mapping.base.as_ptr(), initial_bytes)?;
-        // SAFETY: fallocate/populate succeeded; the page-aligned header is private
-        // during construction. Initialize atomic objects, not references to zero bytes.
-        unsafe {
-            for slot in 0..slots {
-                mapping
-                    .base
-                    .as_ptr()
-                    .add(slot as usize * 128)
-                    .cast::<Header>()
-                    .write(Header {
-                        committed: AtomicU64::new(0),
-                    });
-            }
-        }
+        let mapping = Mapping::new(&file, len, initial_bytes, slots)?;
         let mut shards = Vec::with_capacity(workers);
         for _ in 0..workers {
-            shards.push(Padded(Mutex::new(FreeList {
-                frames: Vec::new(),
-                low_water: 0,
-            })));
+            shards.push(Padded(Shard::new()));
         }
-        // Frames are distributed lazily; a worker steals resident frames before cold ones.
-        lock(&shards[0].0).frames.extend((0..initial).rev());
+        // Frames are distributed lazily; a worker steals resident frames from lists that look
+        // occupied before taking cold ones.
+        shards[0].0.lock().frames.extend((0..initial).rev());
         Ok(Self {
             mapping,
             file,
@@ -179,6 +302,7 @@ impl Pool {
             reserve_frames,
             slots,
             free_slots: Mutex::new((0..slots).rev().collect()),
+            states: FrameStates::new(frames as usize, initial)?,
             shards: shards.into_boxed_slice(),
             slow: Padded(Mutex::new(Slow {
                 backed: initial,
@@ -201,63 +325,136 @@ impl Pool {
         })
     }
 
-    fn resident(&self, local: usize) -> Option<u32> {
+    /// Pop a resident frame, this worker's list first. Unless `every`, lists that look empty
+    /// are passed over unlocked.
+    fn resident(&self, local: usize, every: bool) -> Option<u32> {
         for step in 0..self.shards.len() {
-            if let Some(frame) = lock(&self.shards[(local + step) % self.shards.len()].0).pop() {
+            let shard = &self.shards[(local + step) % self.shards.len()].0;
+            if (every || shard.occupied())
+                && let Some(frame) = shard.lock().pop()
+            {
                 return Some(frame);
             }
         }
         None
     }
 
-    pub(crate) fn allocate(&self) -> io::Result<u32> {
+    /// Take a free frame whose first `needed` bytes are populated.
+    pub(crate) fn allocate(&self, needed: usize) -> io::Result<u32> {
         let local = self.shard();
-        let frame = if let Some(frame) = self.resident(local) {
-            frame
-        } else {
-            // The reclaimer holds this lock until every candidate is on the cold
-            // list and its punch completes: allocation cannot see missing capacity.
-            let mut slow = lock(&self.slow.0);
-            if let Some(frame) = self.resident(local) {
-                frame
-            } else if let Some(&frame) = slow.cold.last() {
-                let start = self.frame_start(frame);
-                let page_start = start / self.page * self.page;
-                let end = round_up(start + FRAME_BYTES, self.page)?;
-                // Failure leaves ownership on the cold list; no writer sees holes.
-                os::populate(self.address(page_start), end - page_start)?;
-                slow.cold.pop();
-                frame
-            } else {
-                if slow.backed == self.capacity {
-                    return Err(io::Error::new(
-                        io::ErrorKind::OutOfMemory,
-                        "stream pool capacity exhausted",
-                    ));
-                }
-                let old = slow.backed;
-                let new = old.saturating_add(EXTENT).min(self.capacity);
-                let old_end = round_up(self.header_bytes + old as usize * FRAME_BYTES, self.page)?;
-                let new_end = round_up(self.header_bytes + new as usize * FRAME_BYTES, self.page)?;
-                self.file.grow(old_end, new_end - old_end)?;
-                os::populate(self.address(old_end), new_end - old_end)?;
-                slow.backed = new;
-                self.backed.0.store(new, Ordering::Release);
-                let mut free = lock(&self.shards[local].0);
-                free.frames.extend((old + 1..new).rev());
-                old
-            }
+        let frame = match self.resident(local, false) {
+            Some(frame) => frame,
+            None => self.reclaim(local)?,
         };
+        // Populate outside every lock: the frame is this caller's alone. A resident frame may
+        // be populated only for smaller records, a cold one not at all; on refusal it joins
+        // the cold list, and eviction may free better ones.
+        if let Err(error) = self.prefault(frame, needed) {
+            lock(&self.slow.0).cold.push(frame);
+            return Err(error);
+        }
+        self.states[frame as usize].refs.store(1, Ordering::Relaxed);
         self.used.0.fetch_add(1, Ordering::Relaxed);
         Ok(frame)
     }
 
-    /// Caller returns an owned frame exactly once, after every lease/retainer ends.
-    /// The stream layer enforces this invariant; no mapped borrow may survive release.
-    pub(crate) fn release(&self, frame: u32) {
+    /// A frame for an allocation that found no resident one: cold, resident after all, or
+    /// grown. The reclaimer holds this lock until every candidate is on the cold list and
+    /// its punch completes, so allocation cannot see missing capacity.
+    fn reclaim(&self, local: usize) -> io::Result<u32> {
+        let mut slow = lock(&self.slow.0);
+        if let Some(frame) = slow.cold.pop() {
+            return Ok(frame);
+        }
+        if let Some(frame) = self.resident(local, true) {
+            return Ok(frame);
+        }
+        if slow.backed == self.capacity {
+            return Err(io::Error::new(
+                io::ErrorKind::OutOfMemory,
+                "stream pool capacity exhausted",
+            ));
+        }
+        let old = slow.backed;
+        let new = old.saturating_add(EXTENT).min(self.capacity);
+        let old_end = round_up(self.header_bytes + old as usize * FRAME_BYTES, self.page)?;
+        let new_end = round_up(self.header_bytes + new as usize * FRAME_BYTES, self.page)?;
+        self.file.grow(old_end, new_end - old_end)?;
+        os::populate(self.address(old_end), new_end - old_end)?;
+        for frame in old..new {
+            self.states[frame as usize]
+                .ready
+                .store(FRAME_BYTES as u32, Ordering::Relaxed);
+        }
+        slow.backed = new;
+        self.backed.0.store(new, Ordering::Release);
+        self.shards[local].0.lock().frames.extend((old + 1..new).rev());
+        Ok(old)
+    }
+
+    /// Whether the first `needed` bytes of a frame the caller owns are populated.
+    pub(crate) fn is_ready(&self, frame: u32, needed: usize) -> bool {
+        needed <= self.states[frame as usize].ready.load(Ordering::Relaxed) as usize
+    }
+
+    /// Populate the pages under the first `needed` bytes of a frame the caller owns. Pages
+    /// that are already populated cost nothing; a refusal (tmpfs full) leaves them unwritten.
+    pub(crate) fn prefault(&self, frame: u32, needed: usize) -> io::Result<()> {
+        let ready = self.states[frame as usize].ready.load(Ordering::Relaxed) as usize;
+        if needed <= ready {
+            return Ok(());
+        }
+        assert!(frame < self.backed_frames() && needed <= FRAME_BYTES);
+        // A frame written in small records grows its prefix by doubling, so filling it costs
+        // a few calls rather than one per page. Near exhaustion only `needed` must succeed.
+        let ahead = needed.max(ready * 2).min(FRAME_BYTES);
+        if ahead > needed && self.populate(frame, ready, ahead).is_ok() {
+            return Ok(());
+        }
+        self.populate(frame, ready, needed)
+    }
+
+    /// Populate a frame's bytes from `ready` up to `to` and record the new prefix.
+    fn populate(&self, frame: u32, ready: usize, to: usize) -> io::Result<()> {
+        let start = self.frame_start(frame);
+        let from = (start + ready) / self.page * self.page;
+        let to = round_up(start + to, self.page)?;
+        os::populate(self.address(from), to - from)?;
+        let ready = (to - start).min(FRAME_BYTES) as u32;
+        self.states[frame as usize].ready.store(ready, Ordering::Relaxed);
+        Ok(())
+    }
+
+    pub(crate) fn references(&self, frame: u32) -> u32 {
+        self.states[frame as usize].refs.load(Ordering::Relaxed)
+    }
+
+    /// Whether another reference would overflow the frame's count.
+    pub(crate) fn saturated(&self, frame: u32) -> bool {
+        self.states[frame as usize].refs.load(Ordering::Relaxed) == u32::MAX
+    }
+
+    /// Add a reference to an allocated frame. The caller holds a reference that cannot be
+    /// released concurrently and has checked `saturated` since its last increment.
+    pub(crate) fn retain(&self, frame: u32) {
+        self.states[frame as usize].refs.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Drop one reference, which the caller holds and gives up exactly once. The last one
+    /// returns the frame to this thread's free list; no mapped borrow may survive it.
+    /// Returns whether the frame became free.
+    pub(crate) fn release(&self, frame: u32) -> bool {
         assert!(frame < self.backed_frames());
+        let previous = self.states[frame as usize].refs.fetch_sub(1, Ordering::Release);
+        assert_ne!(previous, 0, "frame released without a reference");
+        if previous != 1 {
+            return false;
+        }
+        // Every earlier holder's reads happen before the frame is reused.
+        fence(Ordering::Acquire);
         self.used.0.fetch_sub(1, Ordering::Relaxed);
-        lock(&self.shards[self.shard()].0).frames.push(frame);
+        self.shards[self.shard()].0.lock().frames.push(frame);
+        true
     }
 
     fn frame_start(&self, frame: u32) -> usize {
@@ -302,7 +499,8 @@ impl Pool {
         Some(slot)
     }
 
-    /// Caller returns a slot exactly once, only when its stream object is dropped.
+    /// Caller returns a slot exactly once, at invalidation or drop of its stream; the stream
+    /// never loads or stores that header afterwards.
     pub(crate) fn release_slot(&self, slot: u32) {
         assert!(slot < self.slots);
         lock(&self.free_slots).push(slot);
@@ -320,12 +518,21 @@ impl Pool {
         let mut slow = lock(&self.slow.0);
         let Slow { cold, candidates, .. } = &mut *slow;
         candidates.clear();
+        // The warm budget is pool-wide: frames freed on one thread stay warm for any thread,
+        // which steals resident frames before taking cold ones.
+        let mut warm = WARM * self.shards.len();
         for shard in &self.shards {
-            let mut free = lock(&shard.0);
-            let count = free.low_water.min(free.frames.len()).saturating_sub(WARM);
+            let mut free = shard.0.lock();
+            let idle = free.low_water.min(free.frames.len());
+            let kept = idle.min(warm);
+            warm -= kept;
+            let count = idle - kept;
             // The startup prefix stays backed even while free; punch only the excess.
             candidates.extend(free.frames.extract_if(..count, |frame| *frame >= self.reserve_frames));
             free.low_water = free.frames.len();
+        }
+        for &frame in candidates.iter() {
+            self.states[frame as usize].ready.store(0, Ordering::Relaxed);
         }
         candidates.sort_unstable();
         // Publish cold ownership before any destructive syscall, even if a later
@@ -350,6 +557,11 @@ impl Pool {
             }
         }
         first_error.map_or(Ok(()), Err)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn cold_frames(&self) -> usize {
+        lock(&self.slow.0).cold.len()
     }
 
     pub(crate) fn capacity(&self) -> u32 {

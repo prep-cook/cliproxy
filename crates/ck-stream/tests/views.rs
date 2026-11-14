@@ -237,6 +237,34 @@ fn invalidation_between_frame_visits_stops_before_the_next_chunk() {
 }
 
 #[test]
+fn lease_visits_check_invalidation_before_each_frame() {
+    let (_dir, store, clock) = store();
+    let mut writer = store.create().unwrap();
+    writer.append(b"/pathVALUE").unwrap();
+    writer.append(&vec![b'x'; FRAME_BYTES + 1]).unwrap();
+    let mut reader = store.reader(writer.id(), 0).unwrap();
+    let small = lease(&mut reader);
+    let large = lease(&mut reader);
+    drop(reader);
+    let mut seen = Vec::new();
+    small.visit(|chunk| seen.extend_from_slice(chunk)).unwrap();
+    assert_eq!(seen, b"/pathVALUE");
+    let mut calls = 0;
+    let result = large.visit(|chunk| {
+        calls += 1;
+        assert_eq!(chunk, &[b'x'; FRAME_BYTES - 10]);
+        clock.advance(Duration::from_secs(3601));
+        store.tick().unwrap();
+    });
+    assert!(matches!(result, Err(Error::Gone)));
+    assert_eq!(calls, 1);
+    assert!(matches!(
+        small.visit(|_| panic!("invalidated lease exposed bytes")),
+        Err(Error::Gone)
+    ));
+}
+
+#[test]
 fn views_keep_using_the_borrowed_lease_after_other_owners_drop() {
     let (_dir, store, _) = store();
     let mut writer = store.create().unwrap();

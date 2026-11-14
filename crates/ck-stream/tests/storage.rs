@@ -48,6 +48,25 @@ fn incomplete_record_is_invisible_and_abandoned_frames_are_reusable() {
 }
 
 #[test]
+fn incomplete_commit_keeps_the_reservation_writable() {
+    let (_dir, store, _) = store(4);
+    let mut writer = store.create().unwrap();
+    let mut reader = store.reader(writer.id(), 0).unwrap();
+    let mut record = writer.begin_record(12, false, 0, 0).unwrap();
+    record.write(b"data: ").unwrap();
+    assert!(matches!(record.commit(), Err(Error::IncompleteRecord)));
+    record.write(b"done\n\n").unwrap();
+    let committed = record.commit().unwrap();
+    assert!(matches!(record.commit(), Err(Error::Closed)));
+    assert!(matches!(record.write(b""), Err(Error::Closed)));
+    drop(record);
+    let read = lease(&mut reader);
+    assert_eq!(read.record(), committed);
+    assert_eq!(read.chunk(committed.start).unwrap(), b"data: done\n\n");
+    assert!(matches!(reader.try_next(), Poll::Pending));
+}
+
+#[test]
 fn cross_frame_record_and_aligned_padding_are_not_mixed() {
     let (_dir, store, _) = store(8);
     let mut writer = store.create().unwrap();
@@ -56,9 +75,11 @@ fn cross_frame_record_and_aligned_padding_are_not_mixed() {
     record.write(b"abc").unwrap();
     record.write(b"defghi").unwrap();
     record.commit().unwrap();
-    let mut aligned = writer.begin_record(4, true, 5, 8).unwrap();
-    aligned.write(b"last").unwrap();
-    let aligned = aligned.commit().unwrap();
+    drop(record);
+    let mut reservation = writer.begin_record(4, true, 5, 8).unwrap();
+    reservation.write(b"last").unwrap();
+    let aligned = reservation.commit().unwrap();
+    drop(reservation);
     assert_eq!(aligned.start.offset, 0);
     let mut reader = store.reader(writer.id(), 1).unwrap();
     let read = lease(&mut reader);
@@ -141,14 +162,13 @@ fn pressure_evicts_oldest_read_not_oldest_created_and_never_reuses_a_lease() {
     lease(&mut first_reader).acknowledge();
     let mut allocating = store.create().unwrap();
     allocating.append(&vec![3; 3 * FRAME_BYTES]).unwrap();
-    // second is invalidated first but its lease prevents reuse, so first must also be evicted.
-    terminal(&mut second_reader, Terminal::Gone);
-    assert_eq!(borrowed, vec![2; FRAME_BYTES]);
-    assert!(matches!(pinned.chunk(pinned.record().start), Err(Error::Gone)));
-    assert_eq!(store.used_frames(), 4);
-    drop(pinned);
-    assert_eq!(store.used_frames(), 3);
+    // second was read least recently, but its lease means eviction would return nothing.
     assert!(matches!(store.reader(first.id(), 0), Err(Error::Gone)));
+    assert_eq!(borrowed, vec![2; FRAME_BYTES]);
+    assert_eq!(pinned.chunk(pinned.record().start).unwrap(), borrowed);
+    drop(pinned);
+    assert!(matches!(second_reader.try_next(), Poll::Pending));
+    assert_eq!(store.used_frames(), 4);
 }
 
 #[test]
@@ -163,11 +183,13 @@ fn pinned_capacity_fails_visibly_without_overwrite_and_keeps_prefix() {
     let mut failed_reader = store.reader(second.id(), 0).unwrap();
     assert!(matches!(second.append(b"cannot fit"), Err(Error::StorageExhausted)));
     terminal(&mut failed_reader, Terminal::StorageExhausted);
-    terminal(&mut reader, Terminal::Gone);
+    // The pinned stream would return no frame, so pressure leaves it readable.
+    assert!(matches!(reader.try_next(), Poll::Pending));
     assert_eq!(bytes, vec![9; FRAME_BYTES]);
-    assert_eq!(store.used_frames(), 4);
     drop(pinned);
-    assert_eq!(store.used_frames(), 0);
+    assert_eq!(store.used_frames(), 4);
+    first.finish(Terminal::Done);
+    terminal(&mut reader, Terminal::Done);
 }
 
 #[test]
@@ -188,6 +210,90 @@ fn per_stream_quota_does_not_evict_others_and_error_follows_prefix() {
     terminal(&mut reader, Terminal::StorageExhausted);
 }
 
+#[test]
+fn pressure_never_invalidates_streams_that_free_nothing() {
+    let (_dir, store, _) = store(4);
+    let mut owner = store.create().unwrap();
+    let scratch = owner.begin_scratch(4 * FRAME_BYTES).unwrap();
+    let mut waiting = store.create().unwrap();
+    let mut allocating = store.create().unwrap();
+    assert!(matches!(allocating.append(&[1; 10]), Err(Error::StorageExhausted)));
+    assert!(store.reader(owner.id(), 0).is_ok());
+    assert!(store.reader(waiting.id(), 0).is_ok());
+    drop(scratch);
+    waiting.append(&[2; 10]).unwrap();
+}
+
+#[test]
+fn pressure_skips_leased_victims_until_their_frames_can_return() {
+    let (_dir, store, _) = store(4);
+    let mut pinned = store.create().unwrap();
+    for _ in 0..4 {
+        pinned.append(&[7; FRAME_BYTES]).unwrap();
+    }
+    let mut reader = store.reader(pinned.id(), 0).unwrap();
+    let leases: Vec<_> = (0..4).map(|_| lease(&mut reader)).collect();
+    let mut waiting = store.create().unwrap();
+    let mut allocating = store.create().unwrap();
+    assert!(matches!(allocating.append(&[1; 10]), Err(Error::StorageExhausted)));
+    assert!(store.reader(waiting.id(), 0).is_ok());
+    assert_eq!(leases[3].chunk(leases[3].record().start).unwrap(), &[7; FRAME_BYTES]);
+    drop(leases);
+    // Without leases the least recently read stream returns its frames and is evicted.
+    waiting.append(&[2; 10]).unwrap();
+    terminal(&mut reader, Terminal::Gone);
+}
+
+#[test]
+fn pressure_fails_without_eviction_when_victims_cannot_cover_the_reservation() {
+    let (_dir, store, _) = store(4);
+    let mut pinned = store.create().unwrap();
+    pinned.append(&[7; 3 * FRAME_BYTES]).unwrap();
+    let mut reader = store.reader(pinned.id(), 0).unwrap();
+    let pin = lease(&mut reader);
+    let mut small = store.create().unwrap();
+    small.append(&[8; 10]).unwrap();
+    let mut allocating = store.create().unwrap();
+    assert!(matches!(
+        allocating.begin_scratch(2 * FRAME_BYTES),
+        Err(Error::StorageExhausted)
+    ));
+    assert!(store.reader(small.id(), 0).is_ok());
+    assert!(pin.chunk(pin.record().start).is_ok());
+    assert_eq!(store.used_frames(), 4);
+}
+
+#[test]
+fn header_slot_exhaustion_evicts_the_least_recently_read_stream() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut config = Config::new(dir.path().join("pool"));
+    config.pool_bytes = Some(64 * FRAME_BYTES);
+    config.max_event_bytes = FRAME_BYTES;
+    config.workers = 1;
+    assert_eq!(config.header_slots, 4096);
+    let clock = Arc::new(ManualClock::default());
+    let store = Store::with_clock(config, clock.clone()).unwrap();
+    let finished = || {
+        let mut writer = store.create().unwrap();
+        writer.finish(Terminal::Done);
+        writer.id()
+    };
+    let first = finished();
+    let mut second = store.create().unwrap();
+    let kept = second.append(b"kept").unwrap();
+    let mut second_reader = store.reader(second.id(), 0).unwrap();
+    let rest: Vec<_> = (2..4096).map(|_| finished()).collect();
+    clock.advance(Duration::from_secs(1));
+    drop(store.reader(first, 0).unwrap());
+    let mut admitted = store.create().unwrap();
+    admitted.append(b"reuses the freed header slot").unwrap();
+    terminal(&mut second_reader, Terminal::Gone);
+    assert_eq!(second.committed(), kept.end);
+    assert!(matches!(store.reader(second.id(), 0), Err(Error::Gone)));
+    assert!(store.reader(first, 0).is_ok());
+    assert!(store.reader(rest[0], 0).is_ok());
+}
+
 #[tokio::test]
 async fn notification_registration_cannot_lose_publication_or_cancellation() {
     let (_dir, store, _) = store(8);
@@ -200,7 +306,10 @@ async fn notification_registration_cannot_lose_publication_or_cancellation() {
             };
             assert_eq!(read.chunk(read.record().start).unwrap(), &[expected]);
         }
-        assert!(matches!(reader.next().await, Some(Read::Terminal(Terminal::Cancelled))));
+        assert!(matches!(
+            reader.next().await,
+            Some(Read::Terminal(Terminal::ProducerLost))
+        ));
         assert!(reader.next().await.is_none());
     });
     for byte in 0..128u8 {

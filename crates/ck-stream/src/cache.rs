@@ -1,18 +1,33 @@
 use std::{
-    collections::{BTreeSet, HashMap},
+    collections::{BTreeSet, HashMap, HashSet},
+    hash::{BuildHasherDefault, Hasher},
     io,
+    ops::Bound::{Excluded, Unbounded},
+    panic::AssertUnwindSafe,
     sync::{
-        Arc, Condvar, Mutex, RwLock, RwLockWriteGuard, Weak,
+        Arc, Condvar, Mutex, RwLock, RwLockReadGuard, RwLockWriteGuard, Weak,
         atomic::{AtomicBool, AtomicU64, Ordering},
     },
     thread::JoinHandle,
     time::{Duration, Instant},
 };
 
-use crate::{Config, Error, Limits, Reader, Terminal, Writer, pool::Pool, publication::Stream};
+use parking_lot::MutexGuard;
+
+use crate::{
+    Config, Error, Limits, Reader, Terminal, Writer,
+    pool::Pool,
+    publication::{State, Stream},
+};
+
+mod stats;
+use stats::Failures;
+pub use stats::StoreStats;
 
 /// Monotonic elapsed time. Implementations must never move backwards.
 pub trait Clock: Send + Sync + 'static {
+    /// Must not panic: reads and lease drops call it after taking frame references and
+    /// metadata charges, and an unwind there strands both.
     fn now(&self) -> Duration;
 }
 
@@ -56,10 +71,99 @@ fn checked_add(counter: &AtomicU64, increment: u64) -> Option<u64> {
 
 static NEXT_ID: AtomicU64 = AtomicU64::new(1);
 
+/// Maintenance failures since the store opened. The crate has no logger: the runtime reads
+/// these counters and the first unread error (`Store::take_reclaim_error`) and logs them.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct MaintenanceFailures {
+    /// Ticks whose expiry or decay returned an I/O error.
+    pub errors: u64,
+    /// Ticks that panicked. The maintenance thread contains each panic and keeps running.
+    pub panics: u64,
+}
+
+#[derive(Default)]
+struct Maintenance {
+    failures: MaintenanceFailures,
+    first_error: Option<io::Error>,
+}
+
+/// Hashes stream ids by one multiplication. The store assigns ids sequentially, so no client
+/// chooses the keys in the table, and a lookup skips SipHash's cost.
+#[derive(Default)]
+struct IdHasher(u64);
+
+impl Hasher for IdHasher {
+    fn finish(&self) -> u64 {
+        self.0
+    }
+    fn write(&mut self, bytes: &[u8]) {
+        for &byte in bytes {
+            self.write_u64(self.0.rotate_left(8) ^ u64::from(byte));
+        }
+    }
+    fn write_u64(&mut self, id: u64) {
+        self.0 = id.wrapping_mul(0x9e37_79b9_7f4a_7c15);
+    }
+}
+
+/// A cached stream and its key in `order`, which removal needs: keys lag the last read.
+struct Entry {
+    stream: Arc<Stream>,
+    queued: Duration,
+}
+
 #[derive(Default)]
 pub(crate) struct Cache {
-    streams: HashMap<u64, Arc<Stream>>,
+    streams: HashMap<u64, Entry, BuildHasherDefault<IdHasher>>,
     order: BTreeSet<(Duration, u64)>,
+    evictions: u64,
+    expiries: u64,
+    /// Streams that left the cache; their readers may still hold leases.
+    orphans: Vec<Weak<Stream>>,
+    /// `orphans` length that triggers the next prune: twice the entries the last prune kept.
+    prune_at: usize,
+}
+
+impl Cache {
+    fn insert(&mut self, stream: Arc<Stream>) {
+        let queued = stream.last_read();
+        self.order.insert((queued, stream.id));
+        self.streams.insert(stream.id, Entry { stream, queued });
+    }
+
+    fn get(&self, id: u64) -> Option<Arc<Stream>> {
+        self.streams.get(&id).map(|entry| entry.stream.clone())
+    }
+
+    fn remove(&mut self, id: u64) -> Option<Arc<Stream>> {
+        let entry = self.streams.remove(&id)?;
+        self.order.remove(&(entry.queued, id));
+        Some(entry.stream)
+    }
+
+    fn requeue(&mut self, key: (Duration, u64), read: Duration) {
+        self.order.remove(&key);
+        self.order.insert((read, key.1));
+        self.streams.get_mut(&key.1).unwrap().queued = read;
+    }
+
+    /// Each prune scans at most twice the entries the previous one kept, and as many
+    /// retirements pass in between, so retirement is amortized O(1). The length stays below
+    /// twice the entries alive at the last prune plus one; capacity keeps its historical peak.
+    fn retire(&mut self, stream: &Arc<Stream>) {
+        if self.orphans.len() >= self.prune_at {
+            self.orphans.retain(|orphan| orphan.strong_count() > 0);
+            self.prune_at = 2 * self.orphans.len();
+        }
+        self.orphans.push(Arc::downgrade(stream));
+    }
+
+    /// Put back the retired streams a scrape kept, ahead of those retired meanwhile.
+    fn restore(&mut self, mut kept: Vec<Weak<Stream>>) {
+        self.prune_at = 2 * kept.len();
+        kept.append(&mut self.orphans);
+        self.orphans = kept;
+    }
 }
 
 #[repr(align(128))]
@@ -69,13 +173,23 @@ pub(crate) struct Inner {
     cache: parking_lot::Mutex<Cache>,
     retention: Arc<Retention>,
     closed: AtomicBool,
-    reclaim_error: Mutex<Option<io::Error>>,
+    maintenance: parking_lot::Mutex<Maintenance>,
+    /// Serializes `Store::stats`, which takes `Cache::orphans` out while it walks them, so
+    /// that no scrape misses the retired streams another scrape holds.
+    scrape: parking_lot::Mutex<()>,
+    /// Runs once between planning victims and invalidating them.
+    #[cfg(test)]
+    evict_hook: parking_lot::Mutex<Option<Box<dyn FnOnce() + Send>>>,
+    /// Runs once in a tick, after expiry and before decay.
+    #[cfg(test)]
+    tick_hook: parking_lot::Mutex<Option<Box<dyn FnOnce() + Send>>>,
 }
 
 pub(crate) struct Retention {
     clock: Arc<dyn Clock>,
     fence: RwLock<()>,
     active: AtomicBool,
+    pub(crate) failures: Failures,
 }
 
 impl Retention {
@@ -88,27 +202,35 @@ impl Retention {
         }
     }
 
-    pub(crate) fn reading<R>(
-        &self,
-        stream: &Stream,
-        read: impl FnOnce(&mut crate::publication::State) -> (R, bool),
-    ) -> R {
-        let mut state = stream.state.lock();
+    /// Lock stream state once no maintenance pass that has observed this stream is running.
+    /// Reads and every writer transition that lowers a stream's reclaimable frames use this,
+    /// so eviction's counted gain cannot shrink before it invalidates its victims.
+    pub(crate) fn lock_stable<'a>(
+        &'a self,
+        stream: &'a Stream,
+    ) -> (MutexGuard<'a, State>, Option<RwLockReadGuard<'a, ()>>) {
+        let state = stream.state.lock();
         // Maintenance sets the flag before locking stream state. Once it has observed a
-        // stream, that mutex's release/acquire edge makes later readers take the fence.
-        let _retention = if self.active.load(Ordering::Acquire) {
-            drop(state);
-            let guard = self.fence.read().unwrap();
-            state = stream.state.lock();
-            Some(guard)
-        } else {
-            None
-        };
+        // stream, that mutex's release/acquire edge makes later callers take the fence.
+        if !self.active.load(Ordering::Acquire) {
+            return (state, None);
+        }
+        drop(state);
+        let fence = self.fence.read().unwrap();
+        (stream.state.lock(), Some(fence))
+    }
+
+    pub(crate) fn reading<R>(&self, stream: &Stream, read: impl FnOnce(&mut State) -> (R, bool)) -> R {
+        let (mut state, _fence) = self.lock_stable(stream);
         let (result, acquired) = read(&mut state);
         if acquired {
-            state.last_read = self.clock.now();
+            stream.touch(self.clock.now());
         }
         result
+    }
+
+    pub(crate) fn now(&self) -> Duration {
+        self.clock.now()
     }
 }
 
@@ -124,48 +246,59 @@ impl Drop for RetentionGuard<'_> {
 }
 
 impl Inner {
-    pub(crate) fn evict_one(&self, exclude: u64) -> bool {
+    /// Invalidate the least recently read streams whose `gain` (what invalidation returns now)
+    /// together covers `wanted`. Streams that would return nothing stay cached; if every
+    /// candidate together cannot cover the request, nothing is invalidated and this returns false.
+    fn evict(&self, exclude: Option<u64>, wanted: usize, gain: fn(&Stream, &State) -> usize) -> bool {
         let _retention = self.retention.retain();
         let mut cache = self.cache.lock();
-        let mut stale = 0;
-        let pass = cache.streams.len() - usize::from(cache.streams.contains_key(&exclude));
-        while let Some(key) = cache.order.iter().find(|(_, id)| *id != exclude).copied() {
-            let stream = cache.streams[&key.1].clone();
-            let mut state = stream.state.lock();
-            cache.order.remove(&key);
-            // Queue timestamps are lower bounds. The fence stops new refreshes; a reader
-            // already past its flag check can refresh once. After one stale pass, scan
-            // real timestamps: each observed stream is then stable under the fence.
-            if state.last_read != key.0 {
-                cache.order.insert((state.last_read, key.1));
-                stale += 1;
-                if stale < pass {
-                    continue;
-                }
-                drop(state);
+        let mut victims = Vec::new();
+        let mut found = 0;
+        let mut refreshed = HashSet::new();
+        let mut cursor = None;
+        while found < wanted {
+            let next = match cursor {
+                None => cache.order.first(),
+                Some(key) => cache.order.range((Excluded(key), Unbounded)).next(),
+            };
+            let Some(&key) = next else {
                 break;
+            };
+            cursor = Some(key);
+            if Some(key.1) == exclude {
+                continue;
             }
-            cache.streams.remove(&key.1);
-            if stream.invalidate_locked(&mut state) > 0 {
-                return true;
+            let stream = cache.streams[&key.1].stream.clone();
+            let state = stream.state.lock();
+            // Queue timestamps are lower bounds. Once maintenance has observed a stream, the
+            // fence holds off new leases, so one requeue at the real value is exact except for
+            // an acknowledgement racing this pass, which then counts as arriving after it.
+            let last_read = stream.last_read();
+            if last_read != key.0 && refreshed.insert(key.1) {
+                drop(state);
+                cache.requeue(key, last_read);
+                continue;
+            }
+            let returned = gain(&stream, &state);
+            if returned > 0 {
+                found += returned;
+                victims.push(key);
             }
         }
-        // Every fallback iteration removes a stream, even if leases pin all its frames.
-        while let Some(id) = cache
-            .streams
-            .iter()
-            .filter(|(id, _)| **id != exclude)
-            .min_by_key(|(id, stream)| (stream.state.lock().last_read, **id))
-            .map(|(id, _)| *id)
-        {
-            let stream = cache.streams.remove(&id).unwrap();
-            let mut state = stream.state.lock();
-            cache.order.retain(|(_, entry)| *entry != id);
-            if stream.invalidate_locked(&mut state) > 0 {
-                return true;
-            }
+        if found < wanted {
+            return false;
         }
-        false
+        #[cfg(test)]
+        if let Some(hook) = self.evict_hook.lock().take() {
+            hook();
+        }
+        cache.evictions += victims.len() as u64;
+        for key in victims {
+            let stream = cache.remove(key.1).unwrap();
+            stream.invalidate_locked(&mut stream.state.lock());
+            cache.retire(&stream);
+        }
+        true
     }
 
     fn tick(&self) -> io::Result<()> {
@@ -177,32 +310,86 @@ impl Inner {
                 if now.saturating_sub(read) <= self.limits.cache_ttl {
                     break;
                 }
-                let stream = cache.streams[&id].clone();
+                let stream = cache.streams[&id].stream.clone();
                 let mut state = stream.state.lock();
-                cache.order.remove(&(read, id));
                 // An outstanding wait is a read even without publication or another poll.
                 if state.readers > 0 {
-                    state.last_read = now;
+                    stream.touch(now);
                 }
-                if state.last_read != read {
-                    cache.order.insert((state.last_read, id));
+                let last_read = stream.last_read();
+                if last_read != read {
+                    cache.requeue((read, id), last_read);
                     continue;
                 }
-                cache.streams.remove(&id);
+                cache.remove(id);
+                cache.expiries += 1;
                 stream.invalidate_locked(&mut state);
+                cache.retire(&stream);
             }
+        }
+        #[cfg(test)]
+        if let Some(hook) = self.tick_hook.lock().take() {
+            hook();
         }
         self.pool.decay()
     }
 
-    pub(crate) fn allocate(&self, exclude: u64) -> Result<u32, Error> {
+    /// One maintenance round, with a panicking tick contained, counted and reported.
+    ///
+    /// A panic in the fenced expiry section poisons the retention fence, which §6.4 keeps
+    /// poisoning: every later tick and eviction then panics, so maintenance cannot recover.
+    /// Only a broken internal invariant panics there. A panic after that section, in decay,
+    /// is recoverable: pool locks ignore poisoning, and decay moves frames to the cold list
+    /// before any punch, so the next tick expires and decays normally.
+    fn maintain(&self) {
+        match std::panic::catch_unwind(AssertUnwindSafe(|| self.tick())) {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => self.record_failure(error, false),
+            Err(_) => self.record_failure(io::Error::other("stream maintenance tick panicked"), true),
+        }
+    }
+
+    fn record_failure(&self, error: io::Error, panicked: bool) {
+        let mut maintenance = self.maintenance.lock();
+        if panicked {
+            maintenance.failures.panics += 1;
+        } else {
+            maintenance.failures.errors += 1;
+        }
+        maintenance.first_error.get_or_insert(error);
+    }
+
+    /// Remove a stream its writer ended with `Gone`. Invalidation already freed its slot and
+    /// frames, so neither eviction nor expiry would remove it before the TTL. Called after
+    /// invalidation released the stream's state and the fence, so the lock order holds.
+    pub(crate) fn forget(&self, stream: &Arc<Stream>) {
+        let mut cache = self.cache.lock();
+        // Eviction, expiry or shutdown may have removed it first.
+        if cache.remove(stream.id).is_some() {
+            cache.retire(stream);
+        }
+    }
+
+    /// Allocate one of the `remaining` frames a pending reservation still needs, with its
+    /// first `needed` bytes populated.
+    pub(crate) fn allocate(&self, exclude: u64, remaining: usize, needed: usize) -> Result<u32, Error> {
+        let mut evicted_for_tmpfs = false;
         loop {
-            match self.pool.allocate() {
+            match self.pool.allocate(needed) {
                 Ok(frame) => return Ok(frame),
                 Err(error) if error.kind() == io::ErrorKind::OutOfMemory && error.raw_os_error().is_none() => {
-                    if !self.evict_one(exclude) {
+                    if !self.evict(Some(exclude), remaining, Stream::reclaimable) {
                         return Err(Error::StorageExhausted);
                     }
+                }
+                // tmpfs refused growth (ENOSPC) or a cold prefault (EFAULT). Evicted frames are
+                // already backed, so retry once; a second refusal keeps the OS cause (G7).
+                Err(error)
+                    if !evicted_for_tmpfs
+                        && matches!(error.raw_os_error(), Some(libc::ENOSPC | libc::EFAULT))
+                        && self.evict(Some(exclude), remaining, Stream::reclaimable) =>
+                {
+                    evicted_for_tmpfs = true;
                 }
                 Err(error) => return Err(Error::Io(error)),
             }
@@ -240,9 +427,15 @@ impl Store {
                 clock,
                 fence: RwLock::new(()),
                 active: AtomicBool::new(false),
+                failures: Failures::default(),
             }),
             closed: AtomicBool::new(false),
-            reclaim_error: Mutex::new(None),
+            maintenance: parking_lot::Mutex::new(Maintenance::default()),
+            scrape: parking_lot::Mutex::new(()),
+            #[cfg(test)]
+            evict_hook: parking_lot::Mutex::new(None),
+            #[cfg(test)]
+            tick_hook: parking_lot::Mutex::new(None),
         });
         let stop = Arc::new((Mutex::new(false), Condvar::new()));
         let weak: Weak<Inner> = Arc::downgrade(&inner);
@@ -263,9 +456,7 @@ impl Store {
                     let Some(inner) = weak.upgrade() else {
                         break;
                     };
-                    if let Err(error) = inner.tick() {
-                        *inner.reclaim_error.lock().unwrap() = Some(error);
-                    }
+                    inner.maintain();
                 }
             })?;
         Ok(Self {
@@ -290,12 +481,27 @@ impl Store {
 
     /// Admit one exclusive producer. The returned id is an internal generation, not an auth token.
     pub fn create(&self) -> Result<Writer, Error> {
+        // Header slots bound the mapping, not the cache: when none is free, evict the least
+        // recently read stream exactly as under frame pressure. Invalidation frees its slot.
+        let slot = loop {
+            if self.inner.closed.load(Ordering::Acquire) {
+                return Err(Error::Closed);
+            }
+            if let Some(slot) = self.inner.pool.claim_slot() {
+                break slot;
+            }
+            if !self.inner.evict(None, 1, State::slot_count) {
+                self.inner.retention.failures.record(None);
+                return Err(Error::StorageExhausted);
+            }
+        };
         let mut cache = self.inner.cache.lock();
-        if self.inner.closed.load(Ordering::Acquire) {
-            return Err(Error::Closed);
+        let id = if self.inner.closed.load(Ordering::Acquire) {
+            Err(Error::Closed)
+        } else {
+            checked_add(&NEXT_ID, 1).ok_or(Error::StorageExhausted)
         }
-        let id = checked_add(&NEXT_ID, 1).ok_or(Error::StorageExhausted)?;
-        let slot = self.inner.pool.claim_slot().ok_or(Error::StorageExhausted)?;
+        .inspect_err(|_| self.inner.pool.release_slot(slot))?;
         let now = self.inner.retention.clock.now();
         let stream = Arc::new(Stream::new(
             id,
@@ -305,14 +511,13 @@ impl Store {
             self.inner.limits,
             now,
         ));
-        cache.order.insert((now, id));
-        cache.streams.insert(id, stream.clone());
+        cache.insert(stream.clone());
         Ok(Writer::new(self.inner.clone(), stream))
     }
 
     /// Attach at the number of complete records already consumed. Authorization belongs to the caller.
     pub fn reader(&self, id: u64, after: u64) -> Result<Reader, Error> {
-        let stream = self.inner.cache.lock().streams.get(&id).cloned().ok_or(Error::Gone)?;
+        let stream = self.inner.cache.lock().get(id).ok_or(Error::Gone)?;
         Reader::new(stream, after)
     }
 
@@ -321,8 +526,13 @@ impl Store {
         self.inner.tick()
     }
 
+    /// The first maintenance failure since the last call; later failures only count.
     pub fn take_reclaim_error(&self) -> Option<io::Error> {
-        self.inner.reclaim_error.lock().unwrap().take()
+        self.inner.maintenance.lock().first_error.take()
+    }
+
+    pub fn maintenance_failures(&self) -> MaintenanceFailures {
+        self.inner.maintenance.lock().failures
     }
 
     /// Stop admission, publish cancellation, join maintenance, then release cache retention.
@@ -332,11 +542,11 @@ impl Store {
         {
             let _retention = self.inner.retention.retain();
             let mut cache = self.inner.cache.lock();
-            for stream in cache.streams.values() {
-                stream.finish(Terminal::Shutdown);
-            }
             cache.order.clear();
-            cache.streams.clear();
+            for Entry { stream, .. } in std::mem::take(&mut cache.streams).into_values() {
+                stream.finish(Terminal::Shutdown);
+                cache.retire(&stream);
+            }
         }
         *self.stop.0.lock().unwrap() = true;
         self.stop.1.notify_all();
@@ -351,8 +561,10 @@ impl Store {
 
 impl Drop for Store {
     fn drop(&mut self) {
-        if let Err(error) = self.shutdown() {
-            eprintln!("stream maintenance failed: {error}");
-        }
+        // A dropped store has nowhere to report; callers that need the error call shutdown first.
+        let _ = self.shutdown();
     }
 }
+
+#[cfg(test)]
+mod tests;

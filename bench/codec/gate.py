@@ -5,7 +5,9 @@ import datetime
 from decimal import Decimal
 from fractions import Fraction
 import hashlib
+import itertools
 import json
+import math
 import os
 from pathlib import Path
 import platform
@@ -17,12 +19,14 @@ import sys
 HERE = Path(__file__).resolve().parent
 ROOT = HERE.parent.parent
 BASELINE_REVISION = "b518060ea1e43ef4b266591986ca92321e6289b5"
-# unit, direction, allowed regression percent; None means report only.
+# unit, direction, allowed regression percent; None means not a percentage rule.
+# "present" fails only when old output was nonzero and new output is zero.
 METRICS = {
     "cpu_ns_per_event": ("ns/event", "lower", 5),
     "allocations_per_event": ("allocations/event", "lower", 5),
-    "allocated_bytes_per_event": ("B/event", "lower", 5),
-    "encoded_bytes_per_event": ("B/event", "report", None),
+    # INTERNAL-STREAM.md §9.2 tolerances: allocated bytes are memory, 0%.
+    "allocated_bytes_per_event": ("B/event", "lower", 0),
+    "encoded_bytes_per_event": ("B/event", "present", None),
     "decoded_bytes_per_event": ("B/event", "report", None),
     "cpu_ns_per_completion": ("ns/completion", "lower", 5),
     "throughput": ("events/s", "higher", 5),
@@ -35,7 +39,27 @@ METRICS = {
         "rss_anon", "rss_shmem", "mapped_resident", "metadata", "tmpfs_charge")},
     **{kind: ("frames", "report", None) for kind in ("pool_reserved", "pool_used")},
     **{kind: ("faults", "report", None) for kind in ("minor_faults", "major_faults")},
+    "output_chunks": ("chunks", "present", None),
+    "no_output_completions": ("completions", "lower", 0),
 }
+# Owner ruling 2026-11-14: OS memory counters move between identical runs, so they
+# may exceed old by a calibrated noise band; beyond it the 0% rule holds. Heap and
+# allocation metrics stay exact.
+BANDED_METRICS = ("rss", "pss", "cgroup_charge", "total_charged")
+BAND_SCHEMA_VERSION = 2
+BAND_SIGMAS = 3
+BAND_RULE = ("new_median - old_median <= allowance for rss, pss, cgroup_charge and total_charged; "
+             "allowance = max(one page, ceil(3 x sigma), largest difference), where sigma and the largest "
+             "difference come from median(3 warm old rounds) - median(3 other warm old rounds) over every "
+             "ordered pair of disjoint triples of that workload's calibration rounds")
+BAND_MAX_AGE_DAYS = 30
+# The first run of a harness is cold (RSS about 260 KiB lower), so the gate and the
+# calibration both discard it and compare warm rounds only.
+WARMUP_ROUNDS = 1
+GATE_ROUNDS = 3
+# Ten warm rounds give 4,200 ordered pairs of disjoint triples per workload.
+CALIBRATION_ROUNDS = WARMUP_ROUNDS + 10
+PAGE_SIZE = os.sysconf("SC_PAGE_SIZE")
 
 
 def unique_object(pairs):
@@ -226,33 +250,162 @@ def records(path, required, checksum, round_number):
 def acceptable(old, new, direction, tolerance):
     if direction == "report":
         return True
+    if direction == "present":
+        return not (old > 0 and new == 0)
     old, new = Fraction(old), Fraction(new)
     if direction == "higher":
         return new * 100 >= old * (100 - tolerance)
     return new * 100 <= old * (100 + tolerance)
 
 
-def compare(workloads, rounds):
+def compare(workloads, rounds, allowances):
     comparisons = []
     for workload in workloads:
         key = workload["id"]
         for metric, (unit, direction, tolerance) in METRICS.items():
             old = statistics.median([row[key][metric] for row in rounds["old"]])
             new = statistics.median([row[key][metric] for row in rounds["new"]])
-            comparisons.append({"workload_id": key, "metric": metric, "unit": unit,
-                                "old_median": old, "new_median": new,
-                                "direction": direction, "regression_percent": tolerance,
-                                "pass": acceptable(old, new, direction, tolerance)})
+            row = {"workload_id": key, "metric": metric, "unit": unit,
+                   "old_median": old, "new_median": new,
+                   "direction": direction, "regression_percent": tolerance}
+            if metric in BANDED_METRICS:
+                allowance = allowances[key][metric]
+                row["noise_band"] = allowance
+                row["pass"] = new - old <= allowance
+            else:
+                row["pass"] = acceptable(old, new, direction, tolerance)
+            comparisons.append(row)
     return comparisons
 
 
-def run(old, new, out):
+def median_differences(samples):
+    """Old-vs-old differences between medians of GATE_ROUNDS, sampled as compare() samples them."""
+    indices = range(len(samples))
+    medians = {triple: sorted(samples[index] for index in triple)[GATE_ROUNDS // 2]
+               for triple in itertools.combinations(indices, GATE_ROUNDS)}
+    return [medians[second] - medians[first]
+            for first in medians for second in medians if not set(first) & set(second)]
+
+
+def allowance(samples):
+    """max(one page, ceil(3 x sigma), largest difference) over median_differences(samples), in bytes.
+
+    Every ordered pair appears in both orders, so the differences have mean zero and sigma is
+    their root mean square. The page floor is the counters' resolution and never exceeds one page.
+    """
+    differences = median_differences(samples)
+    target = BAND_SIGMAS ** 2 * sum(value * value for value in differences)
+    sigmas = math.isqrt(target // len(differences))
+    while sigmas * sigmas * len(differences) < target:
+        sigmas += 1
+    return max(PAGE_SIZE, sigmas, max(differences))
+
+
+def band_samples(workloads, rounds):
+    result = {}
+    for workload in workloads:
+        result[workload["id"]] = {}
+        for metric in BANDED_METRICS:
+            values = [row[workload["id"]][metric] for row in rounds]
+            if any(value != value.to_integral_value() for value in values):
+                raise ValueError(f"{workload['id']} {metric}: byte counters must be integers")
+            result[workload["id"]][metric] = [int(value) for value in values]
+    return result
+
+
+def load_band(path, old, checksum, required):
+    """Fail closed unless the band is raw old-vs-old evidence for this build, corpus, host and month.
+
+    Allowances are recomputed from the recorded samples; the file carries no allowance to trust.
+    """
+    if not path:
+        raise ValueError("CODEC_NOISE_BAND is unset; calibrate with bench/codec-gate.sh --calibrate")
+    band = loads(Path(path).read_text())
+    expected = {"schema_version": BAND_SCHEMA_VERSION, "rule": BAND_RULE, "unit": "B",
+                "metrics": list(BANDED_METRICS), "sigma_multiplier": BAND_SIGMAS, "page_size": PAGE_SIZE,
+                "rounds": CALIBRATION_ROUNDS, "discarded_warmup_rounds": WARMUP_ROUNDS,
+                "revision": old["revision"], "source_checksum": old["source_checksum"],
+                "executable_sha256": old["executable_sha256"], "manifest_sha256": checksum,
+                "hostname": platform.node(), "kernel": platform.release(),
+                "affinity": sorted(os.sched_getaffinity(0))}
+    fields = {*expected, "created_utc", "load_before", "load_after", "samples"}
+    if not isinstance(band, dict) or set(band) != fields:
+        raise ValueError(f"noise band fields must be exactly {sorted(fields)}")
+    for field, value in expected.items():
+        if type(band[field]) is not type(value) or band[field] != value:
+            raise ValueError(f"noise band {field} is {band[field]!r}, expected {value!r}")
+    if not all(isinstance(band[field], str) for field in ("created_utc", "load_before", "load_after")):
+        raise ValueError("noise band created_utc and load fields must be strings")
+    created = datetime.datetime.fromisoformat(band["created_utc"])
+    if created.tzinfo is None:
+        raise ValueError("noise band created_utc needs a UTC offset")
+    age = datetime.datetime.now(datetime.timezone.utc) - created
+    if not datetime.timedelta(0) <= age <= datetime.timedelta(days=BAND_MAX_AGE_DAYS):
+        raise ValueError(f"noise band is stale: created {band['created_utc']}, limit {BAND_MAX_AGE_DAYS} days")
+    samples = band["samples"]
+    if not isinstance(samples, dict) or set(samples) != required:
+        keys = set(samples) if isinstance(samples, dict) else set()
+        raise ValueError(f"noise band samples: {len(required - keys)} missing and "
+                         f"{len(keys - required)} extra workloads")
+    allowances = {}
+    for key, metrics in samples.items():
+        if not isinstance(metrics, dict) or set(metrics) != set(BANDED_METRICS):
+            raise ValueError(f"noise band samples for {key} must cover exactly {list(BANDED_METRICS)}")
+        allowances[key] = {}
+        for metric, values in metrics.items():
+            if (not isinstance(values, list) or len(values) != CALIBRATION_ROUNDS - WARMUP_ROUNDS
+                    or any(type(value) is not int or value < 0 for value in values)):
+                raise ValueError(f"noise band samples for {key} {metric} must be "
+                                 f"{CALIBRATION_ROUNDS - WARMUP_ROUNDS} nonnegative integer bytes")
+            allowances[key][metric] = allowance(values)
+    return band, allowances
+
+
+def prepare(out):
     out = Path(out).resolve()
     if out == ROOT or ROOT in out.parents:
         raise ValueError("OUT must be outside the repository")
     out.mkdir(parents=True, exist_ok=True)
     if any(out.iterdir()):
         raise ValueError("OUT must be empty; raw evidence is never overwritten")
+    return out
+
+
+def matrix(out, summary):
+    data = manifest()
+    path = out / "workloads.json"
+    save(path, data)
+    checksum = digest(path)
+    required = {row["id"] for row in data["workloads"]}
+    if len(required) != len(data["workloads"]) or not required:
+        raise ValueError("empty or duplicate required matrix")
+    summary.update({"manifest_sha256": checksum, "workload_count": len(required),
+                    "driver_sha256": digest(Path(__file__)),
+                    "fixture_pins_sha256": digest(HERE / "fixtures.json")})
+    return data, path, checksum, required
+
+
+def measure(executable, description, label, round_number, path, checksum, required, out, storage, summary):
+    raw = out / f"{label}-{round_number}.jsonl"
+    state = {"harness": label, "round": round_number, "raw": raw.name, "before": snapshot(storage)}
+    summary["rounds"].append(state)
+    with raw.open("w") as stdout, (out / f"{label}-{round_number}.stderr").open("w") as stderr:
+        process = subprocess.run([
+            str(executable), "--run", str(path), "--round", str(round_number)],
+            stdout=stdout, stderr=stderr, timeout=600, check=False,
+            env={**os.environ, "CODEC_EVIDENCE_DIR": str(out / f"{label}-{round_number}-evidence")})
+    state.update({"exit_code": process.returncode, "after": snapshot(storage), "raw_sha256": digest(raw)})
+    if process.returncode:
+        raise ValueError(f"{label} round {round_number}: harness exited {process.returncode}")
+    if digest(path) != checksum:
+        raise ValueError("harness modified immutable workload manifest")
+    if digest(executable) != description["executable_sha256"]:
+        raise ValueError("harness executable changed during run")
+    return records(raw, required, checksum, round_number)
+
+
+def run(old, new, out):
+    out = prepare(out)
     summary = {"schema_version": 1, "status": "error", "rounds": []}
     try:
         executables = {"old": Path(old).resolve(strict=True), "new": Path(new).resolve(strict=True)}
@@ -265,42 +418,27 @@ def run(old, new, out):
             raise ValueError("old/new revision and source checksum are identical")
         if descriptions["old"]["revision"] != BASELINE_REVISION:
             raise ValueError(f"old source must be pinned to {BASELINE_REVISION}")
+        if descriptions["new"]["revision"] == BASELINE_REVISION:
+            raise ValueError("new source must not be the baseline revision; that compares old code with itself")
         if descriptions["old"]["config"] != descriptions["new"]["config"]:
             raise ValueError("old/new configuration differs")
-        data = manifest()
-        path = out / "workloads.json"
-        save(path, data)
-        checksum = digest(path)
-        required = {row["id"] for row in data["workloads"]}
-        if len(required) != len(data["workloads"]) or not required:
-            raise ValueError("empty or duplicate required matrix")
-        summary.update({"manifest_sha256": checksum, "workload_count": len(required),
-                        "driver_sha256": digest(Path(__file__)),
-                        "fixture_pins_sha256": digest(HERE / "fixtures.json")})
+        data, path, checksum, required = matrix(out, summary)
+        band_path = os.environ.get("CODEC_NOISE_BAND")
+        band, allowances = load_band(band_path, descriptions["old"], checksum, required)
+        summary["noise_band"] = {"path": str(Path(band_path).resolve()), "sha256": digest(Path(band_path)),
+                                 "created_utc": band["created_utc"]}
         storage = [out, *(Path(value["storage_directory"]) for value in descriptions.values())]
         summary["host"] = snapshot(storage)
         rounds = {"old": [], "new": []}
-        for round_number in (1, 2, 3):
+        for round_number in range(1, WARMUP_ROUNDS + GATE_ROUNDS + 1):
             for label in ("old", "new"):
-                raw = out / f"{label}-{round_number}.jsonl"
-                state = {"harness": label, "round": round_number, "raw": raw.name,
-                         "before": snapshot(storage)}
-                summary["rounds"].append(state)
-                with raw.open("w") as stdout, (out / f"{label}-{round_number}.stderr").open("w") as stderr:
-                    process = subprocess.run([
-                        str(executables[label]), "--run", str(path), "--round", str(round_number)],
-                        stdout=stdout, stderr=stderr, timeout=600, check=False,
-                        env={**os.environ, "CODEC_EVIDENCE_DIR": str(out / f"{label}-{round_number}-evidence")})
-                state.update({"exit_code": process.returncode, "after": snapshot(storage),
-                              "raw_sha256": digest(raw)})
-                if process.returncode:
-                    raise ValueError(f"{label} round {round_number}: harness exited {process.returncode}")
-                if digest(path) != checksum:
-                    raise ValueError("harness modified immutable workload manifest")
-                if digest(executables[label]) != descriptions[label]["executable_sha256"]:
-                    raise ValueError("harness executable changed during run")
-                rounds[label].append(records(raw, required, checksum, round_number))
-        comparisons = compare(data["workloads"], rounds)
+                values = measure(executables[label], descriptions[label], label, round_number,
+                                 path, checksum, required, out, storage, summary)
+                if round_number > WARMUP_ROUNDS:
+                    rounds[label].append(values)
+                else:
+                    summary["rounds"][-1]["discarded_warmup"] = True
+        comparisons = compare(data["workloads"], rounds, allowances)
         summary["comparisons"] = comparisons
         summary["failed_metrics"] = sum(not row["pass"] for row in comparisons)
         summary["status"] = "fail" if summary["failed_metrics"] else "pass"
@@ -313,16 +451,58 @@ def run(old, new, out):
         print(f"codec gate: {summary['status']}; {out / 'summary.json'}")
 
 
+def calibrate(old, out):
+    """Measure the baseline against itself and write OUT/noise-band.json."""
+    out = prepare(out)
+    summary = {"schema_version": 1, "status": "error", "rounds": [], "mode": "calibrate"}
+    try:
+        executable = Path(old).resolve(strict=True)
+        description = describe(executable, out, "old")
+        summary["harnesses"] = {"old": description}
+        if description["revision"] != BASELINE_REVISION:
+            raise ValueError(f"old source must be pinned to {BASELINE_REVISION}")
+        data, path, checksum, required = matrix(out, summary)
+        storage = [out, Path(description["storage_directory"])]
+        summary["host"] = snapshot(storage)
+        rounds = [measure(executable, description, "old", round_number, path, checksum, required,
+                          out, storage, summary) for round_number in range(1, CALIBRATION_ROUNDS + 1)]
+        for state in summary["rounds"][:WARMUP_ROUNDS]:
+            state["discarded_warmup"] = True
+        samples = band_samples(data["workloads"], rounds[WARMUP_ROUNDS:])
+        band = {"schema_version": BAND_SCHEMA_VERSION, "rule": BAND_RULE, "unit": "B",
+                "metrics": list(BANDED_METRICS), "sigma_multiplier": BAND_SIGMAS, "page_size": PAGE_SIZE,
+                "created_utc": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+                "revision": description["revision"], "source_checksum": description["source_checksum"],
+                "executable_sha256": description["executable_sha256"], "manifest_sha256": checksum,
+                "hostname": platform.node(), "kernel": platform.release(),
+                "load_before": summary["rounds"][0]["before"]["load"],
+                "load_after": summary["rounds"][-1]["after"]["load"],
+                "affinity": summary["host"]["affinity"], "rounds": CALIBRATION_ROUNDS,
+                "discarded_warmup_rounds": WARMUP_ROUNDS, "samples": samples}
+        save(out / "noise-band.json", band)
+        summary["allowances"] = {key: {metric: allowance(values) for metric, values in metrics.items()}
+                                 for key, metrics in samples.items()}
+        summary["status"] = "calibrated"
+        return 0
+    except (OSError, ValueError, TypeError, KeyError, subprocess.SubprocessError) as error:
+        summary["error"] = str(error)
+        return 2
+    finally:
+        save(out / "summary.json", summary)
+        print(f"codec gate: {summary['status']}; {out / 'summary.json'}")
+
+
 def main():
-    if len(sys.argv) != 4:
-        print("usage: bench/codec-gate.sh OLD_CODEC NEW_CODEC OUT", file=sys.stderr)
+    calibrating = sys.argv[1:2] == ["--calibrate"]
+    if len(sys.argv) != 4 or (sys.argv[1].startswith("--") and not calibrating):
+        print("usage: bench/codec-gate.sh OLD_CODEC NEW_CODEC OUT\n"
+              "       bench/codec-gate.sh --calibrate OLD_CODEC OUT", file=sys.stderr)
         return 2
     try:
-        return run(*sys.argv[1:])
+        return calibrate(*sys.argv[2:]) if calibrating else run(*sys.argv[1:])
     except (OSError, ValueError) as error:
         print(f"codec gate: {error}", file=sys.stderr)
         return 2
-
 
 if __name__ == "__main__":
     sys.exit(main())

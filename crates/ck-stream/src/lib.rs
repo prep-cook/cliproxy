@@ -10,7 +10,7 @@ mod position;
 mod publication;
 mod request;
 
-pub use cache::{Clock, ManualClock, MonotonicClock, Store};
+pub use cache::{Clock, MaintenanceFailures, ManualClock, MonotonicClock, Store, StoreStats};
 pub use grammar::{ByteSpan, EventView};
 pub use limits::{Config, Limits, MAX_POOL_BYTES, MAX_STREAM_FRAMES};
 pub use position::{Position, Record};
@@ -27,16 +27,28 @@ pub enum Terminal {
     UpstreamError,
     StorageExhausted,
     Gone,
+    /// The writer was dropped without a terminal, e.g. its producer task aborted or panicked.
+    ProducerLost,
 }
 
 impl Terminal {
+    /// Code of the `error` event for codes INTERNAL-STREAM.md §3.3 registers. An upstream
+    /// error carries the producer's own sanitized code, so it has none here.
     pub fn error_code(self) -> Option<&'static str> {
         match self {
-            Self::Done => None,
-            Self::Cancelled | Self::Shutdown => Some("stream.cancelled"),
-            Self::UpstreamError => Some("stream.upstream_error"),
             Self::StorageExhausted => Some("stream.storage_exhausted"),
             Self::Gone => Some("stream.gone"),
+            Self::ProducerLost => Some("stream.producer_lost"),
+            Self::Done | Self::Cancelled | Self::Shutdown | Self::UpstreamError => None,
+        }
+    }
+
+    /// `reason` of the `cancelled` event (§3.3); cancellation is not an error code.
+    pub fn cancel_reason(self) -> Option<&'static str> {
+        match self {
+            Self::Cancelled => Some("client_cancel"),
+            Self::Shutdown => Some("shutdown"),
+            Self::Done | Self::UpstreamError | Self::StorageExhausted | Self::Gone | Self::ProducerLost => None,
         }
     }
 }

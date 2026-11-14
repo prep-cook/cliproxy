@@ -3,6 +3,7 @@
 
 import argparse
 import base64
+import errno
 import hashlib
 import http.client
 import http.server
@@ -27,6 +28,18 @@ SIGNATURE = "opaque+/signature==do-not-change"
 ARGUMENTS = '{"path":"src/測試.rs","line":17}'
 MEDIA = bytes(range(256)) * 32768  # 8 MiB, including invalid textual UTF-8.
 TIMEOUT = 12
+# §6.4: one exchange's request, response, scratch and replay frames share
+# max_frames = 5,368; the allocation of the 5,369th frame fails (§9.1 Bounds).
+STREAM_MAX_FRAMES = 5368
+BULK_CONTENT = 40966  # f"{i:05d}:" plus 40,960 bytes per bulk record
+DIAGNOSTIC = "diagnostic, not acceptance"
+# §9.2 flow-limit metrics and how scenario values combine. The gateway exposes
+# no internal stream counters, so the second group stays missing until it does.
+FLOW_METRICS = {"consumer_lag_bytes": max, "blocked_read_s": max, "resumes": sum, "stream_gone": sum,
+                "cancelled_stream_cleanup_s": max}
+GATEWAY_ONLY_METRICS = ("cache_bytes", "time_since_last_read_s", "evictions", "expiries",
+                        "allocation_failures", "outstanding_leases")
+UNVERIFIED = "UNVERIFIED: supply release build revision/compiler/profile/features/flags"
 
 _ws_spec = importlib.util.spec_from_file_location("flow_realtime", Path(__file__).with_name("realtime.py"))
 realtime = importlib.util.module_from_spec(_ws_spec)
@@ -147,6 +160,7 @@ class Upstream(http.server.ThreadingHTTPServer):
         self.requests = []
         self.progress = []
         self.error = None
+        self.errno = None
         self.sent = 0
         self.sessions = 0
         self.received = []
@@ -261,8 +275,10 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self.wfile.flush()
         except (OSError, AssertionError, ValueError) as exc:
             up.error = str(exc)
+            up.errno = getattr(exc, "errno", None)
         finally:
-            up.progress.append({"time": time.monotonic(), "kind": "end", "bytes": up.sent, "error": up.error})
+            up.progress.append({"time": time.monotonic(), "kind": "end", "bytes": up.sent, "error": up.error,
+                                "errno": up.errno})
             if up.scenario != "sideband-resume" or up.error:
                 up.done.set()
 
@@ -399,6 +415,14 @@ class RecordedResponse:
 
 
 class Gateway:
+    resumes = gone = 0  # resume attaches and 410 Gone responses seen by request()
+    diagnostic = False
+    # Frames charged to the stream-limit exchange when its storage error fired. No
+    # gateway interface reports them yet (open owner question with the §9.2 counters);
+    # client bytes cannot locate the error to one frame because the stored canonical
+    # record size (§3.1 framing plus x_ck identity) is implementation-defined.
+    charged_frames = None
+
     def __init__(self, binary, out, upstream):
         self.request_number = 0
         self.out, self.up = out, upstream
@@ -496,6 +520,8 @@ api-keys:
         except (OSError, http.client.HTTPException):
             conn.close()
             raise
+        self.resumes += path.startswith("/v1/streams")
+        self.gone += response.status == 410
         return conn, RecordedResponse(response, self.out / f"response-{self.request_number}.body")
 
     def stop(self):
@@ -667,6 +693,67 @@ def check_resume(gateway, response, conn, live):
     return {"resumed_events": len(tail), "cursor_end": end, "upstream_requests": len(up.requests)}
 
 
+def check_stream_limit(gateway, response):
+    """The storage error must arrive at the per-stream limit and cancel the upstream."""
+    up = gateway.up
+    exhausted, successful, delivered, error_time = False, False, 0, None
+    content, length = hashlib.sha256(), 0
+    for record in records(response):
+        delivered += len(record)
+        value = payload(record)
+        if value and isinstance(value.get("error"), dict):
+            require(value["error"].get("code") == "stream.storage_exhausted", "wrong per-stream limit error")
+            exhausted, error_time = True, time.monotonic()
+        elif value and value.get("type") == "error":
+            require(value.get("code") == "stream.storage_exhausted", "wrong stream limit error")
+            exhausted, error_time = True, time.monotonic()
+        else:
+            require(not exhausted, "output continued after exhaustion error")
+            for choice in (value or {}).get("choices", []):
+                piece = (choice.get("delta", {}).get("content") or "").encode()
+                content.update(piece)
+                length += len(piece)
+        successful |= b"data: [DONE]" in record
+    require(exhausted and not successful, "stream exceeded 256 MiB without a visible storage error")
+    count, partial = divmod(length, BULK_CONTENT)
+    expected = hashlib.sha256()
+    for i in range(count):
+        expected.update(f"{i:05d}:".encode() + b"x" * 40960)
+    require(not partial and content.digest() == expected.digest(),
+            "content before the storage error is not a gap-free prefix of whole records")
+    require(up.done.wait(3), "upstream still running 3 s after the storage error")
+    total = sum(len(record) for record in bulk_records(7000))
+    require(up.errno is not None or up.sent < total,
+            f"upstream completed without cancellation: sent all {total} bytes after the storage error")
+    require(up.errno in (errno.EPIPE, errno.ECONNRESET),
+            f"upstream ended without a cancellation reset: error {up.error!r}, sent {up.sent} of {total} bytes")
+    require(len(up.requests) == 1, "storage exhaustion retried another upstream")
+    gateway.await_ready()
+    end = next(p["time"] for p in reversed(up.progress) if p["kind"] == "end")
+    result = {"delivered_bytes": delivered, "content_records": count, "upstream_bytes": up.sent,
+              "upstream_total_bytes": total, "terminal": "stream.storage_exhausted",
+              "charged_frames": gateway.charged_frames,
+              "flow": {"cancelled_stream_cleanup_s": max(0.0, end - error_time)}}
+    position = limit_position_failure(gateway.charged_frames)
+    if position and gateway.diagnostic:
+        result["position"] = f"{DIAGNOSTIC}: {position}"
+    else:
+        require(not position, position)
+    return result
+
+
+def limit_position_failure(charged_frames):
+    """The error must fire exactly when the exchange holds all 5,368 frames (§6.4, §9.1 Bounds)."""
+    if charged_frames is None:
+        return ("storage error position unverified: the gateway reports no frames charged to the "
+                "failed exchange, so the 5,369th-frame failure cannot be checked to one frame")
+    if type(charged_frames) is not int:
+        return f"frames charged must be an integer counter, not {charged_frames!r}"
+    if charged_frames != STREAM_MAX_FRAMES:
+        return f"storage error with {charged_frames} frames charged, not {STREAM_MAX_FRAMES}"
+    return None
+
+
 def run_scenario(gateway, name):
     up = gateway.up
     if name in ("realtime-resume", "sideband-resume"):
@@ -716,36 +803,22 @@ def run_scenario(gateway, name):
                       ("/proc/sys/net/ipv4/tcp_wmem", "/proc/sys/net/ipv4/tcp_rmem")]
             require(up.sent - read_bytes > sum(limits) * 2, "workload does not exceed socket buffering; stall proof invalid")
             require(up.sent > sent_before, "upstream did not progress during client stall")
+            writes = [p["time"] for p in up.progress if p["kind"] == "write" and t0 <= p["time"]]
             conn.sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 4 * 1024 * 1024)
             check_bulk(itertools.chain([first], records(response)), 2048)
             return {"stall_s": elapsed, "upstream_bytes_during_stall": up.sent - sent_before,
-                    "client_bytes_before_stall": read_bytes, "socket_buffer_bound_bytes": sum(limits) * 2}
+                    "client_bytes_before_stall": read_bytes, "socket_buffer_bound_bytes": sum(limits) * 2,
+                    "flow": {"consumer_lag_bytes": up.sent - read_bytes,
+                             "blocked_read_s": max((b - a for a, b in zip(writes, writes[1:])), default=0.0)}}
         if name == "stream-limit":
-            exhausted, successful, delivered = False, False, 0
-            for record in records(response):
-                delivered += len(record)
-                value = payload(record)
-                if value and isinstance(value.get("error"), dict):
-                    require(value["error"].get("code") == "stream.storage_exhausted",
-                            "wrong per-stream limit error")
-                    exhausted = True
-                elif value and value.get("type") == "error":
-                    require(value.get("code") == "stream.storage_exhausted", "wrong stream limit error")
-                    exhausted = True
-                else:
-                    require(not exhausted, "output continued after exhaustion error")
-                successful |= b"data: [DONE]" in record
-            require(exhausted and not successful, "stream exceeded 256 MiB without a visible storage error")
-            require(up.done.wait(3), "exhaustion did not cancel upstream collection")
-            require(len(up.requests) == 1, "storage exhaustion retried another upstream")
-            gateway.await_ready()
-            return {"delivered_bytes": delivered, "upstream_bytes": up.sent,
-                    "terminal": "stream.storage_exhausted"}
+            return check_stream_limit(gateway, response)
         if name in ("long-media", "media-resume"):
             require(response.getheader("Content-Type", "").startswith("audio/mpeg"), "media MIME changed")
-            prefix = response.read(65536)
+            first = response.read(1)
+            require(first, "media response ended before its first byte")
             first_write = next(p["time"] for p in up.progress if p["kind"] == "write")
             first_delivery_s = time.monotonic() - first_write
+            prefix = first + response.read(65535)
             if name == "media-resume":
                 stream_id = response.getheader("X-Ck-Stream-Id")
                 require(stream_id, "missing X-Ck-Stream-Id for byte resume")
@@ -790,6 +863,8 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("binary", type=Path)
     parser.add_argument("out", type=Path)
+    parser.add_argument("--diagnostic", action="store_true",
+                        help=f"{DIAGNOSTIC}: report unverified provenance, metrics and positions without passing")
     args = parser.parse_args()
     binary, out = args.binary.resolve(strict=True), args.out.resolve()
     require(os.access(binary, os.X_OK), "gateway binary is not executable")
@@ -799,8 +874,8 @@ def main():
          "page_size": os.sysconf("SC_PAGE_SIZE"), "affinity": sorted(os.sched_getaffinity(0)),
          "load": os.getloadavg(), "filesystem": subprocess.check_output(["stat", "-f", "-c", "%T", str(out)], text=True).strip(),
          "version": subprocess.check_output([str(binary), "--version"], text=True).strip(),
-         "build_provenance": os.environ.get("FLOW_BUILD_PROVENANCE", "UNVERIFIED: supply release build revision/compiler/profile/features/flags"),
-         "scenarios": SCENARIOS, "timeout_s": TIMEOUT})
+         "build_provenance": os.environ.get("FLOW_BUILD_PROVENANCE") or UNVERIFIED,
+         "mode": DIAGNOSTIC if args.diagnostic else "acceptance", "scenarios": SCENARIOS, "timeout_s": TIMEOUT})
     results = []
     for name in SCENARIOS:
         directory = out / name
@@ -813,8 +888,10 @@ def main():
         row = {"scenario": name, "status": "fail"}
         try:
             gateway = Gateway(binary, directory, up)
+            gateway.diagnostic = args.diagnostic
             gateway.await_ready()
             row.update(run_scenario(gateway, name))
+            row.setdefault("flow", {}).update(resumes=gateway.resumes, stream_gone=gateway.gone)
             row["status"] = "pass"
         except (AssertionError, OSError, ValueError, KeyError, IndexError, TypeError,
                 StopIteration, http.client.HTTPException) as exc:
@@ -840,8 +917,33 @@ def main():
         print(json.dumps(row), flush=True)
         with (out / "results.jsonl").open("a") as raw:
             raw.write(json.dumps(row) + "\n")
-    dump(out / "summary.json", {"pass": all(r["status"] == "pass" for r in results), "results": results})
-    return 0 if all(r["status"] == "pass" for r in results) else 1
+    summary = summarize(results, os.environ.get("FLOW_BUILD_PROVENANCE"), args.diagnostic)
+    dump(out / "summary.json", {**summary, "results": results})
+    for failure in summary["failures"] + summary.get("unverified", []):
+        print(f"flow-gate: {failure}", file=sys.stderr)
+    print(f"flow-gate: {summary['mode']}: {'pass' if summary['pass'] else 'fail'}", file=sys.stderr)
+    return 1 if summary["failures"] else 0
+
+
+def summarize(results, provenance, diagnostic):
+    """Acceptance fails closed on any failed scenario, missing §9.2 metric or unverified provenance.
+
+    Diagnostic mode lists the acceptance gaps as unverified and never reports a pass;
+    its exit status covers only the scenarios' own checks.
+    """
+    flow = {name: None for name in (*FLOW_METRICS, *GATEWAY_ONLY_METRICS)}
+    for name, combine in FLOW_METRICS.items():
+        values = [r["flow"][name] for r in results if r["status"] == "pass" and name in r.get("flow", {})]
+        flow[name] = combine(values) if values else None
+    failures = [f"{r['scenario']}: {r.get('error', 'failed')}" for r in results if r["status"] != "pass"]
+    gaps = [f"missing flow metric {name}" for name, value in flow.items() if value is None]
+    if not provenance or provenance.startswith("UNVERIFIED"):
+        gaps.append("FLOW_BUILD_PROVENANCE is unset; acceptance needs verified build provenance")
+    if diagnostic:
+        gaps += [f"{r['scenario']}: {r['position']}" for r in results if "position" in r]
+        return {"mode": DIAGNOSTIC, "pass": False, "failures": failures, "unverified": gaps, "flow_metrics": flow}
+    failures += gaps
+    return {"mode": "acceptance", "pass": not failures, "failures": failures, "flow_metrics": flow}
 
 
 if __name__ == "__main__":

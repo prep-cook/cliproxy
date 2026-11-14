@@ -18,6 +18,9 @@ import uuid
 
 
 RUNTIME = "/run/cooker-runtime"
+# Logged by cooker's shutdown_signal() when the stop signal arrives (crates/cooker/src/main.rs).
+SIGNAL_PREFIX = "shutdown signal received: "
+SIGNAL_LINE = SIGNAL_PREFIX + "SIGTERM"
 TMPFS = f"{RUNTIME}:rw,noexec,nosuid,size=512m,mode=0700,uid=10001,gid=10001"
 POOL_BYTES = 6_400_000
 POOL_FRAMES = POOL_BYTES // 50_000
@@ -442,8 +445,14 @@ class Gate:
         except (GateError, KeyError, ValueError, IndexError) as exc:
             row["errors"].append(str(exc))
         finally:
+            stopped = False
+            prior_signals = 0
             try:
-                if self.state(container)["Running"]:
+                state = self.state(container)
+                stopped = state["Running"]
+                if stopped:
+                    before = self.docker.run("logs", container, check=False)
+                    prior_signals = (before.stdout + before.stderr).count(SIGNAL_PREFIX)
                     self.docker.run("container", "stop", "--time", "10", container, timeout=15)
                     state = self.state(container)
                     row["shutdown_state"] = state
@@ -451,11 +460,31 @@ class Gate:
                         not state["Running"] and state["ExitCode"] == 0 and not state.get("OOMKilled"))
                     if state["Running"] or state["ExitCode"] != 0 or state.get("OOMKilled"):
                         row["errors"].append("shutdown was not clean (exit 0 without OOM/forced kill required)")
+                elif not negative:
+                    # A server must still be running when the gate stops it; exiting on its own is a crash.
+                    row["shutdown_state"] = state
+                    row["checks"]["clean_shutdown"] = False
+                    row["errors"].append(f"server exited before shutdown, ExitCode {state['ExitCode']}")
             except (GateError, KeyError, ValueError, IndexError) as exc:
                 row["errors"].append(f"shutdown: {exc}")
             try:
                 logs = self.docker.run("logs", container, check=False)
                 (self.out / f"{name}.log").write_text(logs.stdout + logs.stderr)
+                # Graceful SIGTERM shutdown and a server that exits 0 on its own between
+                # the last inspect and the stop look alike; only the server's own log line
+                # shows that the stop signal arrived before the exit. A line logged before
+                # the stop belongs to another signal that was already draining the server,
+                # so the gate requires none before the stop and exactly one SIGTERM line after.
+                text = logs.stdout + logs.stderr
+                if stopped and row["checks"].get("clean_shutdown") and prior_signals:
+                    row["checks"]["clean_shutdown"] = False
+                    row["errors"].append(f"server logged {SIGNAL_PREFIX.strip()!r} before the gate's stop; "
+                                         "it was already shutting down")
+                elif stopped and row["checks"].get("clean_shutdown") and not (
+                        text.count(SIGNAL_PREFIX) == text.count(SIGNAL_LINE) == 1):
+                    row["checks"]["clean_shutdown"] = False
+                    row["errors"].append(f"server exited without logging {SIGNAL_LINE!r} exactly once; "
+                                         "it did not stop on the gate's SIGTERM")
             except GateError as exc:
                 row["errors"].append(f"logs: {exc}")
             row["seconds"] = time.monotonic() - started

@@ -294,15 +294,18 @@ fn worker_threads(config: Option<&Config>) -> usize {
 }
 
 /// Waits for Ctrl+C or SIGTERM, Go's `signal.NotifyContext(SIGINT, SIGTERM)`.
+/// The log line is a stable contract: the container gate requires it to tell a
+/// stop from a server that exited on its own.
 async fn shutdown_signal() {
     #[cfg(unix)]
     {
         let mut term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
             .expect("SIGTERM handler installs");
-        tokio::select! {
-            _ = tokio::signal::ctrl_c() => {}
-            _ = term.recv() => {}
-        }
+        let name = tokio::select! {
+            _ = tokio::signal::ctrl_c() => "SIGINT",
+            _ = term.recv() => "SIGTERM",
+        };
+        tracing::info!("shutdown signal received: {name}");
     }
     #[cfg(not(unix))]
     let _ = tokio::signal::ctrl_c().await;

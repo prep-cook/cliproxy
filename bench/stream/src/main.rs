@@ -1,7 +1,13 @@
+mod backend;
 mod heap;
+mod payload;
+#[cfg(test)]
+mod tests;
 
 use anyhow::{Context, Result, bail, ensure};
-use ck_stream::{Config, FRAME_BYTES, ManualClock, Read, Store, Terminal};
+use backend::Backend;
+use ck_stream::{FRAME_BYTES, Read, Terminal};
+use payload::{Check, pattern};
 use serde_json::{Value, json};
 use std::{
     fs,
@@ -16,149 +22,9 @@ use std::{
 const MIB: usize = 1024 * 1024;
 const WORKERS: usize = 8;
 
-enum Backend {
-    Pool(Store, Arc<ManualClock>),
-    Heap(heap::Store),
-}
-enum Writer {
-    Pool(ck_stream::Writer),
-    Heap(heap::Writer),
-}
-enum Reader {
-    Pool(ck_stream::Reader),
-    Heap(heap::Reader),
-}
-enum Lease {
-    Pool(ck_stream::Lease),
-    Heap(heap::Lease),
-}
-
-impl Backend {
-    fn open(kind: &str, directory: &Path, reserve_bytes: Option<usize>) -> Result<Self> {
-        match kind {
-            "pool" => {
-                let clock = Arc::new(ManualClock::default());
-                let mut config = Config::new(directory.to_path_buf());
-                config.workers = WORKERS;
-                config.startup_reserve_bytes = reserve_bytes;
-                Ok(Self::Pool(Store::with_clock(config, clock.clone())?, clock))
-            }
-            "heap" => Ok(Self::Heap(heap::Store::default())),
-            _ => bail!("unknown backend {kind}"),
-        }
-    }
-    fn create(&self) -> Result<Writer> {
-        Ok(match self {
-            Self::Pool(store, _) => Writer::Pool(store.create()?),
-            Self::Heap(store) => Writer::Heap(store.create()),
-        })
-    }
-    fn reader(&self, id: u64) -> Result<Reader> {
-        Ok(match self {
-            Self::Pool(store, _) => Reader::Pool(store.reader(id, 0)?),
-            Self::Heap(store) => Reader::Heap(store.reader(id)?),
-        })
-    }
-    fn expire(&self) -> Result<()> {
-        match self {
-            Self::Pool(store, clock) => {
-                clock.advance(Duration::from_secs(3601));
-                store.tick()?;
-            }
-            Self::Heap(store) => store.expire(),
-        }
-        Ok(())
-    }
-    fn tick(&self) -> Result<()> {
-        if let Self::Pool(store, _) = self {
-            store.tick()?;
-            if let Some(error) = store.take_reclaim_error() {
-                return Err(error.into());
-            }
-        }
-        Ok(())
-    }
-    fn counters(&self) -> Value {
-        match self {
-            Self::Pool(store, _) => {
-                json!({"used_frames":store.used_frames(),"backed_frames":store.backed_frames(),"pool_frames":store.limits().pool_frames,"startup_reserve_frames":store.limits().startup_reserve_frames,"max_frames":store.limits().max_frames,"max_metadata_bytes":store.limits().max_metadata_bytes})
-            }
-            Self::Heap(_) => json!({}),
-        }
-    }
-}
-impl Writer {
-    fn id(&self) -> u64 {
-        match self {
-            Self::Pool(w) => w.id(),
-            Self::Heap(w) => w.id(),
-        }
-    }
-    fn append(&mut self, bytes: &[u8], aligned: bool) -> Result<()> {
-        match self {
-            Self::Pool(w) if aligned => {
-                let mut reservation = w.begin_record(bytes.len(), true, 0, 0)?;
-                reservation.write(bytes)?;
-                reservation.commit()?;
-            }
-            Self::Pool(w) => {
-                w.append(bytes)?;
-            }
-            Self::Heap(w) => w.append(bytes, aligned)?,
-        }
-        Ok(())
-    }
-    fn finish(&mut self) {
-        match self {
-            Self::Pool(w) => w.finish(Terminal::Done),
-            Self::Heap(w) => w.finish(),
-        }
-    }
-}
-impl Reader {
-    fn try_next(&mut self) -> Result<Poll<Option<Lease>>> {
-        match self {
-            Self::Heap(r) => Ok(r.try_next().map(|v| v.map(Lease::Heap))),
-            Self::Pool(r) => match r.try_next() {
-                Poll::Pending => Ok(Poll::Pending),
-                Poll::Ready(Some(Read::Record(lease))) => Ok(Poll::Ready(Some(Lease::Pool(lease)))),
-                Poll::Ready(Some(Read::Terminal(Terminal::Done))) => Ok(Poll::Ready(None)),
-                Poll::Ready(Some(Read::Terminal(other))) => bail!("reader terminal {other:?}"),
-                Poll::Ready(None) => Ok(Poll::Ready(None)),
-            },
-        }
-    }
-    async fn next(&mut self) -> Result<Option<Lease>> {
-        match self {
-            Self::Heap(r) => Ok(r.next().await.map(Lease::Heap)),
-            Self::Pool(r) => match r.next().await {
-                Some(Read::Record(lease)) => Ok(Some(Lease::Pool(lease))),
-                Some(Read::Terminal(Terminal::Done)) | None => Ok(None),
-                Some(Read::Terminal(other)) => bail!("reader terminal {other:?}"),
-            },
-        }
-    }
-}
-impl Lease {
-    fn visit(&self, visitor: impl FnMut(&[u8])) -> Result<()> {
-        match self {
-            Self::Pool(lease) => lease.visit(visitor)?,
-            Self::Heap(lease) => lease.visit(visitor),
-        }
-        Ok(())
-    }
-    fn acknowledge(self) {
-        if let Self::Pool(lease) = self {
-            lease.acknowledge();
-        }
-    }
-}
 fn percentile(values: &mut [u64], p: f64) -> u64 {
     values.sort_unstable();
     values[((values.len() - 1) as f64 * p).round() as usize]
-}
-fn checksum(bytes: &[u8]) -> u64 {
-    bytes.iter().map(|&x| u64::from(x)).sum()
 }
 
 async fn stream(
@@ -171,31 +37,27 @@ async fn stream(
     let start = Instant::now();
     let mut writer = backend.create().context("create stream")?;
     let mut handles = Vec::new();
+    let id = writer.id();
     for _ in 0..readers {
-        let mut reader = backend.reader(writer.id())?;
+        let mut reader = backend.reader(id)?;
         handles.push(tokio::spawn(async move {
-            let mut sum = 0;
+            let mut check = Check::new(id);
             let mut first = None;
             while let Some(lease) = reader.next().await? {
                 first.get_or_insert(start.elapsed().as_nanos() as u64);
-                lease.visit(|bytes| sum += checksum(bytes))?;
+                lease.visit(|bytes| check.visit(bytes))?;
                 lease.acknowledge();
             }
-            ensure!(
-                sum == total as u64 * 85,
-                "reader checksum {sum}, expected {}",
-                total as u64 * 85
-            );
+            check.finish(total)?;
             first.context("reader observed no bytes")
         }));
     }
-    let payload = vec![85; chunk];
     let mut written = 0;
     let mut next_yield = yield_bytes;
     while written < total {
         let n = chunk.min(total - written);
         writer
-            .append(&payload[..n], chunk == 49152)
+            .append(pattern(id, written, n), chunk == 49152)
             .with_context(|| format!("append at {written}/{total} bytes; {}", backend.counters()))?;
         written += n;
         if written >= next_yield {
@@ -247,23 +109,24 @@ async fn small(backend: Arc<Backend>, tasks: usize, requests: usize) -> Result<V
                 for _ in (task..batch).step_by(tasks) {
                     let start = Instant::now();
                     let mut writer = backend.create()?;
-                    let mut reader = backend.reader(writer.id())?;
-                    for _ in 0..32 {
-                        writer.append(&[85; 64], false)?;
+                    let id = writer.id();
+                    let mut reader = backend.reader(id)?;
+                    for record in 0..32 {
+                        writer.append(pattern(id, record * 64, 64), false)?;
                     }
                     writer.finish();
-                    let mut sum = 0;
+                    let mut check = Check::new(id);
                     loop {
                         match reader.try_next()? {
                             Poll::Ready(Some(lease)) => {
-                                lease.visit(|bytes| sum += checksum(bytes))?;
+                                lease.visit(|bytes| check.visit(bytes))?;
                                 lease.acknowledge();
                             }
                             Poll::Ready(None) => break,
                             Poll::Pending => bail!("completed small stream remained pending"),
                         }
                     }
-                    ensure!(sum == 2048 * 85, "small checksum mismatch");
+                    check.finish(2048)?;
                     drop(reader);
                     drop(writer);
                     latencies.push(start.elapsed().as_nanos() as u64);
@@ -473,8 +336,9 @@ fn totalcap(backend: &Backend) -> Result<Value> {
             "unexpected cap error {error}"
         );
         terminal_error(&mut reader)?;
+        // 85,899 − 16 × 5,368 = 11: stream 17 takes exactly the remaining frames.
         ensure!(
-            if stream < 16 { count == 5368 } else { count <= 11 },
+            count == if stream < 16 { 5368 } else { 11 },
             "stream {} stopped at {count} frames",
             stream + 1
         );
@@ -542,6 +406,19 @@ async fn run(
     let backend = Arc::new(Backend::open(kind, directory, reserve_bytes).context("open backend")?);
     let open_ns = open_start.elapsed().as_nanos() as u64;
     let idle = reserve_bytes.map(|_| snapshot(directory)).transpose()?;
+    // Comparison rows run one identical untimed pass, expire it and let the
+    // pool decay once, so both backends start the measured pass with warm code
+    // and idle storage: freed heap memory follows the allocator's trimming, and
+    // freed pool frames are punched except each free list's warm frames.
+    // Startup diagnostics stay cold.
+    let warmup = reserve_bytes.is_none() && !matches!(row.split('-').next(), Some("memory" | "totalcap" | "enospc"));
+    if warmup {
+        workload(backend.clone(), row, directory, None)
+            .await
+            .context("untimed warmup")?;
+        backend.expire()?;
+        backend.tick()?;
+    }
     let mut value = workload(backend.clone(), row, directory, baseline.clone()).await?;
     let startup = if let Some(before_open) = before_open {
         let first_burst = value.clone();
@@ -561,12 +438,22 @@ async fn run(
     } else {
         None
     };
-    Ok(json!({"status":"ok","backend":kind,"row":row,"metrics":value,"counters":backend.counters(),"startup":startup}))
+    Ok(
+        json!({"status":"ok","backend":kind,"row":row,"warmup":warmup,"metrics":value,"counters":backend.counters(),"startup":startup}),
+    )
+}
+
+/// Process-wide minor page faults (all threads), from /proc/self/stat field 10.
+fn minor_faults() -> Result<u64> {
+    let stat = fs::read_to_string("/proc/self/stat")?;
+    let fields = stat.rsplit_once(')').context("stat shape")?.1;
+    Ok(fields.split_whitespace().nth(7).context("minflt")?.parse()?)
 }
 
 async fn workload(backend: Arc<Backend>, row: &str, directory: &Path, baseline: Option<Value>) -> Result<Value> {
     let fields: Vec<&str> = row.split('-').collect();
-    let value = match fields.as_slice() {
+    let faults = minor_faults()?;
+    let mut value = match fields.as_slice() {
         ["small", tasks] => small(backend.clone(), tasks.parse()?, 20000).await?,
         ["smoke"] => small(backend.clone(), 1, 8).await?,
         ["concurrent", streams] => concurrent(backend.clone(), streams.parse()?).await?,
@@ -594,6 +481,9 @@ async fn workload(backend: Arc<Backend>, row: &str, directory: &Path, baseline: 
         ["enospc"] => enospc(&backend, directory)?,
         _ => bail!("unknown workload {row}"),
     };
+    if let Value::Object(metrics) = &mut value {
+        metrics.insert("minor_faults".into(), json!(minor_faults()? - faults));
+    }
     Ok(value)
 }
 

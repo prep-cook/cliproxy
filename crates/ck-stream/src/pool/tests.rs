@@ -45,7 +45,7 @@ fn growth_reuse_and_exact_cap() {
     assert_eq!(pool.backed_frames(), 21);
     let mut allocated = Vec::new();
     for n in 0..45 {
-        let frame = pool.allocate().unwrap();
+        let frame = pool.allocate(FRAME_BYTES).unwrap();
         assert!(!allocated.contains(&frame));
         // SAFETY: this test exclusively owns the new frame and has not published it.
         unsafe {
@@ -55,14 +55,17 @@ fn growth_reuse_and_exact_cap() {
     }
     assert_eq!(pool.backed_frames(), 45);
     assert_eq!(pool.used(), 45);
-    assert_eq!(pool.allocate().unwrap_err().kind(), io::ErrorKind::OutOfMemory);
+    assert_eq!(
+        pool.allocate(FRAME_BYTES).unwrap_err().kind(),
+        io::ErrorKind::OutOfMemory
+    );
     for (n, &frame) in allocated.iter().enumerate() {
         // SAFETY: every allocated frame remains pinned and immutable during this read.
         assert_eq!(unsafe { pool.slice(frame, FRAME_BYTES - 2, 2) }, &[n as u8, 0xa5]);
     }
     let frame = allocated.pop().unwrap();
     pool.release(frame);
-    assert_eq!(pool.allocate().unwrap(), frame);
+    assert_eq!(pool.allocate(FRAME_BYTES).unwrap(), frame);
     pool.release(frame);
     for frame in allocated {
         pool.release(frame);
@@ -103,7 +106,7 @@ fn slots_are_aligned_exclusive_and_reset() {
 fn decay_preserves_a_leased_neighbor_and_prefaults_reuse() {
     let directory = Directory::new();
     let pool = Arc::new(Pool::open(&directory.0, 64, 2, 1, 0).unwrap());
-    let frames: Vec<_> = (0..64).map(|_| pool.allocate().unwrap()).collect();
+    let frames: Vec<_> = (0..64).map(|_| pool.allocate(FRAME_BYTES).unwrap()).collect();
     let neighbor = frames[16];
     // SAFETY: this test exclusively owns the allocated neighbor before publication.
     unsafe {
@@ -127,11 +130,11 @@ fn decay_preserves_a_leased_neighbor_and_prefaults_reuse() {
     );
     pool.decay().unwrap();
     assert!(blocks(&pool.file) < before);
-    assert_eq!(lock(&pool.shards[0].0).frames.len(), WARM);
+    assert_eq!(pool.shards[0].0.lock().frames.len(), WARM);
     assert_eq!(bytes, &[0x5a; FRAME_BYTES]);
     let mut reused = Vec::new();
     for _ in 0..63 {
-        let frame = pool.allocate().unwrap();
+        let frame = pool.allocate(FRAME_BYTES).unwrap();
         assert_ne!(frame, neighbor);
         // SAFETY: the newly reserved frame has no readers; cold prefault succeeded.
         unsafe {
@@ -150,16 +153,59 @@ fn decay_preserves_a_leased_neighbor_and_prefaults_reuse() {
 }
 
 #[test]
+fn the_warm_budget_is_pool_wide() {
+    let directory = Directory::new();
+    let pool = Pool::open(&directory.0, 42, 1, 2, 0).unwrap();
+    let frames: Vec<_> = (0..2 * WARM + 4).map(|_| pool.allocate(FRAME_BYTES).unwrap()).collect();
+    // One thread frees every frame, so one free list holds almost all of them.
+    for frame in frames {
+        pool.release(frame);
+    }
+    pool.decay().unwrap();
+    pool.decay().unwrap();
+    let kept: usize = pool.shards.iter().map(|shard| shard.0.lock().frames.len()).sum();
+    assert_eq!(kept, 2 * WARM);
+}
+
+#[test]
+fn cold_frames_prefault_only_the_pages_a_record_needs() {
+    let directory = Directory::new();
+    let pool = Pool::open(&directory.0, 21, 1, 1, 0).unwrap();
+    pool.decay().unwrap();
+    pool.decay().unwrap();
+    let warm: Vec<_> = (0..WARM).map(|_| pool.allocate(FRAME_BYTES).unwrap()).collect();
+    let page_blocks = (pool.page / 512) as u64;
+    let before = blocks(&pool.file);
+    let frame = pool.allocate(100).unwrap();
+    // The record's span touches at most two pages, one of which may straddle a neighbour.
+    let small = blocks(&pool.file) - before;
+    assert!(small <= 2 * page_blocks, "{small} blocks for 100 bytes");
+    pool.prefault(frame, FRAME_BYTES).unwrap();
+    assert!(blocks(&pool.file) - before >= (FRAME_BYTES / pool.page) as u64 * page_blocks);
+    // SAFETY: this test exclusively owns the allocated frame, now populated end to end.
+    unsafe { pool.write(frame, 0, &[0x7e; FRAME_BYTES]) };
+    // Released first, the frame sits below the eight warm ones and is punched.
+    pool.release(frame);
+    for frame in warm {
+        pool.release(frame);
+    }
+    pool.decay().unwrap();
+    pool.decay().unwrap();
+    // Punching forgets the populated prefix, so reuse populates again.
+    assert_eq!(pool.states[frame as usize].ready.load(Ordering::Relaxed), 0);
+}
+
+#[test]
 fn reused_lifo_frames_wait_a_whole_interval() {
     let directory = Directory::new();
     let pool = Pool::open(&directory.0, 21, 1, 1, 0).unwrap();
     pool.decay().unwrap();
-    let frame = pool.allocate().unwrap();
+    let frame = pool.allocate(FRAME_BYTES).unwrap();
     pool.release(frame);
     pool.decay().unwrap();
     // One popped frame and eight warm frames cannot have been reclaimed.
-    assert_eq!(lock(&pool.shards[0].0).frames.len(), WARM + 1);
-    assert_eq!(pool.allocate().unwrap(), frame);
+    assert_eq!(pool.shards[0].0.lock().frames.len(), WARM + 1);
+    assert_eq!(pool.allocate(FRAME_BYTES).unwrap(), frame);
     pool.release(frame);
 }
 
@@ -174,10 +220,25 @@ fn resident_stealing_precedes_cold_prefault() {
     // Empty the calling shard, leaving resident frames only on its neighbor.
     let local = pool.shard();
     let other = (local + 1) % 2;
-    let moved = std::mem::take(&mut lock(&pool.shards[local].0).frames);
-    lock(&pool.shards[other].0).frames.extend(moved);
-    let frame = pool.allocate().unwrap();
+    let moved = std::mem::take(&mut pool.shards[local].0.lock().frames);
+    pool.shards[other].0.lock().frames.extend(moved);
+    let frame = pool.allocate(FRAME_BYTES).unwrap();
     assert_eq!(lock(&pool.slow.0).cold.len(), cold);
+    pool.release(frame);
+}
+
+#[test]
+fn allocation_finds_resident_frames_a_stale_length_hid_before_growing() {
+    let directory = Directory::new();
+    let pool = Pool::open(&directory.0, 42, 1, 2, 0).unwrap();
+    // Every frame sits on the neighbor whose length mirror reads empty; nothing is cold.
+    let local = pool.shard();
+    let other = (local + 1) % 2;
+    let moved = std::mem::take(&mut pool.shards[local].0.lock().frames);
+    pool.shards[other].0.lock().frames.extend(moved);
+    pool.shards[other].0.len.store(0, Ordering::Relaxed);
+    let frame = pool.allocate(FRAME_BYTES).unwrap();
+    assert_eq!(pool.backed_frames(), 21);
     pool.release(frame);
 }
 
@@ -216,7 +277,7 @@ fn concurrent_allocations_and_decay_do_not_alias() {
             let pool = &pool;
             scope.spawn(move || {
                 for _ in 0..500 {
-                    let frame = pool.allocate().unwrap();
+                    let frame = pool.allocate(FRAME_BYTES).unwrap();
                     // SAFETY: worker exclusively owns this unpublished frame.
                     unsafe {
                         pool.write(frame, 0, &[worker; 128]);
@@ -236,7 +297,7 @@ fn concurrent_allocations_and_decay_do_not_alias() {
         });
     });
     assert_eq!(pool.used(), 0);
-    let frames: Vec<_> = (0..168).map(|_| pool.allocate().unwrap()).collect();
+    let frames: Vec<_> = (0..168).map(|_| pool.allocate(FRAME_BYTES).unwrap()).collect();
     let mut distinct = frames.clone();
     distinct.sort_unstable();
     distinct.dedup();
@@ -251,12 +312,18 @@ fn concurrent_allocations_and_decay_do_not_alias() {
 fn rejects_out_of_bounds_span() {
     let directory = Directory::new();
     let pool = Pool::open(&directory.0, 1, 1, 1, 0).unwrap();
-    let frame = pool.allocate().unwrap();
+    let frame = pool.allocate(FRAME_BYTES).unwrap();
     // SAFETY: ownership is valid; this deliberately invalid bound must panic before
     // any pointer access, exercising the documented bounds assertion.
     unsafe {
         pool.write(frame, FRAME_BYTES, &[1]);
     }
+}
+
+/// Tests that fill the one disposable tmpfs hold this for their whole run.
+fn isolated_tmpfs() -> MutexGuard<'static, ()> {
+    static SERIAL: Mutex<()> = Mutex::new(());
+    lock(&SERIAL)
 }
 
 fn fill_available(path: &Path) -> File {
@@ -288,9 +355,10 @@ fn fill_available(path: &Path) -> File {
 #[test]
 #[ignore = "requires a disposable private 4 MiB tmpfs supplied as TMPDIR"]
 fn isolated_tmpfs_growth_and_cold_prefault_enospc() {
+    let _serial = isolated_tmpfs();
     let directory = Directory::new();
     let pool = Pool::open(&directory.0, 42, 1, 1, 0).unwrap();
-    let mut frames: Vec<_> = (0..21).map(|_| pool.allocate().unwrap()).collect();
+    let mut frames: Vec<_> = (0..21).map(|_| pool.allocate(FRAME_BYTES).unwrap()).collect();
     let filler_path = directory.0.join("filler");
     let filler = fill_available(&filler_path);
     assert_eq!(
@@ -298,7 +366,10 @@ fn isolated_tmpfs_growth_and_cold_prefault_enospc() {
         Some(libc::ENOSPC)
     );
     let backed_bytes = fs::metadata(format!("/proc/self/fd/{}", pool.file.fd())).unwrap().len();
-    assert_eq!(pool.allocate().unwrap_err().raw_os_error(), Some(libc::ENOSPC));
+    assert_eq!(
+        pool.allocate(FRAME_BYTES).unwrap_err().raw_os_error(),
+        Some(libc::ENOSPC)
+    );
     assert_eq!(pool.used(), 21);
     assert_eq!(pool.backed_frames(), 21);
     assert_eq!(
@@ -307,17 +378,18 @@ fn isolated_tmpfs_growth_and_cold_prefault_enospc() {
     );
     drop(filler);
     fs::remove_file(&filler_path).unwrap();
-    frames.extend((21..42).map(|_| pool.allocate().unwrap()));
+    frames.extend((21..42).map(|_| pool.allocate(FRAME_BYTES).unwrap()));
     for frame in frames {
         pool.release(frame);
     }
     pool.decay().unwrap();
     pool.decay().unwrap();
-    let warm: Vec<_> = (0..WARM).map(|_| pool.allocate().unwrap()).collect();
+    let warm: Vec<_> = (0..WARM).map(|_| pool.allocate(FRAME_BYTES).unwrap()).collect();
     let cold = lock(&pool.slow.0).cold.len();
     let filler = fill_available(&filler_path);
-    assert!(
-        pool.allocate().is_err(),
+    assert_eq!(
+        pool.allocate(FRAME_BYTES).unwrap_err().raw_os_error(),
+        Some(libc::EFAULT),
         "cold reservation must fail before any content write"
     );
     assert_eq!(pool.used(), WARM as u32);
@@ -326,7 +398,7 @@ fn isolated_tmpfs_growth_and_cold_prefault_enospc() {
     fs::remove_file(&filler_path).unwrap();
     let mut restored = Vec::new();
     for _ in 0..cold {
-        let frame = pool.allocate().unwrap();
+        let frame = pool.allocate(FRAME_BYTES).unwrap();
         // SAFETY: successful prefault restored the exclusively owned cold frame.
         unsafe {
             pool.write(frame, 0, &[0x9b; FRAME_BYTES]);
@@ -341,13 +413,66 @@ fn isolated_tmpfs_growth_and_cold_prefault_enospc() {
 }
 
 #[test]
+fn prefault_doubles_the_populated_prefix() {
+    let directory = Directory::new();
+    let pool = Pool::open(&directory.0, 21, 1, 1, 0).unwrap();
+    pool.decay().unwrap();
+    pool.decay().unwrap();
+    let warm: Vec<_> = (0..WARM).map(|_| pool.allocate(FRAME_BYTES).unwrap()).collect();
+    let frame = pool.allocate(100).unwrap();
+    let ready = || pool.states[frame as usize].ready.load(Ordering::Relaxed) as usize;
+    assert!(ready() <= pool.page);
+    // Record by record, a frame fills in a few populate calls rather than one per page.
+    let mut calls = 0;
+    while ready() < FRAME_BYTES {
+        pool.prefault(frame, ready() + 1).unwrap();
+        calls += 1;
+    }
+    assert!(calls <= 6, "{calls} populate calls for one frame");
+    for frame in warm.into_iter().chain([frame]) {
+        pool.release(frame);
+    }
+}
+
+#[test]
+#[ignore = "requires a disposable private 4 MiB tmpfs supplied as TMPDIR"]
+fn isolated_tmpfs_prefault_ahead_falls_back_to_the_needed_page() {
+    let _serial = isolated_tmpfs();
+    let directory = Directory::new();
+    let pool = Pool::open(&directory.0, 21, 1, 1, 0).unwrap();
+    pool.decay().unwrap();
+    pool.decay().unwrap();
+    let warm: Vec<_> = (0..WARM).map(|_| pool.allocate(FRAME_BYTES).unwrap()).collect();
+    let frame = pool.allocate(4 * pool.page).unwrap();
+    let ready = pool.states[frame as usize].ready.load(Ordering::Relaxed) as usize;
+    let filler_path = directory.0.join("filler");
+    let filler = fill_available(&filler_path);
+    // One free page: populating ahead is refused, the page the record needs is granted.
+    filler
+        .set_len(filler.metadata().unwrap().len() - pool.page as u64)
+        .unwrap();
+    pool.prefault(frame, ready + 1).unwrap();
+    let after = pool.states[frame as usize].ready.load(Ordering::Relaxed) as usize;
+    assert_eq!(after, ready + pool.page);
+    assert_eq!(
+        pool.prefault(frame, after + 1).unwrap_err().raw_os_error(),
+        Some(libc::EFAULT)
+    );
+    drop(filler);
+    fs::remove_file(&filler_path).unwrap();
+    for frame in warm.into_iter().chain([frame]) {
+        pool.release(frame);
+    }
+}
+
+#[test]
 fn startup_reserve_survives_decay_while_excess_is_reclaimed() {
     let directory = Directory::new();
     let reserve = 25;
     let pool = Pool::open(&directory.0, 64, 1, 1, reserve).unwrap();
     let reserved_bytes = round_up(pool.header_bytes + reserve as usize * FRAME_BYTES, pool.page).unwrap();
     assert!(blocks(&pool.file) * 512 >= reserved_bytes as u64);
-    let frames: Vec<_> = (0..64).map(|_| pool.allocate().unwrap()).collect();
+    let frames: Vec<_> = (0..64).map(|_| pool.allocate(FRAME_BYTES).unwrap()).collect();
     for &frame in &frames {
         // SAFETY: this test owns every frame exclusively and initializes its whole payload.
         unsafe { pool.write(frame, 0, &[0x5a; FRAME_BYTES]) };
@@ -363,7 +488,7 @@ fn startup_reserve_survives_decay_while_excess_is_reclaimed() {
     assert!(blocks(&pool.file) * 512 >= reserved_bytes as u64);
     assert!(blocks(&pool.file) < before);
     for _ in 0..64 {
-        let frame = pool.allocate().unwrap();
+        let frame = pool.allocate(FRAME_BYTES).unwrap();
         if frame < reserve {
             // SAFETY: reallocation exclusively owns initialized bytes; a punch would have zeroed them.
             assert_eq!(unsafe { pool.slice(frame, 0, FRAME_BYTES) }, &[0x5a; FRAME_BYTES]);

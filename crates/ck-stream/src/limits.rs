@@ -20,6 +20,8 @@ pub struct Config {
     pub max_event_bytes: usize,
     pub max_metadata_bytes: usize,
     pub cache_ttl: Duration,
+    /// Mapped header slots. Not a cache limit: creating a stream with none free evicts the
+    /// least recently read stream.
     pub header_slots: u32,
     pub workers: usize,
 }

@@ -80,6 +80,38 @@ fn mixed_runs_preserve_each_boundary_kind_correlation_and_resume_sequence() {
 }
 
 #[test]
+fn appends_continue_runs_across_pages_frames_and_other_runs() {
+    let (_dir, store, _) = store(8, 4096);
+    let mut writer = store.create().unwrap();
+    let mut expected = Vec::new();
+    // Equal appends fill the first frame exactly, cross pages and, after one shorter
+    // reserved record, straddle the next frame boundary; each run stays exact.
+    for step in 0..120 {
+        let byte = expected.len() as u8;
+        let record = if step == 60 {
+            append(&mut writer, &[byte; 999], false, 0, 0)
+        } else {
+            writer.append(&[byte; 1000]).unwrap()
+        };
+        assert_eq!(record.sequence, expected.len() as u64);
+        expected.push((record, byte));
+    }
+    let end = expected[49].0.end;
+    assert_eq!((end.frame, end.offset), (1, 0));
+    assert!(
+        expected
+            .iter()
+            .any(|(record, _)| record.start.frame + 1 == record.end.frame && record.end.offset > 0)
+    );
+    writer.finish(Terminal::Done);
+    let mut reader = store.reader(writer.id(), 0).unwrap();
+    for &(record, byte) in &expected {
+        assert_record(&mut reader, record, byte);
+    }
+    terminal(&mut reader, Terminal::Done);
+}
+
+#[test]
 fn repeated_records_fit_a_small_unchanged_metadata_budget() {
     for len in [1, 7, 64, 257] {
         let (_dir, store, _) = store(8, 512);

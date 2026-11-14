@@ -21,7 +21,8 @@ def main():
     label = os.environ.get("CODEC_FAKE_SIDE", "old")
     mode = os.environ.get("CODEC_FAKE_MODE", "pass")
     if args.describe:
-        print(json.dumps({"schema_version": 1, "revision": gate.BASELINE_REVISION,
+        new_revision = label == "new" and mode != "baseline-revision"
+        print(json.dumps({"schema_version": 1, "revision": "c" * 40 if new_revision else gate.BASELINE_REVISION,
                           "source_checksum": ("1" if label == "new" else "0") * 64, "compiler": "synthetic-selftest",
                           "target": "synthetic", "profile": "release", "features": [],
                           "build_flags": [], "config": {"synthetic": True},
@@ -49,6 +50,13 @@ def main():
                     value = 94
                 if name == "heap_retained":
                     value = 101
+            # A harness that emits nothing has structural zero latencies and output.
+            if label == "new" and mode == "silent":
+                if name in {"encoded_bytes_per_event", "output_chunks"} or name.startswith(
+                        ("first_deliverable_", "inter_event_")):
+                    value = 0
+                if name == "no_output_completions":
+                    value = 200
             metrics[name] = {"unit": unit, "value": value}
         print(json.dumps({"schema_version": 1, "workload_id": workload["id"],
                           "manifest_sha256": checksum, "round": args.round,
