@@ -150,7 +150,7 @@ impl<F: FnMut(&'static str, u64)> Egress<F> {
         let at = At { node, x, item, index };
         match kind {
             Kind::MediaStart => self.image_start(at),
-            Kind::ToolStart => self.tool_start(at),
+            Kind::ToolStart => self.tool_start(owner, at, output),
             Kind::BlockStart => self.block_start(owner, at, output),
             Kind::ToolResult | Kind::Grounding | Kind::CodeExecution => self.execution(owner, kind, at, output),
             Kind::Chunk => self.chunk(owner, at, output),
@@ -219,12 +219,27 @@ fn write_lease(lease: &ScratchLease, e: &mut Encoder<'_, '_>) -> Result<()> {
     }
     Ok(())
 }
+/// Origin carrier of a call item split out of a message item.
+const CALL_ITEM: &str = "responses.tool";
+
+/// The output item of the event with correlation `x`: its own call item when it has one, else
+/// the item named by `item_id`.
 fn find_item(doc: &Document, output: usize, x: usize) -> Result<Option<(usize, u64)>> {
     let Some(local) = doc.member(x, "item_id")? else {
         return Ok(None);
     };
+    if let Some(call) = doc.member(x, "tool_call_id")? {
+        for (index, item) in doc.children(output)?.enumerate() {
+            if let Some((origin, Some(CALL_ITEM))) = doc.origin(item)?
+                && doc.equal_strings(doc.required(origin, "tool_call_id")?, call)?
+            {
+                return Ok(Some((item, index as u64)));
+            }
+        }
+    }
     for (index, item) in doc.children(output)?.enumerate() {
-        if let Some((origin, _)) = doc.origin(item)?
+        if let Some((origin, carrier)) = doc.origin(item)?
+            && carrier != Some(CALL_ITEM)
             && doc.equal_strings(doc.required(origin, "item_id")?, local)?
         {
             return Ok(Some((item, native_index(doc, item, "output_index", index as u64)?)));

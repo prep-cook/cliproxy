@@ -48,13 +48,25 @@ impl<F: FnMut(&'static str, u64)> Egress<F> {
         )
     }
 
-    /// Turns the item into a function or custom call with the restored call identity.
-    pub(super) fn tool_start(&mut self, at: At) -> Result<()> {
-        let At { node, x, item, .. } = at;
+    /// Turns the item into a function or custom call with the restored call identity. A source
+    /// that carries calls inside a message item (Chat, Anthropic) gets one call item per call.
+    pub(super) fn tool_start(
+        &mut self,
+        owner: &mut Writer,
+        at: At,
+        output: &mut impl FnMut(ScratchLease) -> Result<()>,
+    ) -> Result<()> {
+        let At { node, x, .. } = at;
         let doc = &mut self.document;
-        if is(doc, node, "kind", "server")? && super::super::response::Server::from_item(doc, item)?.is_some() {
+        if is(doc, node, "kind", "server")? && super::super::response::Server::from_item(doc, at.item)?.is_some() {
             return Ok(());
         }
+        let separate = is(doc, at.item, "type", "message")?;
+        let (item, index) = if separate {
+            call_item(doc, x)?
+        } else {
+            (at.item, at.index)
+        };
         if is(doc, node, "kind", "custom")? {
             doc.set(item, "type", Value::Text("custom_tool_call"))?;
         } else {
@@ -69,10 +81,18 @@ impl<F: FnMut(&'static str, u64)> Egress<F> {
         if let Some(source) = doc.member(x, "source")?
             && let Some(ids) = doc.member(source, "ids")?
         {
-            for name in ["id", "call_id"] {
-                if let Some(value) = doc.member(ids, name)? {
-                    let target = doc.set(item, name, Value::Null)?;
+            if separate {
+                // The source names its call identifier `id`; the call item has its own id.
+                if let Some(value) = doc.member(ids, "call_id")?.or(doc.member(ids, "id")?) {
+                    let target = doc.set(item, "call_id", Value::Null)?;
                     doc.transplant(target, value)?;
+                }
+            } else {
+                for name in ["id", "call_id"] {
+                    if let Some(value) = doc.member(ids, name)? {
+                        let target = doc.set(item, name, Value::Null)?;
+                        doc.transplant(target, value)?;
+                    }
                 }
             }
         }
@@ -80,7 +100,21 @@ impl<F: FnMut(&'static str, u64)> Egress<F> {
             let value = doc.node(doc.required(x, "tool_call_id")?)?.value;
             doc.set(item, "call_id", value)?;
         }
-        Ok(())
+        if !separate {
+            return Ok(());
+        }
+        let payload = encode::scratch(owner, |e| {
+            e.bytes(b",\"output_index\":")?;
+            e.unsigned(index)?;
+            e.bytes(b",\"item\":")?;
+            write_item(doc, item, e)
+        })?;
+        self.emit(
+            owner,
+            "response.output_item.added",
+            |e| write_lease(&payload, e),
+            output,
+        )
     }
 
     /// Opens a content or summary part and publishes its added event.
@@ -317,7 +351,7 @@ impl<F: FnMut(&'static str, u64)> Egress<F> {
         at: At,
         output: &mut impl FnMut(ScratchLease) -> Result<()>,
     ) -> Result<()> {
-        let At { item, index, .. } = at;
+        let At { node, item, index, .. } = at;
         let doc = &mut self.document;
         if let Some(server) = super::super::response::Server::from_item(doc, item)?
             && (server != super::super::response::Server::Mcp || doc.member(item, "arguments")?.is_none())
@@ -331,6 +365,18 @@ impl<F: FnMut(&'static str, u64)> Egress<F> {
             item_fields(doc, item, index, e)?;
             super::super::member(doc, item, field, e)
         })?;
+        let item_done = if doc.origin(item)?.is_some_and(|(_, carrier)| carrier == Some(CALL_ITEM)) {
+            let status = doc.node(doc.required(node, "status")?)?.value;
+            doc.set(item, "status", status)?;
+            Some(encode::scratch(owner, |e| {
+                e.bytes(b",\"output_index\":")?;
+                e.unsigned(index)?;
+                e.bytes(b",\"item\":")?;
+                write_item(doc, item, e)
+            })?)
+        } else {
+            None
+        };
         self.emit(
             owner,
             if custom {
@@ -342,7 +388,11 @@ impl<F: FnMut(&'static str, u64)> Egress<F> {
             },
             |e| write_lease(&payload, e),
             output,
-        )
+        )?;
+        match item_done {
+            Some(done) => self.emit(owner, "response.output_item.done", |e| write_lease(&done, e), output),
+            None => Ok(()),
+        }
     }
 
     /// Finishes the item status and order, and publishes `response.output_item.done`.
@@ -381,4 +431,16 @@ impl<F: FnMut(&'static str, u64)> Egress<F> {
         })?;
         self.emit(owner, "response.output_item.done", |e| write_lease(&payload, e), output)
     }
+}
+
+/// Appends a function call output item for the call that `x` starts inside a message item.
+fn call_item(doc: &mut Document, x: usize) -> Result<(usize, u64)> {
+    let output = doc.required(doc.root(), "output")?;
+    let item = doc.add(None, Value::Object)?;
+    doc.append(output, item)?;
+    let id = doc.node(doc.required(x, "tool_call_id")?)?.value;
+    doc.set(item, "id", id)?;
+    doc.set(item, "status", Value::Text("in_progress"))?;
+    doc.bind_origin(item, x, Some(CALL_ITEM))?;
+    Ok((item, doc.children(output)?.count() as u64 - 1))
 }

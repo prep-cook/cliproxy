@@ -137,3 +137,64 @@ fn chat_logprobs_without_a_block_join_the_open_text_part() {
     assert_eq!(response["status"], "completed");
     assert_eq!(response["output"][0]["content"][0]["logprobs"], logprobs["content"]);
 }
+#[test]
+fn chat_tool_call_becomes_a_function_call_item() {
+    let input = json!({"id":"r","model":"m","choices":[{"index":0,"message":{"role":"assistant","tool_calls":[{"id":"call-a","type":"function","function":{"name":"first","arguments":"{\"v\":1}"}}]},"finish_reason":"tool_calls"}]});
+    let output = chat_to_responses(
+        &serde_json::to_vec(&input).unwrap(),
+        BodyMode::Buffered,
+        BodyMode::Streaming,
+    );
+    let events = client_events(&output);
+    let done = events
+        .iter()
+        .find(|e| e["type"] == "response.function_call_arguments.done")
+        .unwrap();
+    assert_eq!(done["arguments"], "{\"v\":1}");
+    let output = &events.last().unwrap()["response"]["output"];
+    let call = output
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|item| item["type"] == "function_call")
+        .unwrap();
+    assert_eq!(call["type"], "function_call");
+    assert_eq!(call["name"], "first");
+    assert_eq!(call["call_id"], "call-a");
+    assert_eq!(call["arguments"], "{\"v\":1}");
+}
+
+#[test]
+fn chat_text_and_multiple_calls_remain_separate_output_items() {
+    let input = json!({"id":"r","choices":[{"index":0,"message":{"role":"assistant","content":"lead","tool_calls":[{"id":"call-a","type":"function","function":{"name":"first","arguments":"{}"}},{"id":"call-b","type":"function","function":{"name":"second","arguments":"{\"v\":1}"}}]},"finish_reason":"tool_calls"}]});
+    for downstream in [BodyMode::Buffered, BodyMode::Streaming] {
+        let output = chat_to_responses(&serde_json::to_vec(&input).unwrap(), BodyMode::Buffered, downstream);
+        let out = if downstream == BodyMode::Buffered {
+            serde_json::from_slice(&output).unwrap()
+        } else {
+            let events = client_events(&output);
+            let added = events
+                .iter()
+                .filter(|e| e["type"] == "response.output_item.added" && e["item"]["type"] == "function_call")
+                .count();
+            let done = events
+                .iter()
+                .filter(|e| e["type"] == "response.output_item.done" && e["item"]["type"] == "function_call")
+                .count();
+            assert_eq!((added, done), (2, 2));
+            events.last().unwrap()["response"].clone()
+        };
+        let items = out["output"].as_array().unwrap();
+        let message = items.iter().find(|item| item["type"] == "message").unwrap();
+        assert_eq!(message["content"][0]["text"], "lead");
+        for (id, name, arguments) in [("call-a", "first", "{}"), ("call-b", "second", "{\"v\":1}")] {
+            let call = items.iter().find(|item| item["call_id"] == id).unwrap();
+            assert_eq!(call["type"], "function_call");
+            assert_eq!(call["name"], name);
+            assert_eq!(call["arguments"], arguments);
+            assert_eq!(call["status"], "completed");
+            assert_ne!(call["id"], message["id"]);
+            assert!(call.get("content").is_none());
+        }
+    }
+}
