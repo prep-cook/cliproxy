@@ -19,6 +19,8 @@ impl State {
         if !snapshots {
             return Ok(());
         }
+        // The replay reduces published records only, so held audio publishes first.
+        self.flush_audio(owner, true)?;
         self.replay(owner)?;
         self.validate_finishes(owner, doc, choices)?;
         let (changes, _seen) = self.snapshot_changes(owner, doc, choices)?;
