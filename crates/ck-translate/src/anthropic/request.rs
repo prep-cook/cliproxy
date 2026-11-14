@@ -57,9 +57,9 @@ impl Ingress {
         self.input.as_mut().ok_or(Error::Closed)?.finish()?;
         self.consume(owner)?;
         let mut doc = self.input.take().ok_or(Error::Closed)?.document;
-        self.media.validate_registrations(&doc)?;
+        self.media.validate_registrations(&doc, 0)?;
         normalize(owner, &mut doc, self.operation)?;
-        self.media.relocate_ingress(&doc)?;
+        self.media.relocate_ingress(&doc, 0)?;
         super::content::register_media(
             &mut doc,
             &mut self.media,

@@ -473,7 +473,8 @@ fn media_source(view: RequestView<'_>, part: usize, kind: usize, e: &mut Encoder
             doc.write(mime, e)?;
         }
         e.bytes(b",\"data\":")?;
-        view.media.write_value(doc, doc.required(source, "ref")?, e)?;
+        view.media
+            .write_value(doc, doc.required(source, "ref")?, (doc.member(part, "mime")?, false), e)?;
     } else if super::is(doc, source, "kind", "uri")? {
         e.string("url")?;
         e.bytes(b",\"url\":")?;
