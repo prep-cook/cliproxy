@@ -73,20 +73,31 @@ pub(super) fn validate(view: RequestView<'_>) -> Result<()> {
     Ok(())
 }
 /// Whether the request continues stored state (`previous_response_id` or `conversation`), whose
-/// calls the upstream links tool outputs to.
+/// calls the upstream links tool outputs to. Only a string identity, or a conversation object with
+/// a string `id`, names such state; null or a malformed value does not.
 fn continued(doc: &Document, x: usize) -> Result<bool> {
     if let Some(session) = doc.member(x, "session")?
-        && doc.member(session, "previous_response_id")?.is_some()
+        && let Some(id) = doc.member(session, "previous_response_id")?
+        && string(doc, id).is_ok()
     {
         return Ok(true);
     }
-    Ok(match doc.member(x, "provider_parameters")? {
-        Some(providers) => match doc.member(providers, "responses")? {
-            Some(p) => doc.member(p, "conversation")?.is_some(),
-            None => false,
-        },
-        None => false,
-    })
+    let Some(conversation) = doc
+        .member(x, "provider_parameters")?
+        .map(|providers| doc.member(providers, "responses"))
+        .transpose()?
+        .flatten()
+        .map(|responses| doc.member(responses, "conversation"))
+        .transpose()?
+        .flatten()
+    else {
+        return Ok(false);
+    };
+    let id = match doc.node(conversation)?.value {
+        Value::Object => doc.member(conversation, "id")?,
+        _ => Some(conversation),
+    };
+    Ok(id.is_some_and(|id| string(doc, id).is_ok()))
 }
 /// Indexes every call ID. A repeated ID is accepted: the Responses API documents no uniqueness
 /// rule for `call_id`, and an output then links to any earlier call with it.
@@ -181,6 +192,12 @@ fn validate_part(view: RequestView<'_>, part: usize) -> Result<()> {
         "opaque",
     ] {
         supported |= doc.string_is(kind, k)?;
+    }
+    // Text-like kinds carry their text in `text` (§4); egress writes it as the native member.
+    for k in ["text", "reasoning", "reasoning_summary", "refusal"] {
+        if doc.string_is(kind, k)? {
+            string(doc, doc.required(part, "text")?)?;
+        }
     }
     if doc.string_is(kind, "audio")? {
         let source = doc.required(part, "source")?;

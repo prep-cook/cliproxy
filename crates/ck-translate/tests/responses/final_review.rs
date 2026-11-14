@@ -164,3 +164,67 @@ fn deleted_encrypted_parts_take_their_replay_payload_with_them() {
     });
     assert!(moved.is_err());
 }
+
+/// Runs a Responses request to the fence; returns whether `request.end` was published.
+fn fenced(input: &Value) -> bool {
+    let mut m = Mapped::new();
+    let mut ingress = responses::request::Ingress::new(
+        &mut m.writer,
+        &m.store,
+        identity(Direction::Request),
+        Operation::Generate,
+        1024 * 1024,
+    )
+    .unwrap();
+    let advanced = ingress.advance(&mut m.writer, &serde_json::to_vec(input).unwrap());
+    let ended = advanced.is_ok()
+        && ingress
+            .finish(&mut m.writer, &responses::request::ResponsesCapability)
+            .is_ok();
+    let published = String::from_utf8(m.output(&m.writer))
+        .unwrap()
+        .contains("event: x_ck.request.end\n");
+    assert_eq!(ended, published);
+    ended
+}
+
+#[test]
+fn the_fence_refuses_missing_text_and_null_continuations() {
+    for part in [
+        json!({"type":"refusal"}),
+        json!({"type":"output_text"}),
+        json!({"type":"refusal","refusal":7}),
+    ] {
+        assert!(
+            !fenced(&json!({"model":"m","input":[{"role":"assistant","content":[part]}]})),
+            "{part}"
+        );
+    }
+    let summary = json!({"type":"reasoning","summary":[{"type":"summary_text"}]});
+    assert!(!fenced(&json!({"model":"m","input":[summary]})));
+    let output = json!({"type":"function_call_output","call_id":"missing","output":"ok"});
+    for continuation in [
+        json!({"previous_response_id":null}),
+        json!({"conversation":null}),
+        json!({"conversation":{"vendor":1}}),
+    ] {
+        let mut input = json!({"model":"m","input":[output]});
+        input
+            .as_object_mut()
+            .unwrap()
+            .extend(continuation.as_object().unwrap().clone());
+        assert!(!fenced(&input), "{continuation}");
+    }
+    for continuation in [
+        json!({"previous_response_id":"resp"}),
+        json!({"conversation":"conv"}),
+        json!({"conversation":{"id":"conv"}}),
+    ] {
+        let mut input = json!({"model":"m","input":[output]});
+        input
+            .as_object_mut()
+            .unwrap()
+            .extend(continuation.as_object().unwrap().clone());
+        assert!(fenced(&input), "{continuation}");
+    }
+}
