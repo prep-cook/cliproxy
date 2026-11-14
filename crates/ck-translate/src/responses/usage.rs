@@ -67,43 +67,7 @@ impl Usage {
                 e.unsigned(total)?;
                 e.bytes(b",\"derived\":[\"total_tokens\"]")?;
             }
-            for (details, fields) in [
-                (
-                    "input_tokens_details",
-                    &[
-                        ("cached_tokens", "cache_read_tokens"),
-                        ("audio_tokens", "input_audio_tokens"),
-                        ("cache_write_tokens", "cache_write_tokens"),
-                    ][..],
-                ),
-                (
-                    "output_tokens_details",
-                    &[
-                        ("reasoning_tokens", "reasoning_tokens"),
-                        ("audio_tokens", "output_audio_tokens"),
-                    ][..],
-                ),
-            ] {
-                if let Some(details) = doc.member(root, details)?
-                    && matches!(doc.node(details)?.value, Value::Object)
-                {
-                    for (from, to) in fields {
-                        if let Some(n) = doc.member(details, from)?
-                            && !matches!(doc.node(n)?.value, Value::Null)
-                            && (to != &"cache_write_tokens"
-                                || doc
-                                    .member(root, to)?
-                                    .is_none_or(|n| matches!(doc.node(n).map(|n| n.value), Ok(Value::Null))))
-                        {
-                            doc.unsigned(n)?;
-                            e.bytes(b",")?;
-                            e.string(to)?;
-                            e.bytes(b":")?;
-                            doc.write(n, e)?;
-                        }
-                    }
-                }
-            }
+            write_details(doc, root, e)?;
             if let Some(ttl) = doc.member(root, "cache_write_by_ttl")? {
                 e.bytes(b",\"cache_write_by_ttl\":")?;
                 doc.write(ttl, e)?;
@@ -111,6 +75,49 @@ impl Usage {
         }
         e.bytes(b"}")
     }
+}
+
+/// Writes the counts nested in the native token details under their canonical names; a
+/// native top-level `cache_write_tokens` wins over the nested one.
+fn write_details(doc: &Document, root: usize, e: &mut Encoder<'_, '_>) -> Result<()> {
+    for (details, fields) in [
+        (
+            "input_tokens_details",
+            &[
+                ("cached_tokens", "cache_read_tokens"),
+                ("audio_tokens", "input_audio_tokens"),
+                ("cache_write_tokens", "cache_write_tokens"),
+            ][..],
+        ),
+        (
+            "output_tokens_details",
+            &[
+                ("reasoning_tokens", "reasoning_tokens"),
+                ("audio_tokens", "output_audio_tokens"),
+            ][..],
+        ),
+    ] {
+        if let Some(details) = doc.member(root, details)?
+            && matches!(doc.node(details)?.value, Value::Object)
+        {
+            for (from, to) in fields {
+                if let Some(n) = doc.member(details, from)?
+                    && !matches!(doc.node(n)?.value, Value::Null)
+                    && (to != &"cache_write_tokens"
+                        || doc
+                            .member(root, to)?
+                            .is_none_or(|n| matches!(doc.node(n).map(|n| n.value), Ok(Value::Null))))
+                {
+                    doc.unsigned(n)?;
+                    e.bytes(b",")?;
+                    e.string(to)?;
+                    e.bytes(b":")?;
+                    doc.write(n, e)?;
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Responses usage for canonical snapshot `usage`: a Responses source's native value, or the

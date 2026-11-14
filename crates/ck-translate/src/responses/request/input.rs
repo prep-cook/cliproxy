@@ -157,15 +157,7 @@ impl Input {
                 && let Some(parent_name) = doc.node(parent)?.name
                 && doc.name_is(parent_name, "input_audio")?
                 && let Some(part) = doc.node(parent)?.parent
-                && let Some(content) = doc.node(part)?.parent
-                && matches!(doc.node(content)?.value, Value::Array)
-                && let Some(content_name) = doc.node(content)?.name
-                && doc.name_is(content_name, "content")?
-                && let Some(item) = doc.node(content)?.parent
-                && let Some(input) = doc.node(item)?.parent
-                && doc.node(input)?.parent == Some(doc.root())
-                && let Some(input_name) = doc.node(input)?.name
-                && doc.name_is(input_name, "input")?
+                && input_part(doc, part)?
             {
                 let Some(kind) = doc.member(part, "type")? else {
                     return Ok(None);
@@ -190,20 +182,10 @@ impl Input {
                 ) {
                     return Ok(None);
                 }
-                if (image && doc.string_is(kind, "input_image")?) || (file && doc.string_is(kind, "input_file")?) {
-                    let content = doc.node(parent)?.parent;
-                    if let Some(content) = content
-                        && matches!(doc.node(content)?.value, Value::Array)
-                        && let Some(content_name) = doc.node(content)?.name
-                        && doc.name_is(content_name, "content")?
-                        && let Some(item) = doc.node(content)?.parent
-                        && let Some(input) = doc.node(item)?.parent
-                        && doc.node(input)?.parent == Some(doc.root())
-                        && let Some(input_name) = doc.node(input)?.name
-                        && doc.name_is(input_name, "input")?
-                    {
-                        binary = Some((if image { "image" } else { "document" }, file));
-                    }
+                if ((image && doc.string_is(kind, "input_image")?) || (file && doc.string_is(kind, "input_file")?))
+                    && input_part(doc, parent)?
+                {
+                    binary = Some((if image { "image" } else { "document" }, file));
                 }
             }
         }
@@ -300,4 +282,26 @@ impl Input {
         }
         Ok(())
     }
+}
+
+/// True when `part` is a content part of an item in the root `input` array.
+fn input_part(doc: &Document, part: usize) -> Result<bool> {
+    let Some(content) = doc.node(part)?.parent else {
+        return Ok(false);
+    };
+    let node = doc.node(content)?;
+    let named = |name: Option<Name>, value| name.map_or(Ok(false), |name| doc.name_is(name, value));
+    if !matches!(node.value, Value::Array) || !named(node.name, "content")? {
+        return Ok(false);
+    }
+    let Some(input) = node
+        .parent
+        .map(|item| doc.node(item))
+        .transpose()?
+        .and_then(|item| item.parent)
+    else {
+        return Ok(false);
+    };
+    let input = doc.node(input)?;
+    Ok(input.parent == Some(doc.root()) && named(input.name, "input")?)
 }
