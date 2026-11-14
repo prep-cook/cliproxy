@@ -35,6 +35,7 @@ impl<F: FnMut(&'static str, u64)> Egress<F> {
     }
 
     /// Restores the native identity; `response.created` is owed until `created` publishes it.
+    /// Fields the source did not supply keep the response's own values.
     pub(super) fn response_start(&mut self, incoming: Document) -> Result<()> {
         let doc = &mut self.document;
         let target = doc.root();
@@ -45,7 +46,9 @@ impl<F: FnMut(&'static str, u64)> Egress<F> {
             ("created", "created_at"),
             ("status", "status"),
         ] {
-            if let Some(value) = doc.remove(node, from)? {
+            if let Some(value) = doc.remove(node, from)?
+                && !synthetic(doc, node, from)?
+            {
                 let target = doc.set(target, to, Value::Null)?;
                 doc.transplant(target, value)?;
             }
@@ -136,6 +139,10 @@ impl<F: FnMut(&'static str, u64)> Egress<F> {
             let node = doc.absorb(incoming)?;
             let value = doc.required(node, "value")?;
             super::super::opaque::preserve_carrier_collision(doc, value)?;
+            // A client that has seen the response keeps its id for the whole response.
+            if self.sequence > 0 {
+                doc.remove(value, "id")?;
+            }
             super::super::merge(doc, doc.root(), value)?;
             // Every snapshot carries the native identity, so the owed `response.created` follows
             // its merge rather than a synthesized start.
@@ -187,4 +194,20 @@ impl<F: FnMut(&'static str, u64)> Egress<F> {
         doc.append(output_node, item)?;
         Ok(())
     }
+}
+
+/// Whether the canonical start `node` names `field` as generated rather than supplied.
+fn synthetic(doc: &Document, node: usize, field: &str) -> Result<bool> {
+    let Some(x) = doc.member(node, "x_ck")? else {
+        return Ok(false);
+    };
+    let Some(names) = doc.member(x, "synthetic")? else {
+        return Ok(false);
+    };
+    for name in doc.children(names)? {
+        if doc.string_is(name, field)? {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }

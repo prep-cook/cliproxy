@@ -81,3 +81,56 @@ fn output_text_parts_always_carry_annotations() {
             .all(|part| part["annotations"] == json!([]) && part.get("logprobs").is_none())
     );
 }
+
+/// The ids of every lifecycle event a streaming client sees.
+fn lifecycle_ids(out: &[u8]) -> Vec<String> {
+    client_events(out)
+        .iter()
+        .filter_map(|event| event.get("response"))
+        .map(|response| response["id"].as_str().unwrap().to_owned())
+        .collect()
+}
+
+#[test]
+fn a_response_without_a_source_id_keeps_one_gateway_id() {
+    let item = json!({"id":"i","type":"reasoning","summary":[]});
+    let terminal = |response: Value| json!({"type":"response.completed","response":response});
+    // The source's id arrives only after the first item forced `response.created`.
+    let late = [
+        json!({"type":"response.output_item.added","output_index":0,"item":item}),
+        json!({"type":"response.output_item.done","output_index":0,"item":item}),
+        terminal(json!({"id":"r","status":"completed","output":[item]})),
+    ];
+    let (out, _) = try_streamed(&late, BodyMode::Streaming).unwrap();
+    let ids = lifecycle_ids(&out);
+    assert_eq!(ids.len(), 2);
+    assert!(ids[0].starts_with("resp_") && ids[0].len() > 5, "{ids:?}");
+    assert_eq!(ids[0], ids[1]);
+    // No id at all: streaming and buffered clients get a gateway id.
+    let none = [terminal(json!({"status":"completed","output":[item]}))];
+    let (out, _) = try_streamed(&none, BodyMode::Streaming).unwrap();
+    let streamed = lifecycle_ids(&out);
+    assert_eq!(streamed.len(), 2);
+    assert_eq!(streamed[0], streamed[1]);
+    assert!(streamed[0].starts_with("resp_"), "{streamed:?}");
+    let (out, _) = try_streamed(&none, BodyMode::Buffered).unwrap();
+    assert!(
+        serde_json::from_slice::<Value>(&out).unwrap()["id"]
+            .as_str()
+            .unwrap()
+            .starts_with("resp_")
+    );
+    let body = json!({"status":"completed","output":[item]});
+    let (out, _) = response(
+        body.to_string().as_bytes(),
+        BodyMode::Buffered,
+        BodyMode::Buffered,
+        Operation::Generate,
+    );
+    assert!(
+        serde_json::from_slice::<Value>(&out).unwrap()["id"]
+            .as_str()
+            .unwrap()
+            .starts_with("resp_")
+    );
+}

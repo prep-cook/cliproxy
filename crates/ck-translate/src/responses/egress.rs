@@ -44,7 +44,7 @@ pub struct Egress<F: FnMut(&'static str, u64)> {
 impl<F: FnMut(&'static str, u64)> Egress<F> {
     pub fn new(
         owner: &mut Writer,
-        identity: Identity,
+        _identity: Identity,
         operation: Operation,
         mode: BodyMode,
         diagnostic: F,
@@ -52,10 +52,12 @@ impl<F: FnMut(&'static str, u64)> Egress<F> {
         if operation == Operation::CountTokens || (operation == Operation::Compact && mode == BodyMode::Streaming) {
             return Err(Error::Unsupported);
         }
+        // The response id when the source supplies none: generated here, never a source value.
+        let id = codec::media::local_id(b's', owner.id())?;
         let document = super::mapped(owner, |e| {
-            e.bytes(b"{\"id\":")?;
-            e.string(identity.stream_id.as_str())?;
-            e.bytes(b",\"object\":")?;
+            e.bytes(b"{\"id\":\"resp_")?;
+            e.bytes(id.as_str().as_bytes())?;
+            e.bytes(b"\",\"object\":")?;
             e.string(if operation == Operation::Compact {
                 "response.compaction"
             } else {
