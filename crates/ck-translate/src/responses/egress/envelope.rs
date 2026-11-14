@@ -13,7 +13,7 @@ impl<F: FnMut(&'static str, u64)> Egress<F> {
         let root = doc.root();
         doc.set(root, "status", Value::Text("failed"))?;
         let error = doc.set(root, "error", Value::Object)?;
-        doc.set(error, "code", Value::Text("upstream_error"))?;
+        doc.set(error, "code", Value::Text("server_error"))?;
         doc.set(error, "message", Value::Text("Response failed"))?;
         order_array(doc, doc.required(root, "output")?, "output_index", owner)?;
         let response = encode::scratch(owner, |e| write_response(doc, e))?;

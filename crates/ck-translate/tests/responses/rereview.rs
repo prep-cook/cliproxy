@@ -106,6 +106,69 @@ fn opaque_summary_parts_raise_no_text_events() {
     }
 }
 
+/// Client bytes for Responses `input` whose ingress fails; egress still ends the response.
+fn failing(input: &[u8], mode: BodyMode, downstream: BodyMode) -> Vec<u8> {
+    let mut m = Mapped::new();
+    let mut ingress = responses::response::Ingress::new(
+        &mut m.writer,
+        identity(Direction::Response),
+        Operation::Generate,
+        mode,
+        1024 * 1024,
+    )
+    .unwrap();
+    let mut reader = m.store.reader(m.writer.id(), 0).unwrap();
+    let mut egress = responses::egress::Egress::new(
+        &mut m.writer,
+        identity(Direction::Response),
+        Operation::Generate,
+        downstream,
+        |_, _| {},
+    )
+    .unwrap();
+    let ingested = ingress
+        .advance(&mut m.writer, input)
+        .and_then(|()| ingress.finish(&mut m.writer));
+    assert!(ingested.is_err());
+    let mut out = Vec::new();
+    while let std::task::Poll::Ready(Some(ck_stream::Read::Record(lease))) = reader.try_next() {
+        egress
+            .advance(&mut m.writer, lease, |chunk| {
+                out.extend_from_slice(&bytes(&chunk));
+                Ok(())
+            })
+            .unwrap();
+    }
+    egress.finish().unwrap();
+    out
+}
+
+const FAILED: &str = r#"{"id":"r","model":"m","created_at":123,"status":"failed","output":[],
+    "error":{"code":"server_error","message":"SENSITIVE"},"usage":{"input_tokens":10,"output_tokens":2,"total_tokens":12}}"#;
+
+/// The failed response a client receives, after checking the stream's lifecycle events.
+fn failed_response(out: &[u8], downstream: BodyMode) -> Value {
+    assert!(!String::from_utf8_lossy(out).contains("SENSITIVE"));
+    if downstream == BodyMode::Buffered {
+        return serde_json::from_slice(out).unwrap();
+    }
+    let events = client_events(out);
+    let types: Vec<_> = events.iter().map(|e| e["type"].as_str().unwrap()).collect();
+    assert_eq!(types, ["response.created", "response.failed"]);
+    assert_eq!(events[0]["response"]["id"], "r");
+    events[1]["response"].clone()
+}
+
+#[test]
+fn failures_carry_the_native_server_error_code() {
+    let out = failing(FAILED.as_bytes(), BodyMode::Buffered, BodyMode::Buffered);
+    let response: Value = serde_json::from_slice(&out).unwrap();
+    assert_eq!(
+        response["error"],
+        json!({"code":"server_error","message":"Response failed"})
+    );
+}
+
 const COMPLETED: &str =
     "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"r\",\"status\":\"completed\",\"output\":[]}}\n\n";
 
