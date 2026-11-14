@@ -2,6 +2,7 @@
 
 mod content;
 pub mod egress;
+mod index;
 pub mod request;
 mod request_encode;
 mod request_schema;

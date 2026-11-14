@@ -72,11 +72,7 @@ impl Egress {
         if let Some(calls) = doc.member(delta, "tool_calls")? {
             for call in doc.children(calls)? {
                 let tool = doc.unsigned(doc.required(call, "index")?)?;
-                let index = self
-                    .blocks
-                    .iter()
-                    .position(|b| b.tool == Some(tool) && b.open)
-                    .ok_or(Error::Schema)?;
+                let index = self.open_tool(None, tool)?;
                 let function = doc.required(call, "function")?;
                 if let Some(args) = doc.member(function, "arguments")? {
                     self.fragment(owner, doc, args, index, ("partial_json", "input_json_delta"), output)?;

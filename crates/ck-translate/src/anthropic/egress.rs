@@ -1,4 +1,4 @@
-use super::{Table, is, mapped, member, object, string};
+use super::{Table, index::Index, is, mapped, member, object, string};
 
 mod block;
 mod envelope;
@@ -28,6 +28,8 @@ struct Block {
     tool: Option<u64>,
     explicit_block: bool,
     start_origin: Option<Document>,
+    /// The text kind under which `Egress::texts` lists this block while it is open.
+    text: Option<&'static str>,
 }
 pub struct Egress {
     owner: u64,
@@ -37,6 +39,11 @@ pub struct Egress {
     sequence: u64,
     base: Option<Document>,
     blocks: Table<Block>,
+    /// `blocks` positions by (item, block index), by tool index, and open text blocks by
+    /// (item, kind).
+    named: Index,
+    tools: Index,
+    texts: Index,
     usage: Option<Document>,
     finish: Option<Document>,
     start_origin: Option<Document>,
@@ -67,6 +74,9 @@ impl Egress {
             sequence: 0,
             base: None,
             blocks: Table::new(owner)?,
+            named: Index::new(owner)?,
+            tools: Index::new(owner)?,
+            texts: Index::new(owner)?,
             usage: None,
             finish: None,
             start_origin: None,

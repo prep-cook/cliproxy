@@ -14,7 +14,12 @@ impl Egress {
         }
         let item = local(&doc, doc.required(x, "item_id")?)?;
         let canonical = doc.unsigned(doc.required(x, "block_index")?)?;
-        if self.blocks.iter().any(|b| b.item == item && b.canonical == canonical) {
+        let hash = self.named.hash((item.as_str(), canonical));
+        let found = self.named.find(hash, |position| {
+            let b = &self.blocks[position];
+            Ok(b.item == item && b.canonical == canonical)
+        })?;
+        if found.is_some() {
             return Err(Error::Schema);
         }
         let native = if is(&doc, root, "kind", "text")? {
@@ -65,7 +70,9 @@ impl Egress {
             tool: None,
             explicit_block: true,
             start_origin: Some(doc),
+            text: matches!(native, "text" | "thinking").then_some(native),
         })?;
+        self.listed(owner, index as usize)?;
         if matches!(native, "text" | "thinking") {
             self.start_block(owner, index as usize, output)?;
         }
@@ -80,11 +87,14 @@ impl Egress {
         let root = doc.root();
         let x = doc.required(root, "x_ck")?;
         let index = self.find_or_tool(owner, &doc, x)?;
-        let block = &mut self.blocks[index];
-        if block.tool.is_some() {
+        if self.blocks[index].tool.is_some() {
             return Err(Error::Schema);
         }
-        block.tool = Some(doc.unsigned(doc.required(x, "tool_index")?)?);
+        let tool = doc.unsigned(doc.required(x, "tool_index")?)?;
+        self.blocks[index].tool = Some(tool);
+        let hash = self.tools.hash(tool);
+        self.tools.insert(owner, hash, index)?;
+        let block = &mut self.blocks[index];
         let body = &mut block.document;
         let from = body.absorb(doc)?;
         let x = body.required(from, "x_ck")?;
@@ -245,19 +255,41 @@ impl Egress {
         let item = local(doc, doc.required(x, "item_id")?)?;
         if let Some(index) = doc.member(x, "block_index")? {
             let index = doc.unsigned(index)?;
-            self.blocks
-                .iter()
-                .position(|b| b.item == item && b.canonical == index && b.open)
+            let hash = self.named.hash((item.as_str(), index));
+            self.named
+                .find(hash, |position| {
+                    let b = &self.blocks[position];
+                    Ok(b.item == item && b.canonical == index && b.open)
+                })?
                 .ok_or(Error::Schema)
         } else if let Some(tool) = doc.member(x, "tool_index")? {
-            let tool = doc.unsigned(tool)?;
-            self.blocks
-                .iter()
-                .position(|b| b.item == item && b.tool == Some(tool) && b.open)
-                .ok_or(Error::Schema)
+            self.open_tool(Some(item), doc.unsigned(tool)?)
         } else {
             Err(Error::Schema)
         }
+    }
+    /// The first open block for tool index `tool`, within `item` when one is given.
+    pub(super) fn open_tool(&self, item: Option<LocalId>, tool: u64) -> Result<usize> {
+        self.tools
+            .find(self.tools.hash(tool), |position| {
+                let b = &self.blocks[position];
+                Ok(item.is_none_or(|item| b.item == item) && b.tool == Some(tool) && b.open)
+            })?
+            .ok_or(Error::Schema)
+    }
+    /// Lists the block just pushed at `index` in the lookup indexes.
+    fn listed(&mut self, owner: &mut Writer, index: usize) -> Result<()> {
+        let (item, canonical, text) = {
+            let b = &self.blocks[index];
+            (b.item, b.canonical, b.text)
+        };
+        let hash = self.named.hash((item.as_str(), canonical));
+        self.named.insert(owner, hash, index)?;
+        if let Some(native) = text {
+            let hash = self.texts.hash((item.as_str(), native));
+            self.texts.insert(owner, hash, index)?;
+        }
+        Ok(())
     }
     pub(super) fn find_or_tool(&mut self, owner: &mut Writer, doc: &Document, x: usize) -> Result<usize> {
         if doc.member(x, "block_index")?.is_some() {
@@ -274,7 +306,9 @@ impl Egress {
             tool: None,
             explicit_block: false,
             start_origin: None,
+            text: None,
         })?;
+        self.listed(owner, index)?;
         Ok(index)
     }
     pub(super) fn find_or_text(
@@ -289,9 +323,12 @@ impl Egress {
             return self.find(doc, x);
         }
         let item = local(doc, doc.required(x, "item_id")?)?;
-        if let Some(index) = self.blocks.iter().position(|b| {
-            b.item == item && b.open && is(&b.document, b.document.root(), "type", native).unwrap_or(false)
-        }) {
+        let hash = self.texts.hash((item.as_str(), native));
+        let open = self.texts.find(hash, |position| {
+            let b = &self.blocks[position];
+            Ok(b.item == item && b.text == Some(native))
+        })?;
+        if let Some(index) = open {
             return Ok(index);
         }
         let index = self.blocks.len();
@@ -308,7 +345,9 @@ impl Egress {
             tool: None,
             explicit_block: false,
             start_origin: None,
+            text: Some(native),
         })?;
+        self.listed(owner, index)?;
         self.start_block(owner, index, output)?;
         Ok(index)
     }
@@ -352,6 +391,7 @@ impl Egress {
             return Err(Error::Schema);
         }
         block.open = false;
+        let (item, text) = (block.item, block.text);
         if self.mode == BodyMode::Streaming {
             output(native_event(owner, "content_block_stop", origin, |e| {
                 e.bytes(b",\"index\":")?;
@@ -361,6 +401,10 @@ impl Egress {
                 }
                 Ok(())
             })?)?;
+        }
+        if let Some(native) = text {
+            let hash = self.texts.hash((item.as_str(), native));
+            self.texts.remove(hash, index)?;
         }
         Ok(())
     }

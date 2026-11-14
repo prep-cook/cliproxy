@@ -1,5 +1,6 @@
 use super::{
-    Table, equal_text, failure, is, mapped, member, object, server_result, string, unknown, unknown_at, usage::Usage,
+    Table, equal_text, failure, index::Index, is, mapped, member, object, server_result, string, unknown, unknown_at,
+    usage::Usage,
 };
 
 mod block;
@@ -42,6 +43,9 @@ struct State {
     operation: Operation,
     base: Option<Document>,
     blocks: Table<Block>,
+    /// `blocks` positions by wire block index, and tool blocks by `source_id`.
+    positions: Index,
+    tool_ids: Index,
     next_tool: u64,
     usage: Usage,
     message_started: bool,
@@ -78,6 +82,8 @@ impl Ingress {
                 operation,
                 base: None,
                 blocks: Table::new(owner)?,
+                positions: Index::new(owner)?,
+                tool_ids: Index::new(owner)?,
                 next_tool: 0,
                 usage: Usage::default(),
                 message_started: false,

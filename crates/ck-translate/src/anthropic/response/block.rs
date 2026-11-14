@@ -1,6 +1,27 @@
 use super::*;
 
 impl State {
+    /// Position of the block with wire index `index`; indices are unique per response.
+    fn position(&self, index: u64) -> Result<Option<usize>> {
+        self.positions.find(self.positions.hash(index), |position| {
+            Ok(self.blocks[position].index == index)
+        })
+    }
+    /// Lists the block just pushed at `position` in the lookup indexes.
+    fn listed(&mut self, owner: &mut Writer, position: usize) -> Result<()> {
+        let hash = self.positions.hash(self.blocks[position].index);
+        self.positions.insert(owner, hash, position)?;
+        if let Some(source) = &self.blocks[position].source_id {
+            let hash = text_hash(&self.tool_ids, source, source.root())?;
+            self.tool_ids.insert(owner, hash, position)?;
+        }
+        Ok(())
+    }
+    fn open(&self, index: u64) -> Result<usize> {
+        self.position(index)?
+            .filter(|&position| self.blocks[position].open)
+            .ok_or(Error::Schema)
+    }
     pub(super) fn block_start(
         &mut self,
         owner: &mut Writer,
@@ -10,7 +31,7 @@ impl State {
         whole: bool,
         origin: Origin<'_>,
     ) -> Result<()> {
-        if self.blocks.iter().any(|b| b.index == index) {
+        if self.position(index)?.is_some() {
             return Err(Error::Schema);
         }
         let kind = block_kind(doc, node)?;
@@ -52,7 +73,7 @@ impl State {
         } else {
             None
         };
-        self.blocks.push(Block {
+        let position = self.blocks.push(Block {
             index,
             scope,
             kind,
@@ -71,6 +92,7 @@ impl State {
                 None
             },
         })?;
+        self.listed(owner, position)?;
         self.block_content(owner, doc, node, kind, scope, whole)?;
         if whole && tool {
             let input = doc.member(node, "input")?;
@@ -86,16 +108,11 @@ impl State {
         let tool = matches!(kind, "function" | "server");
         let result_scope = if kind == "tool_result" {
             let id = doc.required(node, "tool_use_id")?;
-            let mut matched = None;
-            for block in self.blocks.iter() {
-                if let Some(source) = &block.source_id
-                    && equal_text(source, source.root(), doc, id)?
-                {
-                    matched = Some(block.scope);
-                    break;
-                }
-            }
-            Some(matched.ok_or(Error::Schema)?)
+            let matched = self.tool_ids.find(text_hash(&self.tool_ids, doc, id)?, |position| {
+                let source = self.blocks[position].source_id.as_ref().ok_or(Error::Schema)?;
+                equal_text(source, source.root(), doc, id)
+            })?;
+            Some(self.blocks[matched.ok_or(Error::Schema)?].scope)
         } else {
             None
         };
@@ -247,11 +264,7 @@ impl State {
         index: u64,
         origin: (&Source, &sse::Event),
     ) -> Result<()> {
-        let block = self
-            .blocks
-            .iter()
-            .find(|b| b.index == index && b.open)
-            .ok_or(Error::Schema)?;
+        let block = &self.blocks[self.open(index)?];
         let scope = block.scope;
         if is(doc, delta, "type", "text_delta")? && block.kind == "text" {
             self.chunk(owner, scope, doc, doc.required(delta, "text")?, "content", Some(origin))
@@ -352,11 +365,8 @@ impl State {
         origin: Option<(&Source, &sse::Event)>,
     ) -> Result<()> {
         string(doc, value)?;
-        let block = self
-            .blocks
-            .iter_mut()
-            .find(|block| block.scope.block_index == scope.block_index)
-            .ok_or(Error::Schema)?;
+        let position = self.position(scope.block_index.ok_or(Error::Schema)?)?;
+        let block = &mut self.blocks[position.ok_or(Error::Schema)?];
         block.signature_final = Some(final_fragment);
         self.emitter.emit(
             owner,
@@ -384,11 +394,8 @@ impl State {
         fragment: bool,
         origin: Option<(&Source, &sse::Event)>,
     ) -> Result<()> {
-        let block = self
-            .blocks
-            .iter_mut()
-            .find(|b| b.index == index && b.open)
-            .ok_or(Error::Schema)?;
+        let position = self.open(index)?;
+        let block = &mut self.blocks[position];
         let (source, parser) = block.arguments.as_mut().ok_or(Error::Schema)?;
         let lease = encode::scratch(owner, |e| {
             if fragment {
@@ -428,11 +435,7 @@ impl State {
         Ok(())
     }
     pub(super) fn block_stop(&mut self, owner: &mut Writer, index: u64, origin: Origin<'_>) -> Result<()> {
-        let position = self
-            .blocks
-            .iter()
-            .position(|b| b.index == index && b.open)
-            .ok_or(Error::Schema)?;
+        let position = self.open(index)?;
         if !self.blocks[position].fragments
             && let Some(initial) = self.blocks[position].initial.take()
         {
@@ -483,6 +486,17 @@ impl State {
         block.initial = None;
         Ok(())
     }
+}
+
+/// Hash of a string node's scalars under `index`'s keys, whatever its storage form.
+fn text_hash(index: &Index, doc: &Document, node: usize) -> Result<u64> {
+    use std::hash::Hasher;
+    let mut hasher = index.hasher();
+    let mut chars = doc.chars(node)?;
+    while let Some(c) = chars.next_scalar()? {
+        hasher.write_u32(c.into());
+    }
+    Ok(hasher.finish())
 }
 
 /// Canonical kind of a native content block.
