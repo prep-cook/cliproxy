@@ -304,7 +304,12 @@ fn publish_field(
         |_| Ok(()),
     )?;
     let (_, event) = codec::internal::next(owner, reader)?;
-    doc.bind_field(node, event)?;
+    // Binding a nameless object or array keeps no text of its record, neither a pointer name
+    // nor a value, so adopting the record would only hold its lease until the request ends.
+    let bound = doc.node(node)?;
+    if bound.name.is_some() || !matches!(bound.value, Value::Object | Value::Array) {
+        doc.bind_field(node, event)?;
+    }
     doc.mark_published(node);
     Ok(())
 }
