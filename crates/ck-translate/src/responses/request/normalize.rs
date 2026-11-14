@@ -1,7 +1,7 @@
 use super::super::{is, move_field, string};
 use crate::codec::{
     Error, Operation, Result,
-    document::{Document, Value},
+    document::{Document, Name, Value},
     encode,
 };
 use ck_stream::Writer;
@@ -44,12 +44,13 @@ pub(super) fn normalize(doc: &mut Document, owner: &mut Writer, operation: Opera
     )?;
     let original = doc.set(x, "original", Value::Array)?;
     if let Some(wire_x) = wire_x {
-        preserve(doc, owner, original, root, wire_x)?;
+        preserve(doc, original, root, wire_x)?;
     }
     normalize_input(doc, owner, x, original)?;
-    normalize_options(doc, owner, x, original)?;
+    normalize_options(doc, x, original)?;
     normalize_tools(doc, owner, x, original)?;
-    preserve_unknown(doc, owner, original, root, ROOT_FIELDS)
+    preserve_unknown(doc, original, root, ROOT_FIELDS)?;
+    pointers(doc, owner, original)
 }
 /// Moves `instructions` and `input` into canonical messages.
 fn normalize_input(doc: &mut Document, owner: &mut Writer, x: usize, original: usize) -> Result<()> {
@@ -62,7 +63,7 @@ fn normalize_input(doc: &mut Document, owner: &mut Writer, x: usize, original: u
         doc.set(message, "role", Value::Text("developer"))?;
         doc.rename(instructions, "content")?;
         doc.append(message, instructions)?;
-        mark(doc, owner, original, message, "/instructions", Value::Bool(true))?;
+        mark(doc, original, message, "instructions", Value::Bool(true))?;
     }
     if let Some(input) = doc.remove(root, "input")? {
         if matches!(doc.node(input)?.value, Value::String(_) | Value::Utf8Media) {
@@ -91,10 +92,10 @@ fn normalize_input(doc: &mut Document, owner: &mut Writer, x: usize, original: u
     Ok(())
 }
 /// Maps the generation options to canonical fields and keeps the rest as provider parameters.
-fn normalize_options(doc: &mut Document, owner: &mut Writer, x: usize, original: usize) -> Result<()> {
+fn normalize_options(doc: &mut Document, x: usize, original: usize) -> Result<()> {
     let root = doc.root();
     if let Some(native) = doc.remove(root, "max_completion_tokens")? {
-        preserve(doc, owner, original, root, native)?;
+        preserve(doc, original, root, native)?;
     }
     move_field(doc, root, "max_output_tokens", root, "max_completion_tokens")?;
     if let Some(text) = doc.remove(root, "text")? {
@@ -151,7 +152,7 @@ fn normalize_tools(doc: &mut Document, owner: &mut Writer, x: usize, original: u
                 for name in ["name", "description", "parameters", "strict"] {
                     move_field(doc, tool, name, function, name)?;
                 }
-                preserve_unknown(doc, owner, original, tool, &["type", "function"])?;
+                preserve_unknown(doc, original, tool, &["type", "function"])?;
             } else {
                 let native = match doc.member(x, "tools")? {
                     Some(n) => n,
@@ -205,15 +206,15 @@ fn normalize_item(doc: &mut Document, owner: &mut Writer, item: usize, items: &m
     if is(doc, item, "type", "function_call")? || is(doc, item, "type", "custom_tool_call")? {
         normalize_call(doc, owner, item, messages, original)
     } else if is(doc, item, "type", "function_call_output")? || is(doc, item, "type", "custom_tool_call_output")? {
-        normalize_output(doc, owner, item, messages, original)
+        normalize_output(doc, item, messages, original)
     } else if is(doc, item, "type", "reasoning")? || is(doc, item, "type", "compaction")? {
-        normalize_reasoning(doc, owner, item, items)
+        normalize_reasoning(doc, item, items)
     } else if (doc.member(item, "type")?.is_none() && doc.member(item, "role")?.is_some())
         || is(doc, item, "type", "message")?
     {
-        normalize_message(doc, owner, item, messages, original)
+        normalize_message(doc, item, messages, original)
     } else {
-        normalize_opaque(doc, owner, item, messages, original)
+        normalize_opaque(doc, item, messages, original)
     }
 }
 /// Wraps a function or custom tool call in an assistant message; the item id is kept as an
@@ -226,7 +227,7 @@ fn normalize_call(doc: &mut Document, owner: &mut Writer, item: usize, messages:
     let calls = doc.set(message, "tool_calls", Value::Array)?;
     doc.append(calls, item)?;
     if let Some(id) = doc.remove(item, "id")? {
-        preserve(doc, owner, original, item, id)?;
+        preserve(doc, original, item, id)?;
     }
     move_field(doc, item, "call_id", item, "id")?;
     doc.set(item, "type", Value::Text(if custom { "custom" } else { "function" }))?;
@@ -258,22 +259,10 @@ fn normalize_call(doc: &mut Document, owner: &mut Writer, item: usize, messages:
             doc.transplant(arguments, parsed)?;
         }
     }
-    preserve_unknown(
-        doc,
-        owner,
-        original,
-        item,
-        &["id", "type", "arguments_format", "function"],
-    )?;
+    preserve_unknown(doc, original, item, &["id", "type", "arguments_format", "function"])?;
     Ok(())
 }
-fn normalize_output(
-    doc: &mut Document,
-    owner: &mut Writer,
-    item: usize,
-    messages: usize,
-    original: usize,
-) -> Result<()> {
+fn normalize_output(doc: &mut Document, item: usize, messages: usize, original: usize) -> Result<()> {
     let custom = is(doc, item, "type", "custom_tool_call_output")?;
     doc.append(messages, item)?;
     doc.set(item, "role", Value::Text("tool"))?;
@@ -284,18 +273,18 @@ fn normalize_output(
         let mut next = doc.node(content)?.first;
         while let Some(part) = next {
             next = doc.node(part)?.next;
-            normalize_part(doc, owner, part, original)?;
+            normalize_part(doc, part, original)?;
         }
     }
     if custom {
         doc.set(item, "name", Value::Text("custom"))?;
     }
-    preserve_unknown(doc, owner, original, item, &["role", "tool_call_id", "content", "name"])?;
+    preserve_unknown(doc, original, item, &["role", "tool_call_id", "content", "name"])?;
     Ok(())
 }
 /// Turns a reasoning or compaction item into an assistant message of reasoning parts; its
 /// encrypted content becomes a replay entry.
-fn normalize_reasoning(doc: &mut Document, owner: &mut Writer, item: usize, items: &mut Items) -> Result<()> {
+fn normalize_reasoning(doc: &mut Document, item: usize, items: &mut Items) -> Result<()> {
     let Items { messages, original, .. } = *items;
     // The item `type`, kept below as an original field, tells request egress which item it was.
     doc.append(messages, item)?;
@@ -308,7 +297,7 @@ fn normalize_reasoning(doc: &mut Document, owner: &mut Writer, item: usize, item
             if is(doc, part, "type", "reasoning_text")? {
                 doc.set(part, "type", Value::Text("reasoning"))?;
             }
-            preserve_unknown(doc, owner, original, part, &["type", "text"])?;
+            preserve_unknown(doc, original, part, &["type", "text"])?;
             doc.append(content, part)?;
         }
     }
@@ -317,13 +306,13 @@ fn normalize_reasoning(doc: &mut Document, owner: &mut Writer, item: usize, item
             doc.detach(summary, part)?;
             doc.set(part, "type", Value::Text("reasoning_summary"))?;
             doc.append(content, part)?;
-            preserve_unknown(doc, owner, original, part, &["type", "text"])?;
+            preserve_unknown(doc, original, part, &["type", "text"])?;
         }
     }
     if let Some(data) = doc.remove(item, "encrypted_content")? {
         replay_encrypted(doc, item, content, data, items)?;
     }
-    preserve_unknown(doc, owner, original, item, &["role", "content"])?;
+    preserve_unknown(doc, original, item, &["role", "content"])?;
     Ok(())
 }
 /// Records encrypted reasoning `data` of the item's message in `x_ck.replay` and marks its
@@ -360,13 +349,7 @@ fn replay_encrypted(doc: &mut Document, item: usize, content: usize, data: usize
     doc.set(part, "replay_index", Value::Unsigned(replay_index))?;
     Ok(())
 }
-fn normalize_message(
-    doc: &mut Document,
-    owner: &mut Writer,
-    item: usize,
-    messages: usize,
-    original: usize,
-) -> Result<()> {
+fn normalize_message(doc: &mut Document, item: usize, messages: usize, original: usize) -> Result<()> {
     doc.append(messages, item)?;
     if let Some(content) = doc.member(item, "content")?
         && matches!(doc.node(content)?.value, Value::Array)
@@ -374,27 +357,21 @@ fn normalize_message(
         let mut next = doc.node(content)?.first;
         while let Some(part) = next {
             next = doc.node(part)?.next;
-            normalize_part(doc, owner, part, original)?;
+            normalize_part(doc, part, original)?;
         }
     }
-    preserve_unknown(doc, owner, original, item, &["role", "content"])?;
+    preserve_unknown(doc, original, item, &["role", "content"])?;
     Ok(())
 }
 /// Keeps an item kind without a canonical form as an opaque part of an assistant message.
-fn normalize_opaque(
-    doc: &mut Document,
-    owner: &mut Writer,
-    item: usize,
-    messages: usize,
-    original: usize,
-) -> Result<()> {
+fn normalize_opaque(doc: &mut Document, item: usize, messages: usize, original: usize) -> Result<()> {
     let message = doc.add(None, Value::Object)?;
     doc.append(messages, message)?;
     let kind = match doc.member(item, "type")? {
         Some(kind) => doc.node(kind)?.value,
         None => Value::Null,
     };
-    mark(doc, owner, original, message, "/type", kind)?;
+    mark(doc, original, message, "type", kind)?;
     doc.set(message, "role", Value::Text("assistant"))?;
     let content = doc.set(message, "content", Value::Array)?;
     let part = doc.add(None, Value::Object)?;
@@ -405,7 +382,7 @@ fn normalize_opaque(
     doc.append(part, item)?;
     Ok(())
 }
-fn normalize_part(doc: &mut Document, owner: &mut Writer, part: usize, original: usize) -> Result<()> {
+fn normalize_part(doc: &mut Document, part: usize, original: usize) -> Result<()> {
     let kind = doc.required(part, "type")?;
     if doc.string_is(kind, "input_text")?
         || doc.string_is(kind, "output_text")?
@@ -418,10 +395,10 @@ fn normalize_part(doc: &mut Document, owner: &mut Writer, part: usize, original:
             Value::Text(if summary { "reasoning_summary" } else { "text" }),
         )?;
         string(doc, doc.required(part, "text")?)?;
-        preserve_unknown(doc, owner, original, part, &["type", "text"])?;
+        preserve_unknown(doc, original, part, &["type", "text"])?;
     } else if doc.string_is(kind, "refusal")? {
         move_field(doc, part, "refusal", part, "text")?;
-        preserve_unknown(doc, owner, original, part, &["type", "text"])?;
+        preserve_unknown(doc, original, part, &["type", "text"])?;
     } else if doc.string_is(kind, "input_audio")? {
         doc.set(part, "type", Value::Text("audio"))?;
         let source = doc.required(part, "input_audio")?;
@@ -440,8 +417,8 @@ fn normalize_part(doc: &mut Document, owner: &mut Writer, part: usize, original:
         let data = doc.required(source, "data")?;
         doc.rename(data, "ref")?;
         doc.set(source, "kind", Value::Text("data"))?;
-        preserve_unknown(doc, owner, original, source, &["kind", "ref"])?;
-        preserve_unknown(doc, owner, original, part, &["type", "source", "mime"])?;
+        preserve_unknown(doc, original, source, &["kind", "ref"])?;
+        preserve_unknown(doc, original, part, &["type", "source", "mime"])?;
     } else if doc.string_is(kind, "input_image")? || doc.string_is(kind, "input_file")? {
         let image = doc.string_is(kind, "input_image")?;
         doc.set(part, "type", Value::Text(if image { "image" } else { "document" }))?;
@@ -455,7 +432,7 @@ fn normalize_part(doc: &mut Document, owner: &mut Writer, part: usize, original:
         } else {
             return Err(Error::Schema);
         }
-        preserve_unknown(doc, owner, original, part, &["type", "source", "detail", "filename"])?;
+        preserve_unknown(doc, original, part, &["type", "source", "detail", "filename"])?;
     } else {
         let value = doc.add(None, Value::Object)?;
         while let Some(child) = doc.node(part)?.first {
@@ -469,58 +446,67 @@ fn normalize_part(doc: &mut Document, owner: &mut Writer, part: usize, original:
     }
     Ok(())
 }
-/// Records in `x_ck.original` that `target` stands for the Responses member `pointer`: the
+/// Records in `x_ck.original` that `target` stands for the Responses member `name`: the
 /// `instructions` message, or the item type of an item kept opaque. Unlike an in-memory carrier,
 /// the entry is published with its binding, so it survives the canonical records (§4).
-fn mark(
-    doc: &mut Document,
-    owner: &mut Writer,
-    original: usize,
-    target: usize,
-    pointer: &str,
-    value: Value,
-) -> Result<()> {
-    let entry = doc.add(None, Value::Object)?;
-    doc.append(original, entry)?;
-    doc.set(entry, "protocol", Value::Text("responses"))?;
-    let lease = encode::scratch(owner, |e| e.string(pointer))?;
-    let pointer = doc.import_json(owner, lease)?;
-    doc.rename(pointer, "pointer")?;
-    doc.append(entry, pointer)?;
-    doc.set(entry, "value", value)?;
-    doc.bind_origin(entry, target, None)
+fn mark(doc: &mut Document, original: usize, target: usize, name: &'static str, value: Value) -> Result<()> {
+    let field = doc.add(Some(Name::Static(name)), value)?;
+    preserve(doc, original, target, field)
 }
-fn preserve(doc: &mut Document, owner: &mut Writer, original: usize, target: usize, value: usize) -> Result<()> {
-    let name = doc.node(value)?.name.ok_or(Error::Schema)?;
+/// Keeps the detached member `value` of `target` in `x_ck.original` under its own name, which
+/// [`pointers`] turns into the entry's pointer once normalization is done.
+fn preserve(doc: &mut Document, original: usize, target: usize, value: usize) -> Result<()> {
+    doc.node(value)?.name.ok_or(Error::Schema)?;
     let entry = doc.add(None, Value::Object)?;
     doc.append(original, entry)?;
     doc.set(entry, "protocol", Value::Text("responses"))?;
-    let lease = encode::scratch(owner, |e| {
-        e.bytes(b"\"/")?;
-        let mut chars = doc.name_chars(name)?;
-        while let Some(c) = chars.next_scalar()? {
-            match c {
-                '~' => e.bytes(b"~0")?,
-                '/' => e.bytes(b"~1")?,
-                _ => e.escaped(c.encode_utf8(&mut [0; 4]))?,
-            }
-        }
-        e.bytes(b"\"")
-    })?;
-    let pointer = doc.import_json(owner, lease)?;
-    doc.rename(pointer, "pointer")?;
-    doc.append(entry, pointer)?;
-    doc.rename(value, "value")?;
     doc.append(entry, value)?;
     doc.bind_origin(entry, target, None)
 }
-fn preserve_unknown(
-    doc: &mut Document,
-    owner: &mut Writer,
-    original: usize,
-    target: usize,
-    known: &[&str],
-) -> Result<()> {
+/// Gives every `x_ck.original` entry the pointer of the member it keeps and names that member
+/// `value`. All pointers share one imported array, as provenance bindings do: an import per
+/// entry cost each entry its own source and scratch lease.
+fn pointers(doc: &mut Document, owner: &mut Writer, original: usize) -> Result<()> {
+    if doc.node(original)?.first.is_none() {
+        return Ok(());
+    }
+    let lease = encode::scratch(owner, |e| {
+        e.bytes(b"[")?;
+        for (i, entry) in doc.children(original)?.enumerate() {
+            if i > 0 {
+                e.bytes(b",")?;
+            }
+            let field = doc.children(entry)?.last().ok_or(Error::Schema)?;
+            let name = doc.node(field)?.name.ok_or(Error::Schema)?;
+            e.bytes(b"\"/")?;
+            let mut chars = doc.name_chars(name)?;
+            while let Some(c) = chars.next_scalar()? {
+                match c {
+                    '~' => e.bytes(b"~0")?,
+                    '/' => e.bytes(b"~1")?,
+                    _ => e.escaped(c.encode_utf8(&mut [0; 4]))?,
+                }
+            }
+            e.bytes(b"\"")?;
+        }
+        e.bytes(b"]")
+    })?;
+    let pointers = doc.import_json(owner, lease)?;
+    let mut next = doc.node(original)?.first;
+    while let Some(entry) = next {
+        next = doc.node(entry)?.next;
+        let field = doc.children(entry)?.last().ok_or(Error::Schema)?;
+        let pointer = doc.node(pointers)?.first.ok_or(Error::Schema)?;
+        doc.detach(pointers, pointer)?;
+        doc.rename(pointer, "pointer")?;
+        doc.detach(entry, field)?;
+        doc.append(entry, pointer)?;
+        doc.rename(field, "value")?;
+        doc.append(entry, field)?;
+    }
+    Ok(())
+}
+fn preserve_unknown(doc: &mut Document, original: usize, target: usize, known: &[&str]) -> Result<()> {
     let mut next = doc.node(target)?.first;
     while let Some(child) = next {
         next = doc.node(child)?.next;
@@ -531,7 +517,7 @@ fn preserve_unknown(
         }
         if !keep {
             doc.detach(target, child)?;
-            preserve(doc, owner, original, target, child)?;
+            preserve(doc, original, target, child)?;
         }
     }
     Ok(())

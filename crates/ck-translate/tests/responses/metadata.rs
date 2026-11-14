@@ -56,11 +56,12 @@ pub(super) fn fits(rounds: usize, budget: usize) -> bool {
 /// The least metadata budget a 30-round tool history passes with. Each tool round costs
 /// metadata for its document nodes and records, so this budget sets how many rounds fit under
 /// the default quota. The ingress releases the wire scanner and node map before
-/// normalization, and nameless objects and arrays keep no record lease. The exact budget moves with any metadata accounting change and must then be
-/// re-measured against the previous behaviour.
+/// normalization, nameless objects and arrays keep no record lease, and the pointers of
+/// original fields share one imported source. The exact budget moves with any metadata
+/// accounting change and must then be re-measured against the previous behaviour.
 #[test]
 fn tool_history_metadata_need() {
-    const NEED: usize = 753_788;
+    const NEED: usize = 742_788;
     assert!(fits(30, NEED), "30 rounds no longer fit in {NEED} bytes");
     assert!(!fits(30, NEED - 1), "30 rounds now fit in less than {NEED} bytes");
 }
