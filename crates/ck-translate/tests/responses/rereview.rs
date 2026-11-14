@@ -37,3 +37,9 @@ fn closing_snapshots_merge_nested_and_opaque_members() {
         json!({"type":"future_content","text":"opaque","vendor":2})
     );
 }
+
+#[test]
+fn empty_arrays_first_supplied_at_close_keep_their_presence() {
+    let done = json!({"type":"output_text","text":"hi","annotations":[],"logprobs":[]});
+    assert_eq!(closed_part(json!({"type":"output_text","text":""}), done.clone()), done);
+}

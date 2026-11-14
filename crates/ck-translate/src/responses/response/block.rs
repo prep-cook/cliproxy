@@ -252,7 +252,9 @@ impl State {
                     |_| Ok(()),
                 )?;
             }
-            super::super::snapshot::append_array(&mut item.doc, value, "annotations", tail)?;
+            if tail.node(tail.root())?.first.is_some() {
+                super::super::snapshot::append_array(&mut item.doc, value, "annotations", tail)?;
+            }
         }
         Ok(())
     }
@@ -335,8 +337,9 @@ impl State {
 }
 
 /// The members of snapshot `part` that the published block value lacks or holds with another
-/// value. A mapped block's text, refusal, annotations and logprobs travel as content instead;
-/// an opaque block maps none of its members.
+/// value. A mapped block's text, refusal, annotations and logprobs travel as content instead,
+/// except an empty array the block lacks, which carries only presence; an opaque block maps
+/// none of its members.
 fn late_attributes(
     owner: &mut Writer,
     stored: &Document,
@@ -350,14 +353,17 @@ fn late_attributes(
         let mut first = true;
         for field in doc.children(part)? {
             let name = doc.node(field)?.name.ok_or(Error::Schema)?;
+            let started = stored_member(stored, value, doc, name)?;
             let mut known = false;
             for content in ["text", "refusal", "annotations", "logprobs"] {
                 known |= !block.opaque && doc.name_is(name, content)?;
             }
-            if known {
+            let presence =
+                started.is_none() && matches!(doc.node(field)?.value, Value::Array) && doc.node(field)?.first.is_none();
+            if known && !(presence && (doc.name_is(name, "annotations")? || doc.name_is(name, "logprobs")?)) {
                 continue;
             }
-            if let Some(started) = stored_member(stored, value, doc, name)?
+            if let Some(started) = started
                 && super::super::snapshot::equal(stored, started, doc, field)?
             {
                 continue;
