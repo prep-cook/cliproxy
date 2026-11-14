@@ -4,15 +4,16 @@ use crate::codec::{
     document::{Document, Name, Value},
     encode::{self, Encoder},
     event::{Emitter, Identity, Kind, Scope},
-    json,
     media::Registry,
 };
 use ck_stream::{ScratchLease, Writer};
 
+#[path = "request_input.rs"]
+mod input;
+
 pub struct Ingress {
     owner: u64,
-    document: Document,
-    scanner: Option<json::Scanner>,
+    input: input::Input,
     media: Registry,
     emitter: Emitter,
     reader: ck_stream::Reader,
@@ -33,8 +34,7 @@ impl Ingress {
         }
         Ok(Self {
             owner: owner.id(),
-            document: Document::streaming(owner)?,
-            scanner: Some(json::Scanner::new(owner, limit)?),
+            input: input::Input::new(owner, limit)?,
             media: Registry::new(owner)?,
             emitter: Emitter::new(identity),
             reader: store.reader(owner.id(), 0)?,
@@ -44,29 +44,28 @@ impl Ingress {
         })
     }
     fn prepare(&mut self, owner: &mut Writer) -> Result<()> {
-        let mut scanner = self.scanner.take().ok_or(Error::Closed)?;
-        scanner.finish(self.document.input())?;
-        let root = self.document.import_completed(&scanner, 0)?;
-        self.document.transplant(self.document.root(), root)?;
-        normalize(&mut self.document, owner, self.operation)?;
-        super::content::register(&mut self.document, owner, &mut self.media)?;
+        self.input.pending.finish()?;
+        self.input.consume(
+            owner,
+            &mut self.media,
+            &mut self.emitter,
+            &mut self.reader,
+            self.operation,
+        )?;
+        let document = &mut self.input.pending.document;
+        self.media.validate_registrations(document, 0)?;
+        normalize(document, owner, self.operation)?;
+        self.media.relocate_ingress(document, 0)?;
+        super::content::register(document, owner, &mut self.media)?;
+        self.media.relocate_ingress(document, 0)?;
         validate(RequestView {
-            document: &self.document,
+            document,
             media: &self.media,
             operation: self.operation,
         })?;
-        self.emitter.request_start(
-            owner,
-            RequestView {
-                document: &self.document,
-                media: &self.media,
-                operation: self.operation,
-            },
-        )?;
-        codec::internal::next(owner, &mut self.reader)?;
-        let root = self.document.root();
+        let root = document.root();
         publish_fields(
-            &mut self.document,
+            document,
             root,
             &mut [None; 128],
             (0, &self.media),
@@ -74,17 +73,17 @@ impl Ingress {
             owner,
             &mut self.reader,
         )?;
-        for index in 0..self.media.len() {
+        for index in self.input.published_media..self.media.len() {
             codec::media::publish(
-                &self.document,
+                document,
                 self.media.at(index),
                 &mut self.emitter,
                 owner,
                 Scope::default(),
             )?;
-            self.media.retain(&mut self.document, index, owner, &mut self.reader)?;
+            self.media.retain(document, index, owner, &mut self.reader)?;
         }
-        self.document.retire_scratch()
+        document.retire_scratch()
     }
 }
 impl codec::RequestIngress for Ingress {
@@ -101,11 +100,26 @@ impl codec::RequestIngress for Ingress {
             return Err(Error::Closed);
         }
         let result = (|| {
-            self.document.push_input(owner, bytes)?;
-            self.scanner
-                .as_mut()
-                .ok_or(Error::Closed)?
-                .advance(self.document.input())
+            for bytes in bytes.chunks(8192) {
+                self.input.pending.advance(owner, bytes)?;
+                self.input.consume(
+                    owner,
+                    &mut self.media,
+                    &mut self.emitter,
+                    &mut self.reader,
+                    self.operation,
+                )?;
+            }
+            if bytes.is_empty() {
+                self.input.consume(
+                    owner,
+                    &mut self.media,
+                    &mut self.emitter,
+                    &mut self.reader,
+                    self.operation,
+                )?;
+            }
+            Ok(())
         })();
         if let Err(error) = result {
             self.closed = true;
@@ -131,7 +145,7 @@ impl codec::RequestIngress for Ingress {
             return Err(error);
         }
         let view = RequestView {
-            document: &self.document,
+            document: &self.input.pending.document,
             media: &self.media,
             operation: self.operation,
         };
@@ -226,7 +240,7 @@ fn normalize(doc: &mut Document, owner: &mut Writer, operation: Operation) -> Re
         doc.bind_origin(message, instructions, Some("responses.instructions"))?;
     }
     if let Some(input) = doc.remove(root, "input")? {
-        if matches!(doc.node(input)?.value, Value::String(_)) {
+        if matches!(doc.node(input)?.value, Value::String(_) | Value::Utf8Media) {
             let m = doc.add(None, Value::Object)?;
             doc.append(messages, m)?;
             doc.set(m, "role", Value::Text("user"))?;
@@ -708,6 +722,38 @@ fn publish_fields(
     if depth == path.len() {
         return Err(Error::Limit);
     }
+    publish_field(doc, node, &path[..depth], media, emitter, owner, reader)?;
+    if media.get(doc, node)?.is_some() {
+        return Ok(());
+    }
+    let mut next = doc.node(node)?.first;
+    let array = matches!(doc.node(node)?.value, Value::Array);
+    let mut index = 0;
+    while let Some(child) = next {
+        next = doc.node(child)?.next;
+        path[depth] = Some(if array {
+            Component::Index(index)
+        } else {
+            Component::Name(doc.node(child)?.name.ok_or(Error::Schema)?)
+        });
+        publish_fields(doc, child, path, (depth + 1, media), emitter, owner, reader)?;
+        index += 1;
+    }
+    Ok(())
+}
+
+fn publish_field(
+    doc: &mut Document,
+    node: usize,
+    path: &[Option<Component>],
+    media: &Registry,
+    emitter: &mut Emitter,
+    owner: &mut Writer,
+    reader: &mut ck_stream::Reader,
+) -> Result<()> {
+    if doc.published(node)? {
+        return Ok(());
+    }
     let registered = media.get(doc, node)?;
     emitter.emit(
         owner,
@@ -715,7 +761,7 @@ fn publish_fields(
         Scope::default(),
         |e| {
             e.bytes(b",\"pointer\":\"")?;
-            for part in path[..depth].iter().flatten() {
+            for part in path.iter().flatten() {
                 e.bytes(b"/")?;
                 match part {
                     Component::Index(i) => e.unsigned(*i)?,
@@ -745,22 +791,7 @@ fn publish_fields(
     )?;
     let (_, event) = codec::internal::next(owner, reader)?;
     doc.bind_field(node, event)?;
-    if registered.is_some() {
-        return Ok(());
-    }
-    let mut next = doc.node(node)?.first;
-    let array = matches!(doc.node(node)?.value, Value::Array);
-    let mut index = 0;
-    while let Some(child) = next {
-        next = doc.node(child)?.next;
-        path[depth] = Some(if array {
-            Component::Index(index)
-        } else {
-            Component::Name(doc.node(child)?.name.ok_or(Error::Schema)?)
-        });
-        publish_fields(doc, child, path, (depth + 1, media), emitter, owner, reader)?;
-        index += 1;
-    }
+    doc.mark_published(node);
     Ok(())
 }
 

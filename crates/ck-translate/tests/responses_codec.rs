@@ -1,5 +1,7 @@
 #[path = "responses/golden.rs"]
 mod golden;
+#[path = "responses/incremental.rs"]
+mod incremental;
 #[path = "responses/recordings.rs"]
 mod recordings;
 // Test-only inclusion until the framework owner declares the production module.

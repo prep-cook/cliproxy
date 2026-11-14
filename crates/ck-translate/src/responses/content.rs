@@ -32,6 +32,17 @@ pub(super) fn register(doc: &mut Document, owner: &mut Writer, registry: &mut Re
             } else {
                 continue;
             };
+            if let Some(media) = registry.get(doc, data)?
+                && !matches!(media.encoding, Encoding::Utf8)
+            {
+                doc.rename(data, "ref")?;
+                doc.set(source, "kind", Value::Text("data"))?;
+                if let Some(mime) = media.mime {
+                    doc.rename(mime, "mime")?;
+                    doc.append(p, mime)?;
+                }
+                continue;
+            }
             let mut chars = doc.chars(data)?;
             let mut prefix = true;
             for expected in "data:".chars() {
