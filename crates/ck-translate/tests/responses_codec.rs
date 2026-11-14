@@ -18,6 +18,8 @@ mod golden;
 mod incremental;
 #[path = "responses/media.rs"]
 mod media;
+#[path = "responses/metadata.rs"]
+mod metadata;
 #[path = "responses/recordings.rs"]
 mod recordings;
 #[path = "responses/request.rs"]

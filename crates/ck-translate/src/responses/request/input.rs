@@ -37,6 +37,12 @@ impl Input {
         })
     }
 
+    /// The document the input built; dropping the rest releases the wire scanner and the wire
+    /// node map.
+    pub fn into_document(self) -> Document {
+        self.pending.document
+    }
+
     /// Deadline of the oldest collected fragment; set when collection starts, so later input
     /// never postpones it.
     pub fn deadline(&self) -> Option<Instant> {
