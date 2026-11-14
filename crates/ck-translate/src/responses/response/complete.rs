@@ -9,7 +9,7 @@ impl State {
                 .member(root, "error")?
                 .is_some_and(|n| !matches!(doc.node(n).map(|n| n.value), Ok(Value::Null)))
         {
-            return Err(Error::Schema);
+            return self.fail(owner, doc, root);
         }
         if let Some(status) = doc.member(root, "status")?
             && !doc.string_is(status, "completed")?
@@ -68,6 +68,27 @@ impl State {
             .emit(owner, Kind::Done, Scope::default(), |_| Ok(()), |_| Ok(()))?;
         self.terminal = true;
         Ok(())
+    }
+
+    /// Publishes what failed response `root` may tell the client, its identity, usage and the
+    /// members other than its status, error and output, then fails the stream. Egress writes a
+    /// sanitized error in place of the source's (crates/AGENTS.md, Security).
+    pub(super) fn fail(&mut self, owner: &mut Writer, doc: &Document, root: usize) -> Result<()> {
+        if !matches!(doc.node(root)?.value, Value::Object) {
+            return Err(Error::Schema);
+        }
+        self.lifecycle(owner, doc, root)?;
+        self.emitter.emit(
+            owner,
+            Kind::Opaque,
+            Scope::default(),
+            |e| {
+                e.bytes(b",\"name\":\"responses.response\",\"format\":\"json\",\"value\":")?;
+                object(doc, root, &["output", "usage", "audio", "status", "error"], e)
+            },
+            |_| Ok(()),
+        )?;
+        Err(Error::Schema)
     }
 
     fn complete_audio(&mut self, owner: &mut Writer, doc: &Document, root: usize) -> Result<()> {

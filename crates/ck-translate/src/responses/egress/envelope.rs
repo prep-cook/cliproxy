@@ -8,6 +8,9 @@ impl<F: FnMut(&'static str, u64)> Egress<F> {
         owner: &mut Writer,
         output: &mut impl FnMut(ScratchLease) -> Result<()>,
     ) -> Result<()> {
+        // A stream that fails before its start still opens with `response.created`.
+        self.owed |= self.sequence == 0;
+        self.created(owner, output)?;
         self.terminal = true;
         let doc = &mut self.document;
         let root = doc.root();

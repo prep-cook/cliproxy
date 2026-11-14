@@ -106,8 +106,9 @@ fn opaque_summary_parts_raise_no_text_events() {
     }
 }
 
-/// Client bytes for Responses `input` whose ingress fails; egress still ends the response.
-fn failing(input: &[u8], mode: BodyMode, downstream: BodyMode) -> Vec<u8> {
+/// Client bytes and canonical records for Responses `input` whose ingress fails; egress still
+/// ends the response.
+fn failing(input: &[u8], mode: BodyMode, downstream: BodyMode) -> (Vec<u8>, Vec<Value>) {
     let mut m = Mapped::new();
     let mut ingress = responses::response::Ingress::new(
         &mut m.writer,
@@ -140,7 +141,7 @@ fn failing(input: &[u8], mode: BodyMode, downstream: BodyMode) -> Vec<u8> {
             .unwrap();
     }
     egress.finish().unwrap();
-    out
+    (out, events(&m))
 }
 
 const FAILED: &str = r#"{"id":"r","model":"m","created_at":123,"status":"failed","output":[],
@@ -160,8 +161,40 @@ fn failed_response(out: &[u8], downstream: BodyMode) -> Value {
 }
 
 #[test]
+fn failed_responses_keep_their_identity_and_usage() {
+    let failed: Value = serde_json::from_str(FAILED).unwrap();
+    let first = format!("data: {}\n\n", json!({"type":"response.failed","response":failed}));
+    let created =
+        json!({"type":"response.created","response":{"id":"r","model":"m","status":"in_progress","output":[]}});
+    let later = format!("data: {created}\n\n{first}");
+    for downstream in [BodyMode::Buffered, BodyMode::Streaming] {
+        for (input, mode) in [
+            (FAILED, BodyMode::Buffered),
+            (first.as_str(), BodyMode::Streaming),
+            (later.as_str(), BodyMode::Streaming),
+        ] {
+            let (out, canonical) = failing(input.as_bytes(), mode, downstream);
+            assert!(!format!("{canonical:?}").contains("SENSITIVE"));
+            let response = failed_response(&out, downstream);
+            for name in ["id", "model", "created_at", "usage"] {
+                assert_eq!(response[name], failed[name], "{name} {input}");
+            }
+            assert_eq!(response["status"], "failed");
+        }
+    }
+    // A stream that fails before it starts still opens with `response.created`.
+    let (out, _) = failing(
+        b"event: response.output_text.delta\ndata: x\n\n",
+        BodyMode::Streaming,
+        BodyMode::Streaming,
+    );
+    let types: Vec<_> = client_events(&out).iter().map(|e| e["type"].clone()).collect();
+    assert_eq!(types, ["response.created", "response.failed"]);
+}
+
+#[test]
 fn failures_carry_the_native_server_error_code() {
-    let out = failing(FAILED.as_bytes(), BodyMode::Buffered, BodyMode::Buffered);
+    let (out, _) = failing(FAILED.as_bytes(), BodyMode::Buffered, BodyMode::Buffered);
     let response: Value = serde_json::from_slice(&out).unwrap();
     assert_eq!(
         response["error"],

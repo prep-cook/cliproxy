@@ -241,7 +241,10 @@ impl State {
             return Ok(());
         };
         match class {
-            Class::Failure => Err(Error::Schema),
+            Class::Failure => match doc.member(root, "response")? {
+                Some(response) => self.fail(owner, &doc, response),
+                None => Err(Error::Schema),
+            },
             Class::Terminal => {
                 let response = doc.required(root, "response")?;
                 self.start(owner, Some((&doc, response)))?;
@@ -321,7 +324,7 @@ impl State {
     }
 
     /// Restores the response identity, and publishes usage reported before the terminal event.
-    fn lifecycle(&mut self, owner: &mut Writer, doc: &Document, response: usize) -> Result<()> {
+    pub(super) fn lifecycle(&mut self, owner: &mut Writer, doc: &Document, response: usize) -> Result<()> {
         self.start(owner, Some((doc, response)))?;
         if let Some(usage) = doc.member(response, "usage")? {
             self.usage.update(owner, doc, usage)?;
