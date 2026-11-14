@@ -1,4 +1,7 @@
-use super::Table;
+use super::{Table, is, mapped, member, object, string};
+
+mod block;
+mod envelope;
 use crate::codec::{
     self, BodyMode, Error, Operation, Result,
     document::{Document, Value},
@@ -147,7 +150,7 @@ impl Egress {
         let Some(source) = doc.member(x, "source")? else {
             return Ok(());
         };
-        if !super::is(doc, source, "protocol", "anthropic")? {
+        if !is(doc, source, "protocol", "anthropic")? {
             return Ok(());
         }
         let Some(fields) = doc.member(source, "sse")? else {
@@ -157,7 +160,7 @@ impl Egress {
         if !lost && let Some(original) = doc.member(x, "original")? {
             let finish = doc.member(x, "native_finish_reason")?.is_some();
             for entry in doc.children(original)? {
-                if !super::is(doc, entry, "protocol", "anthropic")? {
+                if !is(doc, entry, "protocol", "anthropic")? {
                     continue;
                 }
                 let mut pointer = doc.chars(doc.required(entry, "pointer")?)?;
@@ -211,320 +214,21 @@ impl Egress {
                 self.base = Some(doc);
             }
             Kind::ItemStart | Kind::ItemEnd | Kind::Heartbeat => {}
-            Kind::BlockStart => {
-                if self.finish.is_some() {
-                    return Err(Error::Schema);
-                }
-                let item = local(&doc, doc.required(x, "item_id")?)?;
-                let canonical = doc.unsigned(doc.required(x, "block_index")?)?;
-                if self.blocks.iter().any(|b| b.item == item && b.canonical == canonical) {
-                    return Err(Error::Schema);
-                }
-                let native = if super::is(&doc, root, "kind", "text")? {
-                    "text"
-                } else if super::is(&doc, root, "kind", "thinking")? || super::is(&doc, root, "kind", "reasoning")? {
-                    "thinking"
-                } else if super::is(&doc, root, "kind", "redacted")? {
-                    "redacted_thinking"
-                } else if super::is(&doc, root, "kind", "function")? {
-                    "tool_use"
-                } else if super::is(&doc, root, "kind", "server")? {
-                    "server_tool_use"
-                } else if super::is(&doc, root, "kind", "tool_result")? {
-                    "tool_result"
-                } else {
-                    "opaque"
-                };
-                let mut body = super::mapped(owner, |e| {
-                    if let Some(attrs) = doc.member(root, "attributes")? {
-                        super::object(&doc, attrs, &["type"], e)
-                    } else {
-                        e.bytes(b"{}")
-                    }
-                })?;
-                let body_root = body.root();
-                if matches!(native, "tool_result" | "server_tool_use")
-                    && let Some(attrs) = doc.member(root, "attributes")?
-                    && let Some(kind) = doc.member(attrs, "type")?
-                {
-                    let from = body.absorb(super::mapped(owner, |e| doc.write(kind, e))?)?;
-                    copy_value(&mut body, body_root, "type", from)?;
-                } else {
-                    body.set(body_root, "type", Value::Text(native))?;
-                }
-                for (k, field) in [("text", "text"), ("thinking", "thinking")] {
-                    if native == k {
-                        body.set(body_root, field, Value::Fragments)?;
-                    }
-                }
-                let index = self.blocks.len() as u64;
-                self.blocks.push(Block {
-                    item,
-                    canonical,
-                    index,
-                    document: body,
-                    open: true,
-                    started: false,
-                    tool: None,
-                    explicit_block: true,
-                    start_origin: Some(doc),
-                })?;
-                if matches!(native, "text" | "thinking") {
-                    self.start_block(owner, index as usize, output)?;
-                }
-            }
-            Kind::ToolStart => {
-                let index = self.find_or_tool(owner, &doc, x)?;
-                let block = &mut self.blocks[index];
-                if block.tool.is_some() {
-                    return Err(Error::Schema);
-                }
-                block.tool = Some(doc.unsigned(doc.required(x, "tool_index")?)?);
-                let body = &mut block.document;
-                let from = body.absorb(doc)?;
-                let x = body.required(from, "x_ck")?;
-                let id = if let Some(source) = body.member(x, "source")? {
-                    if let Some(ids) = body.member(source, "ids")? {
-                        body.member(ids, "id")?.or(body.member(ids, "call_id")?)
-                    } else {
-                        None
-                    }
-                } else {
-                    None
-                };
-                if let Some(id) = id {
-                    copy_value(body, body.root(), "id", id)?;
-                } else {
-                    let id = local(body, body.required(x, "tool_call_id")?)?;
-                    body.set(body.root(), "id", Value::Id(id))?;
-                }
-                let name = body.required(from, "name")?;
-                copy_value(body, body.root(), "name", name)?;
-                if super::is(body, from, "kind", "server")? && super::is(body, body.root(), "type", "tool_use")? {
-                    body.set(body.root(), "type", Value::Text("server_tool_use"))?;
-                }
-                if !super::is(body, from, "arguments_format", "json")? {
-                    return Err(Error::Unsupported);
-                }
-                self.start_block(owner, index, output)?;
-            }
-            Kind::Chunk => {
-                // Source metadata can replace a synthetic response.start after a heartbeat.
-                if !self.started && metadata_changed(self.base.as_ref().ok_or(Error::Schema)?, &doc)? {
-                    let base = self.base.as_mut().ok_or(Error::Schema)?;
-                    let update = super::mapped(owner, |e| {
-                        e.bytes(b"{")?;
-                        for (i, key) in ["id", "model", "created"].iter().enumerate() {
-                            if i != 0 {
-                                e.bytes(b",")?;
-                            }
-                            e.string(key)?;
-                            e.bytes(b":")?;
-                            if let Some(n) = doc.member(root, key)? {
-                                doc.write(n, e)?;
-                            } else {
-                                base.write(base.required(base.root(), key)?, e)?;
-                            }
-                        }
-                        super::member(base, base.root(), "x_ck", e)?;
-                        e.bytes(b"}")
-                    })?;
-                    *base = update;
-                }
-                let choices = doc.required(root, "choices")?;
-                let mut finished = false;
-                for choice_node in doc.children(choices)? {
-                    let index = doc.unsigned(doc.required(choice_node, "index")?)?;
-                    if index != 0 {
-                        self.drop_event(kind, Some(index), "single-choice destination selects index zero");
-                        continue;
-                    }
-                    let delta = doc.required(choice_node, "delta")?;
-                    for (field, native, delta_kind) in [
-                        ("content", "text", "text_delta"),
-                        ("reasoning_content", "thinking", "thinking_delta"),
-                        ("refusal", "text", "text_delta"),
-                    ] {
-                        if let Some(value) = doc.member(delta, field)?
-                            && !matches!(doc.node(value)?.value, Value::Null)
-                        {
-                            let index = self.find_or_text(owner, &doc, x, native, output)?;
-                            self.fragment(owner, &doc, value, index, (native, delta_kind), output)?;
-                        }
-                    }
-                    if let Some(calls) = doc.member(delta, "tool_calls")? {
-                        for call in doc.children(calls)? {
-                            let tool = doc.unsigned(doc.required(call, "index")?)?;
-                            let index = self
-                                .blocks
-                                .iter()
-                                .position(|b| b.tool == Some(tool) && b.open)
-                                .ok_or(Error::Schema)?;
-                            let function = doc.required(call, "function")?;
-                            if let Some(args) = doc.member(function, "arguments")? {
-                                self.fragment(owner, &doc, args, index, ("partial_json", "input_json_delta"), output)?;
-                            }
-                        }
-                    }
-                    if let Some(reason) = doc.member(choice_node, "finish_reason")?
-                        && !matches!(doc.node(reason)?.value, Value::Null)
-                    {
-                        finished = true;
-                        if self.finish.is_some() || self.blocks.iter().any(|b| b.open) {
-                            return Err(Error::Schema);
-                        }
-                        self.finish = Some(super::mapped(owner, |e| {
-                            e.bytes(b"{\"stop_reason\":")?;
-                            let native = doc.member(x, "native_finish_reason")?;
-                            let anthropic = match doc.member(x, "source")? {
-                                Some(s) => super::is(&doc, s, "protocol", "anthropic")?,
-                                None => false,
-                            };
-                            if anthropic && let Some(native) = native {
-                                doc.write(native, e)?;
-                            } else {
-                                e.string(if doc.string_is(reason, "length")? {
-                                    "max_tokens"
-                                } else if doc.string_is(reason, "tool_calls")? {
-                                    "tool_use"
-                                } else if doc.string_is(reason, "content_filter")? {
-                                    "refusal"
-                                } else {
-                                    "end_turn"
-                                })?;
-                            }
-                            if let Some(source) = doc.member(x, "source")?
-                                && super::is(&doc, source, "event", "message_delta")?
-                            {
-                                original_members_at(&doc, x, "/delta", e)?;
-                            } else {
-                                original_members(&doc, x, e)?;
-                            }
-                            e.bytes(b"}")
-                        })?);
-                        self.begin(owner, output)?;
-                    }
-                    if doc.member(choice_node, "logprobs")?.is_some() {
-                        self.drop_event(kind, Some(0), "Anthropic has no logprobs carrier");
-                    }
-                }
-                if let Some(source) = doc.member(x, "source")?
-                    && super::is(&doc, source, "protocol", "anthropic")?
-                {
-                    if super::is(&doc, source, "event", "message_start")? {
-                        if self.mode == BodyMode::Streaming {
-                            self.start_origin = Some(doc);
-                        }
-                    } else if super::is(&doc, source, "event", "message_delta")? {
-                        if finished && self.mode == BodyMode::Streaming {
-                            self.finish_origin = Some(doc);
-                            self.finish_delta(owner, output)?;
-                        } else if self.mode == BodyMode::Streaming {
-                            self.begin(owner, output)?;
-                            output(native_event(owner, "message_delta", Some(&doc), |e| {
-                                e.bytes(b",\"delta\":{")?;
-                                original_members_with_separator(&doc, x, "/delta", false, e)?;
-                                e.bytes(b"}")?;
-                                if let Some(usage) = &self.usage {
-                                    e.bytes(b",\"usage\":")?;
-                                    write_usage(usage, e)?;
-                                }
-                                original_members(&doc, x, e)
-                            })?)?;
-                        }
-                    }
-                }
-            }
-            Kind::ReasoningSignature => {
-                if !super::is(&doc, root, "kind", "anthropic")? {
-                    self.drop_event(
-                        kind,
-                        choice,
-                        "foreign encrypted or signed reasoning has no Anthropic carrier",
-                    );
-                    return Ok(());
-                }
-                let index = self.find(&doc, x)?;
-                self.fragment(
-                    owner,
-                    &doc,
-                    doc.required(root, "fragment")?,
-                    index,
-                    ("signature", "signature_delta"),
-                    output,
-                )?;
-            }
-            Kind::ToolResult => {
-                let index = self.find(&doc, x)?;
-                let body = &mut self.blocks[index].document;
-                let from = body.absorb(doc)?;
-                copy_value(body, body.root(), "content", body.required(from, "value")?)?;
-                if let Some(error) = body.member(from, "is_error")? {
-                    copy_value(body, body.root(), "is_error", error)?;
-                }
-                let x = body.required(from, "x_ck")?;
-                let source = body.required(x, "source")?;
-                let ids = body.required(source, "ids")?;
-                copy_value(body, body.root(), "tool_use_id", body.required(ids, "tool_use_id")?)?;
-                self.start_block(owner, index, output)?;
-            }
-            Kind::ReasoningRedacted => {
-                let index = self.find(&doc, x)?;
-                let body = &mut self.blocks[index].document;
-                let from = body.absorb(doc)?;
-                copy_value(body, body.root(), "data", body.required(from, "data")?)?;
-                self.start_block(owner, index, output)?;
-            }
-            Kind::Annotation => {
-                let index = self.find(&doc, x)?;
-                let value = doc.required(root, "value")?;
-                let many = super::is(&doc, root, "kind", "citations")?;
-                if !many && !super::is(&doc, root, "kind", "citation")? {
-                    self.drop_event(kind, choice, "annotation has no native citation carrier");
-                    return Ok(());
-                }
-                if many {
-                    if self.mode == BodyMode::Buffered {
-                        let body = &mut self.blocks[index].document;
-                        if body.member(body.root(), "citations")?.is_none() {
-                            body.set(body.root(), "citations", Value::Array)?;
-                        }
-                    }
-                    for citation in doc.children(value)? {
-                        self.citation(owner, &doc, citation, index, output)?;
-                    }
-                } else {
-                    self.citation(owner, &doc, value, index, output)?;
-                }
-            }
-            Kind::ToolEnd => {
-                let index = self.find(&doc, x)?;
-                let body = &mut self.blocks[index].document;
-                if let Some(fragments) = body.remove(body.root(), "partial_json")? {
-                    let raw = encode::scratch(owner, |e| {
-                        for fragment in body.children(fragments)? {
-                            let mut chars = body.chars(fragment)?;
-                            while let Some(c) = chars.next_scalar()? {
-                                e.bytes(c.encode_utf8(&mut [0; 4]).as_bytes())?;
-                            }
-                        }
-                        Ok(())
-                    })?;
-                    let input = body.import_json(owner, raw)?;
-                    body.rename(input, "input")?;
-                    body.append(body.root(), input)?;
-                }
-                if !self.blocks[index].explicit_block {
-                    self.close_block(owner, index, None, output)?;
-                }
-            }
+            Kind::BlockStart => self.block_start(owner, doc, output)?,
+            Kind::ToolStart => self.tool_start(owner, doc, output)?,
+            Kind::Chunk => self.chunk(owner, doc, kind, output)?,
+            Kind::ReasoningSignature => self.signature(owner, doc, kind, choice, output)?,
+            Kind::ToolResult => self.tool_result(owner, doc, output)?,
+            Kind::ReasoningRedacted => self.redacted(owner, doc, output)?,
+            Kind::Annotation => self.annotation(owner, doc, kind, choice, output)?,
+            Kind::ToolEnd => self.tool_end(owner, doc, output)?,
             Kind::BlockEnd => {
                 let index = self.find(&doc, x)?;
                 self.close_block(owner, index, Some(&doc), output)?;
             }
             Kind::Usage => {
                 let usage = doc.required(root, "usage")?;
-                self.usage = Some(super::mapped(owner, |e| doc.write(usage, e))?);
+                self.usage = Some(mapped(owner, |e| doc.write(usage, e))?);
             }
             Kind::CountTokens => {
                 if self.operation != Operation::CountTokens || self.count.is_some() {
@@ -532,303 +236,12 @@ impl Egress {
                 }
                 self.count = Some(doc);
             }
-            Kind::Opaque => {
-                let source = doc.member(x, "source")?;
-                let native = source
-                    .map(|s| super::is(&doc, s, "protocol", "anthropic"))
-                    .transpose()?
-                    .unwrap_or(false);
-                if native && source.is_some_and(|s| super::is(&doc, s, "event", "content_block").unwrap_or(false)) {
-                    let index = self.find(&doc, x)?;
-                    self.blocks[index].document = super::mapped(owner, |e| doc.write(doc.required(root, "value")?, e))?;
-                    self.start_block(owner, index, output)?;
-                } else if native && self.mode == BodyMode::Streaming {
-                    let value = doc.required(root, "value")?;
-                    if matches!(doc.node(value)?.value, Value::Object)
-                        && super::is(&doc, value, "type", "content_block_delta")?
-                    {
-                        let index = self.find(&doc, x)?;
-                        output(native_event(owner, "content_block_delta", Some(&doc), |e| {
-                            e.bytes(b",\"index\":")?;
-                            e.unsigned(self.blocks[index].index)?;
-                            for field in doc.children(value)? {
-                                let name = doc.node(field)?.name.ok_or(Error::Schema)?;
-                                if doc.name_is(name, "type")? || doc.name_is(name, "index")? {
-                                    continue;
-                                }
-                                e.bytes(b",")?;
-                                doc.write_name(name, e)?;
-                                e.bytes(b":")?;
-                                doc.write(field, e)?;
-                            }
-                            Ok(())
-                        })?)?;
-                    } else {
-                        output(encode::scratch(owner, |e| write_opaque(&doc, x, e))?)?;
-                    }
-                } else {
-                    self.drop_event(kind, choice, "opaque event has no native buffered carrier");
-                }
-            }
-            Kind::Done => {
-                if self.operation == Operation::CountTokens {
-                    let count = self.count.as_ref().ok_or(Error::Schema)?;
-                    output(encode::scratch(owner, |e| {
-                        e.bytes(b"{\"input_tokens\":")?;
-                        count.write(count.required(count.root(), "input_tokens")?, e)?;
-                        original_members(count, count.required(count.root(), "x_ck")?, e)?;
-                        e.bytes(b"}")
-                    })?)?;
-                } else {
-                    if self.finish.is_none() || self.blocks.iter().any(|b| b.open) {
-                        return Err(Error::Truncated);
-                    }
-                    self.begin(owner, output)?;
-                    if self.mode == BodyMode::Streaming {
-                        self.finish_delta(owner, output)?;
-                        output(native_event(owner, "message_stop", Some(&doc), |e| {
-                            original_members(&doc, x, e)
-                        })?)?;
-                    } else {
-                        output(encode::scratch(owner, |e| self.buffered(e))?)?;
-                    }
-                }
-                self.terminal = true;
-            }
-            Kind::Error | Kind::Cancelled => {
-                if self.mode == BodyMode::Streaming {
-                    output(event(owner, "error", |e| {
-                        e.bytes(b",\"error\":{\"type\":\"api_error\",\"message\":\"Response failed\"}")
-                    })?)?;
-                } else {
-                    output(encode::scratch(owner, |e| {
-                        e.bytes(
-                            b"{\"type\":\"error\",\"error\":{\"type\":\"api_error\",\"message\":\"Response failed\"}}",
-                        )
-                    })?)?;
-                }
-                self.terminal = true;
-            }
+            Kind::Opaque => self.opaque(owner, doc, kind, choice, output)?,
+            Kind::Done => self.done(owner, doc, output)?,
+            Kind::Error | Kind::Cancelled => self.error(owner, output)?,
             _ => self.drop_event(kind, choice, "event has no Anthropic response carrier"),
         }
         Ok(())
-    }
-    fn find(&self, doc: &Document, x: usize) -> Result<usize> {
-        let item = local(doc, doc.required(x, "item_id")?)?;
-        if let Some(index) = doc.member(x, "block_index")? {
-            let index = doc.unsigned(index)?;
-            self.blocks
-                .iter()
-                .position(|b| b.item == item && b.canonical == index && b.open)
-                .ok_or(Error::Schema)
-        } else if let Some(tool) = doc.member(x, "tool_index")? {
-            let tool = doc.unsigned(tool)?;
-            self.blocks
-                .iter()
-                .position(|b| b.item == item && b.tool == Some(tool) && b.open)
-                .ok_or(Error::Schema)
-        } else {
-            Err(Error::Schema)
-        }
-    }
-    fn find_or_tool(&mut self, owner: &mut Writer, doc: &Document, x: usize) -> Result<usize> {
-        if doc.member(x, "block_index")?.is_some() {
-            return self.find(doc, x);
-        }
-        let index = self.blocks.len();
-        self.blocks.push(Block {
-            item: local(doc, doc.required(x, "item_id")?)?,
-            canonical: u64::MAX - index as u64,
-            index: index as u64,
-            document: super::mapped(owner, |e| e.bytes(b"{\"type\":\"tool_use\"}"))?,
-            open: true,
-            started: false,
-            tool: None,
-            explicit_block: false,
-            start_origin: None,
-        })?;
-        Ok(index)
-    }
-    fn find_or_text(
-        &mut self,
-        owner: &mut Writer,
-        doc: &Document,
-        x: usize,
-        native: &'static str,
-        output: &mut impl FnMut(ScratchLease) -> Result<()>,
-    ) -> Result<usize> {
-        if doc.member(x, "block_index")?.is_some() {
-            return self.find(doc, x);
-        }
-        let item = local(doc, doc.required(x, "item_id")?)?;
-        if let Some(index) = self.blocks.iter().position(|b| {
-            b.item == item && b.open && super::is(&b.document, b.document.root(), "type", native).unwrap_or(false)
-        }) {
-            return Ok(index);
-        }
-        let index = self.blocks.len();
-        let mut body = super::mapped(owner, |e| e.bytes(b"{}"))?;
-        body.set(body.root(), "type", Value::Text(native))?;
-        body.set(body.root(), native, Value::Fragments)?;
-        self.blocks.push(Block {
-            item,
-            canonical: u64::MAX - index as u64,
-            index: index as u64,
-            document: body,
-            open: true,
-            started: false,
-            tool: None,
-            explicit_block: false,
-            start_origin: None,
-        })?;
-        self.start_block(owner, index, output)?;
-        Ok(index)
-    }
-    fn start_block(
-        &mut self,
-        owner: &mut Writer,
-        index: usize,
-        output: &mut impl FnMut(ScratchLease) -> Result<()>,
-    ) -> Result<()> {
-        self.begin(owner, output)?;
-        let block = &mut self.blocks[index];
-        if block.started {
-            return Ok(());
-        }
-        let origin = block.start_origin.take();
-        if self.mode == BodyMode::Streaming {
-            output(native_event(owner, "content_block_start", origin.as_ref(), |e| {
-                e.bytes(b",\"index\":")?;
-                e.unsigned(block.index)?;
-                e.bytes(b",\"content_block\":")?;
-                super::object(&block.document, block.document.root(), &["partial_json"], e)?;
-                if let Some(doc) = &origin {
-                    original_members(doc, doc.required(doc.root(), "x_ck")?, e)?;
-                }
-                Ok(())
-            })?)?;
-        }
-        block.started = true;
-        Ok(())
-    }
-    fn close_block(
-        &mut self,
-        owner: &mut Writer,
-        index: usize,
-        origin: Option<&Document>,
-        output: &mut impl FnMut(ScratchLease) -> Result<()>,
-    ) -> Result<()> {
-        self.start_block(owner, index, output)?;
-        let block = &mut self.blocks[index];
-        if !block.open {
-            return Err(Error::Schema);
-        }
-        block.open = false;
-        if self.mode == BodyMode::Streaming {
-            output(native_event(owner, "content_block_stop", origin, |e| {
-                e.bytes(b",\"index\":")?;
-                e.unsigned(block.index)?;
-                if let Some(doc) = origin {
-                    original_members(doc, doc.required(doc.root(), "x_ck")?, e)?;
-                }
-                Ok(())
-            })?)?;
-        }
-        Ok(())
-    }
-    fn fragment(
-        &mut self,
-        owner: &mut Writer,
-        doc: &Document,
-        value: usize,
-        index: usize,
-        (field, delta): (&'static str, &'static str),
-        output: &mut impl FnMut(ScratchLease) -> Result<()>,
-    ) -> Result<()> {
-        super::string(doc, value)?;
-        self.start_block(owner, index, output)?;
-        let block = &mut self.blocks[index];
-        if self.mode == BodyMode::Streaming {
-            output(native_event(owner, "content_block_delta", Some(doc), |e| {
-                e.bytes(b",\"index\":")?;
-                e.unsigned(block.index)?;
-                e.bytes(b",\"delta\":{\"type\":")?;
-                e.string(delta)?;
-                e.bytes(b",")?;
-                e.string(field)?;
-                e.bytes(b":")?;
-                doc.write(value, e)?;
-                let x = doc.required(doc.root(), "x_ck")?;
-                original_members_at(doc, x, "/delta", e)?;
-                e.bytes(b"}")?;
-                original_members(doc, x, e)
-            })?)?;
-        }
-        // Tool JSON still needs validation at its end; other streamed payloads need no second state copy.
-        if self.mode == BodyMode::Buffered || field == "partial_json" {
-            let incoming = super::mapped(owner, |e| doc.write(value, e))?;
-            let fragment = block.document.absorb(incoming)?;
-            let root = block.document.root();
-            let fragments = match block.document.member(root, field)? {
-                Some(n) => n,
-                None => block.document.set(root, field, Value::Fragments)?,
-            };
-            block.document.append(fragments, fragment)?;
-        }
-        Ok(())
-    }
-    fn citation(
-        &mut self,
-        owner: &mut Writer,
-        doc: &Document,
-        value: usize,
-        index: usize,
-        output: &mut impl FnMut(ScratchLease) -> Result<()>,
-    ) -> Result<()> {
-        if self.mode == BodyMode::Streaming {
-            let block = &self.blocks[index];
-            output(event(owner, "content_block_delta", |e| {
-                e.bytes(b",\"index\":")?;
-                e.unsigned(block.index)?;
-                e.bytes(b",\"delta\":{\"type\":\"citations_delta\",\"citation\":")?;
-                doc.write(value, e)?;
-                e.bytes(b"}")
-            })?)?;
-        } else {
-            let incoming = super::mapped(owner, |e| doc.write(value, e))?;
-            let body = &mut self.blocks[index].document;
-            let value = body.absorb(incoming)?;
-            let array = match body.member(body.root(), "citations")? {
-                Some(n) => n,
-                None => body.set(body.root(), "citations", Value::Array)?,
-            };
-            body.append(array, value)?;
-        }
-        Ok(())
-    }
-    fn buffered(&self, e: &mut Encoder<'_, '_>) -> Result<()> {
-        e.bytes(b"{")?;
-        write_base(self.base.as_ref().ok_or(Error::Schema)?, e)?;
-        e.bytes(b",\"content\":[")?;
-        for (index, block) in self.blocks.iter().enumerate() {
-            if index != 0 {
-                e.bytes(b",")?;
-            }
-            super::object(&block.document, block.document.root(), &["partial_json"], e)?;
-        }
-        e.bytes(b"]")?;
-        let finish = self.finish.as_ref().ok_or(Error::Schema)?;
-        for field in finish.children(finish.root())? {
-            e.bytes(b",")?;
-            finish.write_name(finish.node(field)?.name.ok_or(Error::Schema)?, e)?;
-            e.bytes(b":")?;
-            finish.write(field, e)?;
-        }
-        if let Some(usage) = &self.usage {
-            e.bytes(b",\"usage\":")?;
-            write_usage(usage, e)?;
-        }
-        e.bytes(b"}")
     }
 }
 impl codec::ResponseEgress for Egress {
@@ -903,7 +316,7 @@ fn native_event(
 }
 
 fn native_sse_fields(doc: &Document, source: usize, e: &mut Encoder<'_, '_>) -> Result<()> {
-    if !super::is(doc, source, "protocol", "anthropic")? {
+    if !is(doc, source, "protocol", "anthropic")? {
         return Ok(());
     }
     if let Some(fields) = doc.member(source, "sse")? {
@@ -924,7 +337,7 @@ fn native_sse_fields(doc: &Document, source: usize, e: &mut Encoder<'_, '_>) -> 
 fn write_base(doc: &Document, e: &mut Encoder<'_, '_>) -> Result<()> {
     e.bytes(b"\"type\":\"message\",\"role\":\"assistant\"")?;
     for key in ["id", "model"] {
-        super::member(doc, doc.root(), key, e)?;
+        member(doc, doc.root(), key, e)?;
     }
     if let Some(x) = doc.member(doc.root(), "x_ck")? {
         original_members(doc, x, e)?;
@@ -934,7 +347,7 @@ fn write_base(doc: &Document, e: &mut Encoder<'_, '_>) -> Result<()> {
 fn write_usage(doc: &Document, e: &mut Encoder<'_, '_>) -> Result<()> {
     let root = doc.root();
     if let Some(native) = doc.member(root, "native")?
-        && super::is(doc, native, "protocol", "anthropic")?
+        && is(doc, native, "protocol", "anthropic")?
     {
         return doc.write(doc.required(native, "value")?, e);
     }
@@ -973,7 +386,7 @@ fn original_members_with_separator(
 ) -> Result<()> {
     if let Some(original) = doc.member(x, "original")? {
         'entry: for entry in doc.children(original)? {
-            if !super::is(doc, entry, "protocol", "anthropic")? {
+            if !is(doc, entry, "protocol", "anthropic")? {
                 continue;
             }
             let pointer = doc.required(entry, "pointer")?;
@@ -1025,7 +438,7 @@ fn write_opaque(doc: &Document, x: usize, e: &mut Encoder<'_, '_>) -> Result<()>
     native_sse_fields(doc, source, e)?;
     e.bytes(b"data: ")?;
     let value = doc.required(doc.root(), "value")?;
-    if super::is(doc, doc.root(), "format", "text")? {
+    if is(doc, doc.root(), "format", "text")? {
         raw_string(doc, value, e, true)?;
     } else {
         doc.write(value, e)?;
