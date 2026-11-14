@@ -134,7 +134,7 @@ fn history_signatures_tools_sampling_modalities_and_unknowns() {
 #[test]
 fn every_part_signature_choice_and_finish_survives_all_encodings() {
     use gemini::response::Framing::*;
-    let body = json!({"responseId":"r","modelVersion":"gemini","createTime":"2026-11-14T00:00:00.123Z","candidates":[{"index":7,"content":{"role":"model","parts":[{"text":"first"},{"text":"second"},{"text":"think","thought":true,"thoughtSignature":"sig\n/=="},{"thoughtSignature":"only=="},{"functionCall":{"id":"call","name":"f","args":{"a":[1,null]}}}]},"groundingMetadata":{"chunks":[{"x":1}]},"urlContextMetadata":{"urls":["x"]},"safetyRatings":[],"finishReason":"STOP"},{"index":0,"content":{"role":"model","parts":[{"text":"zero"}]},"finishReason":"MAX_TOKENS"}],"usageMetadata":{"promptTokenCount":0,"candidatesTokenCount":4,"thoughtsTokenCount":2,"totalTokenCount":6,"cachedContentTokenCount":null,"future":{"ttl":{"300":4}}},"unknown":{"x_ck":true}});
+    let body = json!({"responseId":"r","modelVersion":"gemini","createTime":"2026-11-14T00:00:00.123Z","candidates":[{"index":7,"content":{"role":"model","parts":[{"text":"first"},{"text":"second"},{"text":"think","thought":true,"thoughtSignature":"sig\n/=="},{"thoughtSignature":"only=="},{"functionCall":{"id":"call","name":"f","args":{"a":[1,null]}}},{"executableCode":{"language":"PYTHON","code":"print(1)"}},{"codeExecutionResult":{"outcome":"OUTCOME_OK","output":"1"}}]},"groundingMetadata":{"chunks":[{"x":1}]},"urlContextMetadata":{"urls":["x"]},"safetyRatings":[],"finishReason":"STOP"},{"index":0,"content":{"role":"model","parts":[{"text":"zero"}]},"finishReason":"MAX_TOKENS"}],"usageMetadata":{"promptTokenCount":0,"candidatesTokenCount":4,"thoughtsTokenCount":2,"totalTokenCount":6,"cachedContentTokenCount":null,"future":{"ttl":{"300":4}}},"unknown":{"x_ck":true}});
     for upstream in [Json, Sse, JsonArray] {
         for downstream in [Json, Sse, JsonArray] {
             let input = match upstream {
@@ -143,6 +143,10 @@ fn every_part_signature_choice_and_finish_survives_all_encodings() {
                 JsonArray => serde_json::to_vec(&json!([body])).unwrap(),
             };
             let (output, canonical) = response(&input, upstream, downstream, Operation::Generate);
+            if downstream == Json {
+                let raw = String::from_utf8(output.clone()).unwrap();
+                assert_eq!(raw.matches("\"responseId\"").count(), 1, "{raw}");
+            }
             let rows = match downstream {
                 Json => vec![serde_json::from_slice::<Value>(&output).unwrap()],
                 Sse => events(&output),

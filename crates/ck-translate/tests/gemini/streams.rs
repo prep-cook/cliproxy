@@ -9,7 +9,8 @@ fn long_streams_keep_egress_metadata_bounded() {
     let directory = std::env::temp_dir().join(format!("ck-gemini-{}", uuid::Uuid::new_v4()));
     let mut config = ck_stream::Config::new(directory.clone());
     config.workers = 1;
-    let mut store = ck_stream::Store::with_clock(config, std::sync::Arc::new(ck_stream::ManualClock::default())).unwrap();
+    let mut store =
+        ck_stream::Store::with_clock(config, std::sync::Arc::new(ck_stream::ManualClock::default())).unwrap();
     let mut writer = store.create().unwrap();
     let mut reader = store.reader(writer.id(), 0).unwrap();
     let mut ingress = gemini::response::Ingress::with_framing(
