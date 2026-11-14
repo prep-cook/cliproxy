@@ -51,7 +51,7 @@ fn unknown_sse_data_stays_opaque() {
         "data: {\"error\":{\"code\":\"x\"}}\n\n",
         "event: error\ndata: {\"code\":\"x\"}\n\n",
         "event: response.output_text.delta\ndata: not json\n\n",
-        "data: {\"type\":\"response.output_text.delta\",\"delta\":\"a\n\n",
+        "event: response.completed\ndata: {\"type\":\"response.completed\"\n\n",
     ] {
         assert!(before_completion(failing).is_err(), "{failing}");
     }

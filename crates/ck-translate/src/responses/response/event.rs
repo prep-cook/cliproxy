@@ -279,8 +279,8 @@ impl State {
         }
     }
 
-    /// Parses the event data. Non-JSON data of an unknown event becomes a text opaque record;
-    /// under a mapped name, or as an unnamed object that does not parse, it is invalid JSON.
+    /// Parses the event data. Non-JSON data under a mapped event name is invalid JSON; any other
+    /// non-JSON data, named or not, is valid SSE text and becomes a text opaque record (§3.7).
     fn parse(&mut self, owner: &mut Writer, source: &Source, event: &sse::Event) -> Result<Option<Document>> {
         let parsed = if event.data_len(source)? == 0 {
             Err(Error::Json)
@@ -296,14 +296,7 @@ impl State {
             Err(Error::Json | Error::Truncated) => {
                 let invalid = match event.name(source)? {
                     Some(name) => lookup(|known| source.equals(name, known.as_bytes()))?.is_some(),
-                    None => {
-                        let mut first = None;
-                        event.write_data(source, |b| {
-                            first = first.or_else(|| b.iter().copied().find(|c| !c.is_ascii_whitespace()));
-                            Ok(())
-                        })?;
-                        first == Some(b'{')
-                    }
+                    None => false,
                 };
                 if invalid {
                     return Err(Error::Json);

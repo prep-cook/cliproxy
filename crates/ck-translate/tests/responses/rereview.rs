@@ -2,6 +2,7 @@
 //! lifecycle a streaming client sees.
 use super::cross::client_events;
 use super::final_events::buffered_output;
+use super::final_review::try_raw;
 use super::final_review::try_streamed;
 use super::*;
 
@@ -102,6 +103,18 @@ fn opaque_summary_parts_raise_no_text_events() {
             assert_eq!(event["part"], part);
         }
         assert_eq!(events[5]["response"]["output"][0], item);
+    }
+}
+
+const COMPLETED: &str =
+    "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"r\",\"status\":\"completed\",\"output\":[]}}\n\n";
+
+#[test]
+fn unnamed_data_is_not_classified_by_its_first_byte() {
+    for data in ["{diagnostic}", "  {\"type\":\"response.output_text.delta\""] {
+        let (_, canonical) = try_raw(format!("data: {data}\n\n{COMPLETED}").as_bytes(), BodyMode::Buffered).unwrap();
+        let opaque: Vec<_> = canonical.iter().filter(|e| e["format"] == "text").collect();
+        assert_eq!(opaque[0]["value"], data);
     }
 }
 
