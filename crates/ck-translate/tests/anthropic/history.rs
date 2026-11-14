@@ -1,5 +1,5 @@
 use crate::codec::event::Direction;
-use crate::{Mapped, Operation, RequestIngress, anthropic, events, identity, json, request};
+use crate::{Mapped, Operation, RequestIngress, anthropic, assert_invalid_input, identity, json, request};
 
 #[test]
 fn server_and_mcp_history_preserve_semantic_results_and_native_order() {
@@ -84,7 +84,7 @@ fn unlinked_forward_and_wrong_kind_server_results_fail_the_fence() {
                 .is_err()
         );
         let raw = mapped.output(&mapped.writer);
-        assert_eq!(events(&raw).last().unwrap()["scope"], "client");
+        assert_invalid_input(&raw, "client");
         assert!(!std::str::from_utf8(&raw).unwrap().contains("event: x_ck.request.end\n"));
     }
 }

@@ -51,6 +51,14 @@ fn events(raw: &[u8]) -> Vec<Value> {
         .filter_map(|line| serde_json::from_str(line).ok())
         .collect()
 }
+/// Asserts that the last event is the boundary error the Chat codec also emits.
+fn assert_invalid_input(raw: &[u8], scope: &str) {
+    let error = events(raw).pop().unwrap();
+    assert_eq!(error["code"], "stream.invalid_input");
+    assert_eq!(error["status"], if scope == "client" { 400 } else { 502 });
+    assert_eq!(error["message"], "Invalid boundary input");
+    assert_eq!(error["scope"], scope);
+}
 fn request(input: &[u8], operation: Operation) -> (Value, Vec<Value>) {
     let whole = request_fragmented(input, operation, input.len());
     let fragmented = request_fragmented(input, operation, 7);

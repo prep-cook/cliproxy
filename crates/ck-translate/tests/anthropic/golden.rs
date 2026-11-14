@@ -2,8 +2,8 @@
 mod streams;
 
 use super::{
-    BodyMode, Direction, Mapped, Operation, RequestIngress, Value, anthropic, bytes, codec, events, identity, json,
-    request_fragmented, response,
+    BodyMode, Direction, Mapped, Operation, RequestIngress, Value, anthropic, assert_invalid_input, bytes, codec,
+    identity, json, request_fragmented, response,
 };
 use codec::{RequestEgress, ResponseIngress};
 
@@ -99,7 +99,7 @@ fn recorded_request_inputs_preserve_semantics_or_fail_the_source_schema() {
                 let text = std::str::from_utf8(&output).unwrap();
                 assert!(!text.contains("event: x_ck.request.end\n"), "{id}");
                 assert!(!text.contains("event: x_ck.done\n"), "{id}");
-                assert_eq!(events(&output).last().unwrap()["scope"], "client", "{id}");
+                assert_invalid_input(&output, "client");
             }
         }
     }
@@ -178,6 +178,7 @@ fn reject_response(raw: &[u8], operation: Operation, id: &str) {
     let output = std::str::from_utf8(&raw).unwrap();
     assert!(output.contains("event: x_ck.error\n"), "{id}");
     assert!(!output.contains("event: x_ck.done\n"), "{id}");
+    assert_invalid_input(&raw, "upstream");
 }
 
 #[test]

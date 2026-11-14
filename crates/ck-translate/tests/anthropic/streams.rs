@@ -1,5 +1,5 @@
 use super::{RESPONSES, anthropic, codec, identity, json};
-use crate::{BodyMode, Direction, Mapped, Operation, ResponseIngress, Value, response};
+use crate::{BodyMode, Direction, Mapped, Operation, ResponseIngress, Value, assert_invalid_input, response};
 use std::collections::BTreeMap;
 
 // These fixtures include adapter fragments, not just complete Messages streams.
@@ -174,6 +174,7 @@ fn every_recorded_native_sse_stream_obeys_lifecycle_and_preserves_payloads() {
                 } else {
                     assert!(!output.contains("event: x_ck.done\n"), "{id}");
                     assert!(output.contains("event: x_ck.error\n"), "{id}");
+                    assert_invalid_input(&raw, "upstream");
                 }
             }
         }

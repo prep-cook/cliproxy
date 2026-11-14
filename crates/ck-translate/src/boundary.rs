@@ -20,18 +20,18 @@ pub(crate) fn mapped(owner: &mut Writer, write: impl Fn(&mut Encoder<'_, '_>) ->
     Document::parse(owner, source, len)
 }
 
-/// Emits the sanitized terminal error for invalid client (400) or upstream (502) input.
+/// Emits the sanitized terminal error for invalid client (400) or upstream (502) input, with
+/// the code, status and message the Chat codec uses.
 pub(crate) fn failure(emitter: &mut Emitter, owner: &mut Writer, client: bool) -> Result<()> {
     emitter.emit(
         owner,
         Kind::Error,
         Scope::default(),
         |e| {
-            e.bytes(if client {
-                b",\"code\":\"invalid_request\",\"status\":400,\"message\":\"Invalid request\",\"scope\":\"client\""
-            } else {
-                b",\"code\":\"invalid_response\",\"status\":502,\"message\":\"Invalid upstream response\",\"scope\":\"upstream\""
-            })
+            e.bytes(b",\"code\":\"stream.invalid_input\",\"status\":")?;
+            e.unsigned(if client { 400 } else { 502 })?;
+            e.bytes(b",\"message\":\"Invalid boundary input\",\"scope\":")?;
+            e.string(if client { "client" } else { "upstream" })
         },
         |_| Ok(()),
     )?;
