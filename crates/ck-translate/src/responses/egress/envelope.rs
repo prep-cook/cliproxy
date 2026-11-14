@@ -40,6 +40,7 @@ impl<F: FnMut(&'static str, u64)> Egress<F> {
         let doc = &mut self.document;
         let target = doc.root();
         let node = doc.absorb(incoming)?;
+        self.id.start(doc, node)?;
         for (from, to) in [
             ("id", "id"),
             ("model", "model"),
@@ -139,8 +140,9 @@ impl<F: FnMut(&'static str, u64)> Egress<F> {
             let node = doc.absorb(incoming)?;
             let value = doc.required(node, "value")?;
             super::super::opaque::preserve_carrier_collision(doc, value)?;
-            // A client that has seen the response keeps its id for the whole response.
-            if self.sequence > 0 {
+            if let Some(id) = doc.member(value, "id")?
+                && !self.id.adopts(doc, id, self.sequence > 0)?
+            {
                 doc.remove(value, "id")?;
             }
             super::super::merge(doc, doc.root(), value)?;

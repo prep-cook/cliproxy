@@ -4,6 +4,7 @@ use crate::codec::{
     document::{Document, Value},
     encode::{self, Encoder},
     event::{Identity, Kind},
+    identity::ResponseId,
     internal,
     table::Table,
 };
@@ -24,6 +25,9 @@ pub struct Egress {
     terminal: bool,
     failed: bool,
     reduction: Reduction,
+    id: ResponseId,
+    /// A streamed record has shown the client the response id.
+    shown: bool,
     /// Streamed choice indexes and whether each delivered its finish.
     finishes: Table<(u64, bool)>,
     /// Choice and tool indexes of every started tool call without its end.
@@ -51,6 +55,8 @@ impl Egress {
             terminal: false,
             failed: false,
             reduction: Reduction::new(owner)?,
+            id: ResponseId::new("chatcmpl-", owner.id())?,
+            shown: false,
             finishes: Table::new(owner)?,
             open_tools: Table::new(owner)?,
             include_usage,
@@ -119,11 +125,12 @@ impl Egress {
         &mut self,
         owner: &mut Writer,
         kind: Kind,
-        doc: Document,
+        mut doc: Document,
         x: usize,
         output: &mut impl FnMut(ScratchLease) -> Result<()>,
     ) -> Result<()> {
         let root = doc.root();
+        self.response_id(kind, &mut doc)?;
         let deliverable = if kind == Kind::Chunk {
             if self.mode == BodyMode::Streaming {
                 self.reduction.refresh_metadata(owner, &doc)?;
@@ -159,9 +166,27 @@ impl Egress {
                     projection.write(projection.root(), e)?;
                     e.bytes(b"\n\n")
                 })?)?;
+                self.shown = true;
             }
         }
         Ok(())
+    }
+
+    /// Gives the start and each chunk the id the client sees under [`ResponseId`]'s rule.
+    fn response_id(&mut self, kind: Kind, doc: &mut Document) -> Result<()> {
+        let root = doc.root();
+        let supplied = match kind {
+            Kind::ResponseStart => self.id.start(doc, root)?.is_some(),
+            Kind::Chunk => match doc.member(root, "id")? {
+                Some(id) => self.id.adopts(doc, id, self.shown)?,
+                None => false,
+            },
+            _ => return Ok(()),
+        };
+        match self.id.issued() {
+            Some(issued) if !supplied => doc.set_id(root, "id", issued).map(drop),
+            _ => Ok(()),
+        }
     }
 
     /// Delivers a media attributes record as a native field, or another opaque record as its

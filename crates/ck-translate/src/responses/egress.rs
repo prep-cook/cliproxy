@@ -27,6 +27,7 @@ pub struct Egress<F: FnMut(&'static str, u64)> {
     owner: u64,
     mode: BodyMode,
     document: Document,
+    id: codec::identity::ResponseId,
     terminal: bool,
     sequence: u64,
     diagnostic: F,
@@ -46,11 +47,10 @@ impl<F: FnMut(&'static str, u64)> Egress<F> {
         if operation == Operation::CountTokens || (operation == Operation::Compact && mode == BodyMode::Streaming) {
             return Err(Error::Unsupported);
         }
-        // The response id when the source supplies none: generated here, never a source value.
-        let id = codec::identity::response_id("resp_", owner.id())?;
+        let id = codec::identity::ResponseId::new("resp_", owner.id())?;
         let document = super::mapped(owner, |e| {
             e.bytes(b"{\"id\":")?;
-            e.string(id.as_str())?;
+            e.string(id.issued().ok_or(Error::Schema)?.as_str())?;
             e.bytes(b",\"object\":")?;
             e.string(if operation == Operation::Compact {
                 "response.compaction"
@@ -63,6 +63,7 @@ impl<F: FnMut(&'static str, u64)> Egress<F> {
             owner: owner.id(),
             mode,
             document,
+            id,
             terminal: false,
             sequence: 0,
             diagnostic,

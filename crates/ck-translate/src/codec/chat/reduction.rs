@@ -3,8 +3,7 @@ use crate::codec::{
     Error, Result,
     document::{Document, Value},
     encode::{self, Encoder},
-    event::{Kind, LocalId},
-    identity,
+    event::Kind,
     table::Table,
 };
 use ck_stream::Writer;
@@ -22,9 +21,6 @@ struct Tool {
 /// Native topology shared by delivery and reconciliation; payloads remain leased.
 pub(super) struct Reduction {
     pub(super) document: Option<Document>,
-    /// The completion id this egress issued because the source supplied none; it replaces the
-    /// canonical id on every chunk.
-    own_id: Option<LocalId>,
     tools: Table<Tool>,
     media: Table<media_events::Projection>,
 }
@@ -33,7 +29,6 @@ impl Reduction {
     pub(super) fn new(owner: &mut Writer) -> Result<Self> {
         Ok(Self {
             document: None,
-            own_id: None,
             tools: Table::new(owner)?,
             media: Table::new(owner)?,
         })
@@ -47,15 +42,9 @@ impl Reduction {
     pub(super) fn refresh_metadata(&mut self, owner: &mut Writer, incoming: &Document) -> Result<()> {
         let current = self.document.as_ref().ok_or(Error::Schema)?;
         const FIELDS: [&str; 5] = ["id", "model", "created", "system_fingerprint", "service_tier"];
-        // An issued id stays for the whole response; a later canonical id does not replace it.
-        let own = self.own_id.is_some();
-        let supplied = |key: &str| match key {
-            "id" if own => Ok(None),
-            _ => incoming.member(incoming.root(), key),
-        };
         let mut changed = false;
         for key in FIELDS {
-            if let Some(value) = supplied(key)? {
+            if let Some(value) = incoming.member(incoming.root(), key)? {
                 changed |= match current.member(current.root(), key)? {
                     None => true,
                     Some(old) => match (current.node(old)?.value, incoming.node(value)?.value) {
@@ -73,7 +62,7 @@ impl Reduction {
         self.document = Some(mapped_document(owner, |e| {
             e.bytes(b"{\"object\":\"chat.completion\",\"choices\":[]")?;
             for key in FIELDS {
-                let supplied = supplied(key)?.map(|value| (incoming, value));
+                let supplied = incoming.member(incoming.root(), key)?.map(|value| (incoming, value));
                 let retained = current.member(current.root(), key)?.map(|value| (current, value));
                 if let Some((doc, value)) = supplied.or(retained) {
                     e.bytes(b",")?;
@@ -102,11 +91,6 @@ impl Reduction {
                 if self.document.is_some() {
                     return Err(Error::Schema);
                 }
-                if identity::supplied_id(&doc, root)?.is_none() {
-                    let id = identity::response_id("chatcmpl-", owner.id())?;
-                    doc.set_id(root, "id", id)?;
-                    self.own_id = Some(id);
-                }
                 doc.remove(root, "x_ck")?;
                 doc.set(root, "object", Value::Text("chat.completion"))?;
                 doc.set(root, "choices", Value::Array)?;
@@ -121,9 +105,6 @@ impl Reduction {
                     }
                 }
                 doc.remove(root, "x_ck")?;
-                if let Some(id) = self.own_id {
-                    doc.set_id(root, "id", id)?;
-                }
                 lost = !super::provenance::restore(&mut doc, x)?;
                 self.project_tools(&mut doc, x)?;
                 Some(doc)

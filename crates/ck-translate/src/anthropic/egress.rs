@@ -7,7 +7,8 @@ use crate::codec::{
     document::{Document, Value},
     encode::{self, Encoder},
     event::{Identity, Kind, LocalId},
-    identity, internal,
+    identity::ResponseId,
+    internal,
 };
 use ck_stream::{Lease, ScratchLease, Writer};
 
@@ -48,8 +49,7 @@ pub struct Egress {
     mode: BodyMode,
     sequence: u64,
     base: Option<Document>,
-    /// The base id was issued here because the source supplied none; it stays for the response.
-    own_id: bool,
+    id: ResponseId,
     blocks: Table<Block>,
     /// `blocks` positions by (item, block index) and by tool index, and `text_lists` positions
     /// by (item, kind).
@@ -86,7 +86,7 @@ impl Egress {
             mode,
             sequence: 0,
             base: None,
-            own_id: false,
+            id: ResponseId::new("msg_", owner.id())?,
             blocks: Table::new(owner)?,
             named: Index::new(owner)?,
             tools: Index::new(owner)?,
@@ -240,9 +240,8 @@ impl Egress {
                     return Err(Error::Schema);
                 }
                 let root = doc.root();
-                if identity::supplied_id(&doc, root)?.is_none() {
-                    doc.set_id(root, "id", identity::response_id("msg_", owner.id())?)?;
-                    self.own_id = true;
+                if self.id.start(&doc, root)?.is_none() {
+                    doc.set_id(root, "id", self.id.issued().ok_or(Error::Schema)?)?;
                 }
                 self.base = Some(doc);
             }
