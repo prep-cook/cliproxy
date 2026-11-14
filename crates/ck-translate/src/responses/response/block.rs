@@ -280,7 +280,11 @@ impl State {
             item.arguments = Some(field);
         }
         if snapshot && !item.tool_closed {
-            validate_arguments(owner, item)?;
+            let valid = match validate_arguments(owner, item) {
+                Ok(()) => true,
+                Err(Error::Json | Error::Truncated) if item.incomplete => false,
+                Err(error) => return Err(error),
+            };
             item.arguments_done = true;
             if item.server.is_some() {
                 return Ok(());
@@ -290,11 +294,16 @@ impl State {
                 Kind::ToolEnd,
                 item.scope(None),
                 |e| {
-                    e.bytes(if item.custom()? {
-                        b",\"status\":\"completed\""
+                    e.bytes(if item.incomplete {
+                        b",\"status\":\"incomplete\""
                     } else {
-                        b",\"status\":\"completed\",\"valid_json\":true"
-                    })
+                        b",\"status\":\"completed\""
+                    })?;
+                    if item.custom()? {
+                        return Ok(());
+                    }
+                    e.bytes(b",\"valid_json\":")?;
+                    e.bytes(if valid { b"true" } else { b"false" })
                 },
                 |_| Ok(()),
             )?;

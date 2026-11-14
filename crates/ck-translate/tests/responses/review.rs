@@ -128,3 +128,24 @@ fn tool_declarations_keep_order_and_unknown_fields() {
     let (output, _) = request(&input, Operation::Generate);
     assert_eq!(output["tools"], input["tools"]);
 }
+
+#[test]
+fn incomplete_calls_end_incomplete_with_their_arguments() {
+    for (arguments, valid) in [("{\"x\":", false), ("{}", true)] {
+        let input = json!({"id":"r","status":"incomplete","incomplete_details":{"reason":"max_output_tokens"},
+            "output":[{"id":"i","type":"function_call","call_id":"c","name":"f","arguments":arguments,"status":"incomplete"}]});
+        let (out, events) = response(
+            &serde_json::to_vec(&input).unwrap(),
+            BodyMode::Buffered,
+            BodyMode::Buffered,
+            Operation::Generate,
+        );
+        let end = events.iter().find(|e| e.get("valid_json").is_some()).unwrap();
+        assert_eq!(end["status"], "incomplete", "{end}");
+        assert_eq!(end["valid_json"], valid, "{end}");
+        let out: Value = serde_json::from_slice(&out).unwrap();
+        assert_eq!(out["status"], "incomplete");
+        assert_eq!(out["output"][0]["arguments"], arguments);
+        assert_eq!(out["output"][0]["status"], "incomplete");
+    }
+}

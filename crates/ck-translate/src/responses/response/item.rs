@@ -81,6 +81,7 @@ impl State {
             arguments: None,
             arguments_done: false,
             tool_closed: false,
+            incomplete: false,
             server,
             code: None,
             code_closed: false,
@@ -131,6 +132,7 @@ impl State {
         if self.items[at].server.is_some() {
             self.server_snapshot(owner, at, doc, node, close)?;
         } else if self.items[at].tool.is_some() {
+            self.items[at].incomplete = close && is(doc, node, "status", "incomplete")?;
             if let Some(arguments) = doc.member(node, if custom { "input" } else { "arguments" })? {
                 self.arguments(owner, at, doc, arguments, close)?;
             } else if close && !self.items[at].tool_closed {

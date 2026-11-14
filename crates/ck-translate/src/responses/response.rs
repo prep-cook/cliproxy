@@ -130,6 +130,8 @@ struct Item {
     arguments: Option<usize>,
     tool_closed: bool,
     arguments_done: bool,
+    /// The closing snapshot marks the call incomplete: its arguments may be cut off.
+    incomplete: bool,
     server: Option<Server>,
     code: Option<usize>,
     code_closed: bool,
