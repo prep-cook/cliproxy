@@ -201,12 +201,7 @@ fn tools(doc: &Document, root: usize, x: usize) -> Result<()> {
     for tool in doc.children(tools)? {
         if super::is(doc, tool, "type", "server")? {
             let declarations = doc.required(x, "tools")?;
-            if !doc.children(declarations)?.any(|entry| {
-                doc.origin(entry)
-                    .ok()
-                    .flatten()
-                    .is_some_and(|(parent, _)| parent == tool)
-            }) {
+            if super::request_encode::declaration(doc, declarations, tool)?.is_none() {
                 return Err(Error::Unsupported);
             }
         } else {

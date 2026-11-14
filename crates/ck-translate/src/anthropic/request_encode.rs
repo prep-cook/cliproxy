@@ -82,6 +82,13 @@ fn messages(view: RequestView<'_>, root: usize, e: &mut Encoder<'_, '_>) -> Resu
     let doc = view.document;
     e.bytes(b"\"messages\":[")?;
     let messages = doc.required(root, "messages")?;
+    let x = doc.required(root, "x_ck")?;
+    let unbound_replay = match doc.member(x, "replay")? {
+        Some(replay) => doc
+            .children(replay)?
+            .try_fold(false, |any, entry| Ok::<_, Error>(any || doc.origin(entry)?.is_none()))?,
+        None => false,
+    };
     let mut first_message = true;
     let mut system = None;
     for (message_index, message) in doc.children(messages)?.enumerate() {
@@ -96,12 +103,20 @@ fn messages(view: RequestView<'_>, root: usize, e: &mut Encoder<'_, '_>) -> Resu
             e.bytes(b",")?;
         }
         first_message = false;
-        message_value(view, message, message_index as u64, e)?;
+        let at = At {
+            message: message_index as u64,
+            unbound_replay,
+        };
+        message_value(view, message, at, e)?;
     }
     e.bytes(b"]")?;
-    if let Some((message_index, message)) = system {
+    if let Some((message, node)) = system {
         e.bytes(b",\"system\":")?;
-        content(view, doc.required(message, "content")?, message_index, e)?;
+        let at = At {
+            message,
+            unbound_replay,
+        };
+        content(view, doc.required(node, "content")?, at, e)?;
     }
     Ok(())
 }
@@ -161,10 +176,7 @@ fn tools(doc: &Document, root: usize, x: usize, e: &mut Encoder<'_, '_>) -> Resu
         }
         if super::is(doc, tool, "type", "server")? {
             let declarations = doc.required(x, "tools")?;
-            let entry = doc
-                .children(declarations)?
-                .find(|entry| doc.origin(*entry).ok().flatten().is_some_and(|(n, _)| n == tool))
-                .ok_or(Error::Schema)?;
+            let entry = declaration(doc, declarations, tool)?.ok_or(Error::Schema)?;
             let declaration = doc.required(entry, "declaration")?;
             e.bytes(b"{")?;
             for (index, field) in doc.children(declaration)?.enumerate() {
@@ -199,6 +211,15 @@ fn tools(doc: &Document, root: usize, x: usize, e: &mut Encoder<'_, '_>) -> Resu
     }
     e.bytes(b"]")?;
     Ok(())
+}
+/// The x_ck.tools entry bound to a server tool, found through the tool's own bindings.
+pub(super) fn declaration(doc: &Document, declarations: usize, tool: usize) -> Result<Option<usize>> {
+    for entry in doc.origins(tool)? {
+        if doc.node(entry)?.parent == Some(declarations) {
+            return Ok(Some(entry));
+        }
+    }
+    Ok(None)
 }
 fn tool_choice(doc: &Document, root: usize, e: &mut Encoder<'_, '_>) -> Result<()> {
     let choice = doc.member(root, "tool_choice")?;
@@ -236,7 +257,13 @@ fn tool_choice(doc: &Document, root: usize, e: &mut Encoder<'_, '_>) -> Result<(
     e.bytes(b"}")?;
     Ok(())
 }
-fn message_value(view: RequestView<'_>, message: usize, message_index: u64, e: &mut Encoder<'_, '_>) -> Result<()> {
+/// A message's position, and whether any replay entry is matched by position rather than binding.
+#[derive(Clone, Copy)]
+struct At {
+    message: u64,
+    unbound_replay: bool,
+}
+fn message_value(view: RequestView<'_>, message: usize, at: At, e: &mut Encoder<'_, '_>) -> Result<()> {
     let doc = view.document;
     e.bytes(b"{\"role\":")?;
     let tool_result = super::is(doc, message, "role", "tool")?;
@@ -251,7 +278,7 @@ fn message_value(view: RequestView<'_>, message: usize, message_index: u64, e: &
         doc.write(doc.required(message, "tool_call_id")?, e)?;
         if let Some(value) = doc.member(message, "content")? {
             e.bytes(b",\"content\":")?;
-            content(view, value, message_index, e)?;
+            content(view, value, at, e)?;
         }
         e.bytes(b"}]")?;
     } else if let Some(calls) = doc.member(message, "tool_calls")? {
@@ -291,13 +318,13 @@ fn message_value(view: RequestView<'_>, message: usize, message_index: u64, e: &
             } else {
                 let node = part.ok_or(Error::Schema)?;
                 part = doc.node(node)?.next;
-                part_value(view, node, message_index, block_index, e)?;
+                part_value(view, node, at, block_index, e)?;
             }
             block_index += 1;
         }
         e.bytes(b"]")?;
     } else if let Some(value) = doc.member(message, "content")? {
-        content(view, value, message_index, e)?;
+        content(view, value, at, e)?;
     } else {
         e.bytes(b"[]")?;
     }
@@ -336,7 +363,7 @@ fn tool_call(doc: &Document, call: usize, e: &mut Encoder<'_, '_>) -> Result<()>
     originals(doc, call, e)?;
     e.bytes(b"}")
 }
-fn content(view: RequestView<'_>, node: usize, message_index: u64, e: &mut Encoder<'_, '_>) -> Result<()> {
+fn content(view: RequestView<'_>, node: usize, at: At, e: &mut Encoder<'_, '_>) -> Result<()> {
     let doc = view.document;
     if !matches!(doc.node(node)?.value, Value::Array) {
         return doc.write(node, e);
@@ -346,17 +373,11 @@ fn content(view: RequestView<'_>, node: usize, message_index: u64, e: &mut Encod
         if index != 0 {
             e.bytes(b",")?;
         }
-        part_value(view, part, message_index, index as u64, e)?;
+        part_value(view, part, at, index as u64, e)?;
     }
     e.bytes(b"]")
 }
-fn part_value(
-    view: RequestView<'_>,
-    part: usize,
-    message_index: u64,
-    block_index: u64,
-    e: &mut Encoder<'_, '_>,
-) -> Result<()> {
+fn part_value(view: RequestView<'_>, part: usize, at: At, block_index: u64, e: &mut Encoder<'_, '_>) -> Result<()> {
     let doc = view.document;
     let kind = doc.required(part, "type")?;
     if doc.string_is(kind, "opaque")? {
@@ -369,15 +390,20 @@ fn part_value(
         doc.write(doc.required(part, "text")?, e)?;
         let x = doc.required(doc.root(), "x_ck")?;
         if let Some(replay) = doc.member(x, "replay")? {
-            for entry in doc.children(replay)? {
-                let bound = if let Some((parent, _)) = doc.origin(entry)? {
-                    parent == part
-                } else {
-                    doc.unsigned(doc.required(entry, "message_index")?)? == message_index
-                        && doc.unsigned(doc.required(entry, "block_index")?)? == block_index
-                };
-                if bound {
+            for entry in doc.origins(part)? {
+                if doc.node(entry)?.parent == Some(replay) {
                     super::member(doc, entry, "signature", e)?;
+                }
+            }
+            // Imported documents carry no bindings; their entries match by position.
+            if at.unbound_replay {
+                for entry in doc.children(replay)? {
+                    if doc.origin(entry)?.is_none()
+                        && doc.unsigned(doc.required(entry, "message_index")?)? == at.message
+                        && doc.unsigned(doc.required(entry, "block_index")?)? == block_index
+                    {
+                        super::member(doc, entry, "signature", e)?;
+                    }
                 }
             }
         }
@@ -405,7 +431,7 @@ fn part_value(
                 let item = doc.node(value)?.first.ok_or(Error::Schema)?;
                 doc.write(doc.required(item, "value")?, e)?;
             } else {
-                content(view, value, message_index, e)?;
+                content(view, value, at, e)?;
             }
         }
         super::member(doc, part, "is_error", e)?;
@@ -462,11 +488,14 @@ fn media_source(view: RequestView<'_>, part: usize, kind: usize, e: &mut Encoder
 }
 fn shape(doc: &Document, parent: usize, expected: &str) -> Result<bool> {
     let x = doc.required(doc.root(), "x_ck")?;
-    if let Some(original) = doc.member(x, "original")? {
-        for entry in doc.children(original)? {
-            if doc.origin(entry)? == Some((parent, Some("shape"))) {
-                return doc.string_is(doc.required(entry, "value")?, expected);
-            }
+    let original = doc.member(x, "original")?;
+    // Provenance bound to this node, not the whole original list.
+    for entry in doc.origins(parent)? {
+        if original.is_some()
+            && doc.node(entry)?.parent == original
+            && doc.origin(entry)? == Some((parent, Some("shape")))
+        {
+            return doc.string_is(doc.required(entry, "value")?, expected);
         }
     }
     Ok(false)
@@ -475,8 +504,9 @@ fn originals(doc: &Document, parent: usize, e: &mut Encoder<'_, '_>) -> Result<(
     let x = doc.required(doc.root(), "x_ck")?;
     for field in ["original", "cache_control"] {
         if let Some(original) = doc.member(x, field)? {
-            for entry in doc.children(original)? {
-                if doc.origin(entry)? != Some((parent, None)) {
+            // Provenance bound to this node, not the whole list.
+            for entry in doc.origins(parent)? {
+                if doc.node(entry)?.parent != Some(original) || doc.origin(entry)? != Some((parent, None)) {
                     continue;
                 }
                 let pointer = doc.required(entry, "pointer")?;

@@ -321,6 +321,19 @@ fn messages(owner: &mut Writer, doc: &mut Document, root: usize) -> Result<()> {
         super::content::normalize(owner, doc, message, message_index)?;
         message_index += 1;
     }
+    // A redacted block records its replay entry's position, counted in one pass.
+    let replay = doc.required(doc.required(doc.root(), "x_ck")?, "replay")?;
+    let mut next = doc.node(replay)?.first;
+    let mut index = 0;
+    while let Some(entry) = next {
+        next = doc.node(entry)?.next;
+        if let Some((part, _)) = doc.origin(entry)?
+            && super::is(doc, part, "type", "redacted")?
+        {
+            doc.set(part, "replay_index", Value::Unsigned(index))?;
+        }
+        index += 1;
+    }
     Ok(())
 }
 /// Keeps server tools as opaque declarations and maps custom tools to Chat functions.

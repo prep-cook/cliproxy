@@ -140,9 +140,8 @@ fn normalize_part(
     } else if doc.string_is(kind, "redacted_thinking")? {
         doc.replace(kind, Value::Text("redacted"))?;
         super::string(doc, doc.required(part, "data")?)?;
-        let replay_index = doc.children(doc.required(x, "replay")?)?.count() as u64;
+        // request::normalize assigns replay_index once every entry exists.
         replay(doc, part, message_index, block_index, "anthropic")?;
-        doc.set(part, "replay_index", Value::Unsigned(replay_index))?;
     } else if doc.string_is(kind, "image")? || doc.string_is(kind, "document")? {
         media_part(owner, doc, part, original)?;
     } else if doc.string_is(kind, "tool_result")? || super::server_result(doc, part)? {
