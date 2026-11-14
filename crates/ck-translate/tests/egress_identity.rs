@@ -444,3 +444,55 @@ fn chat_source_without_an_id_gets_native_ids() {
     let canonical = run(Source::Chat, &input, Client::Anthropic, BodyMode::Buffered).canonical;
     assert!(canonical.contains("\"synthetic\":[\"id\"]"), "{canonical}");
 }
+
+/// The review's Chat stream: a first chunk with `first` as its id when given, then a finish
+/// chunk with another id and model.
+fn chat_stream_with_ids(first: Option<&str>) -> Vec<u8> {
+    let mut opening = json!({"model":"m","created":5,"choices":[{"index":0,"delta":{"role":"assistant","content":"hi"},"finish_reason":null}]});
+    if let Some(first) = first {
+        opening["id"] = json!(first);
+    }
+    let finish = json!({"id":"chatcmpl_second","model":"m2","created":6,"choices":[{"index":0,"delta":{},"finish_reason":"stop"}]});
+    format!("data: {opening}\n\ndata: {finish}\n\ndata: [DONE]\n\n").into_bytes()
+}
+
+#[test]
+fn chat_stream_keeps_the_first_source_id_it_showed() {
+    let streamed = run(
+        Source::Chat,
+        &chat_stream_with_ids(Some("chatcmpl_first")),
+        Client::Chat,
+        BodyMode::Streaming,
+    );
+    let chunks = chunks(&streamed.output);
+    assert!(chunks.iter().all(|chunk| chunk["id"] == "chatcmpl_first"), "{chunks:?}");
+    assert_eq!(chunks.last().unwrap()["model"], "m2");
+}
+
+#[test]
+fn responses_buffered_body_takes_a_source_id_from_a_later_chunk() {
+    let input = chat_stream_with_ids(None);
+    let chat = run(Source::Chat, &input, Client::Chat, BodyMode::Buffered);
+    let chat: Value = serde_json::from_slice(&chat.output).unwrap();
+    let responses = run(Source::Chat, &input, Client::Responses, BodyMode::Buffered);
+    let responses: Value = serde_json::from_slice(&responses.output).unwrap();
+    assert_eq!((&chat["id"], &chat["model"]), (&json!("chatcmpl_second"), &json!("m2")));
+    assert_eq!((&responses["id"], &responses["model"]), (&chat["id"], &chat["model"]));
+}
+
+#[test]
+fn responses_body_takes_an_anthropic_message_identity_after_a_ping() {
+    let input = anthropic_stream(true, Some("msg_real"));
+    let buffered = run(Source::Anthropic, &input, Client::Responses, BodyMode::Buffered);
+    let body: Value = serde_json::from_slice(&buffered.output).unwrap();
+    assert_eq!((&body["id"], &body["model"]), (&json!("msg_real"), &json!("claude")));
+    let streamed = run(Source::Anthropic, &input, Client::Responses, BodyMode::Streaming);
+    let events = data(&streamed.output);
+    // `response.created` follows the ping, so the client keeps the issued id; the model refreshes.
+    let responses: Vec<_> = events.iter().filter_map(|event| event.get("response")).collect();
+    assert!(responses.len() > 1, "{events:?}");
+    for response in &responses {
+        assert_eq!(response["id"], format!("resp_s{}", streamed.writer), "{response}");
+    }
+    assert_eq!(responses.last().unwrap()["model"], "claude");
+}

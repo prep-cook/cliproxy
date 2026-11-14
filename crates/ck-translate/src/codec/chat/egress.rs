@@ -130,7 +130,7 @@ impl Egress {
         output: &mut impl FnMut(ScratchLease) -> Result<()>,
     ) -> Result<()> {
         let root = doc.root();
-        self.response_id(kind, &mut doc)?;
+        self.response_id(owner, kind, &mut doc)?;
         let deliverable = if kind == Kind::Chunk {
             if self.mode == BodyMode::Streaming {
                 self.reduction.refresh_metadata(owner, &doc)?;
@@ -172,21 +172,38 @@ impl Egress {
         Ok(())
     }
 
-    /// Gives the start and each chunk the id the client sees under [`ResponseId`]'s rule.
-    fn response_id(&mut self, kind: Kind, doc: &mut Document) -> Result<()> {
+    /// Gives the start and each chunk the id the client sees under [`ResponseId`]'s rule. A chunk
+    /// whose id the rule rejects, or that has none, carries the selected id, issued or adopted.
+    fn response_id(&mut self, owner: &mut Writer, kind: Kind, doc: &mut Document) -> Result<()> {
         let root = doc.root();
-        let supplied = match kind {
-            Kind::ResponseStart => self.id.start(doc, root)?.is_some(),
-            Kind::Chunk => match doc.member(root, "id")? {
-                Some(id) => self.id.adopts(doc, id, self.shown)?,
-                None => false,
-            },
+        match kind {
+            Kind::ResponseStart => {
+                if self.id.start(doc, root)?.is_none() {
+                    doc.set_id(root, "id", self.id.issued().ok_or(Error::Schema)?)?;
+                }
+                return Ok(());
+            }
+            Kind::Chunk => {}
             _ => return Ok(()),
-        };
-        match self.id.issued() {
-            Some(issued) if !supplied => doc.set_id(root, "id", issued).map(drop),
-            _ => Ok(()),
         }
+        let current = self.reduction.document.as_ref().ok_or(Error::Schema)?;
+        let selected = current.required(current.root(), "id")?;
+        if let Some(id) = doc.member(root, "id")?
+            && (super::response::equal(current, selected, doc, id)? || self.id.adopts(doc, id, self.shown)?)
+        {
+            return Ok(());
+        }
+        if let Some(issued) = self.id.issued() {
+            return doc.set_id(root, "id", issued).map(drop);
+        }
+        let copy = super::response::mapped_document(owner, |e| {
+            e.bytes(b"{\"id\":")?;
+            current.write(selected, e)?;
+            e.bytes(b"}")
+        })?;
+        let copy = doc.absorb(copy)?;
+        let target = doc.set(root, "id", Value::Null)?;
+        doc.transplant(target, doc.required(copy, "id")?)
     }
 
     /// Delivers a media attributes record as a native field, or another opaque record as its

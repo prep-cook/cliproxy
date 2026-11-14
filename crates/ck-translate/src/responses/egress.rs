@@ -133,7 +133,7 @@ impl<F: FnMut(&'static str, u64)> Egress<F> {
             (self.diagnostic)("unsupported event", 0);
             return Ok(());
         }
-        let node = self.document.absorb(incoming)?;
+        let node = self.absorb(kind, incoming)?;
         if kind == Kind::MediaStart && is(&self.document, node, "kind", "audio")? {
             return self.audio_start(node);
         }

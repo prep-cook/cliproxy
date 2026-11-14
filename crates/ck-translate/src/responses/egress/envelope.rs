@@ -58,6 +58,28 @@ impl<F: FnMut(&'static str, u64)> Egress<F> {
         Ok(())
     }
 
+    /// Absorbs a canonical record. A chunk's root `model` replaces the response's, and its `id`
+    /// does under [`codec::identity::ResponseId`]'s rule.
+    pub(super) fn absorb(&mut self, kind: Kind, incoming: Document) -> Result<usize> {
+        let node = self.document.absorb(incoming)?;
+        if kind != Kind::Chunk {
+            return Ok(node);
+        }
+        let doc = &mut self.document;
+        let root = doc.root();
+        if let Some(id) = doc.member(node, "id")?
+            && self.id.adopts(doc, id, self.sequence > 0)?
+        {
+            let target = doc.set(root, "id", Value::Null)?;
+            doc.transplant(target, id)?;
+        }
+        if let Some(model) = doc.member(node, "model")? {
+            let target = doc.set(root, "model", Value::Null)?;
+            doc.transplant(target, model)?;
+        }
+        Ok(node)
+    }
+
     /// Publishes the owed `response.created` with the response as it stands. Every event other
     /// than a heartbeat, usage, start, opaque record or chunk calls it before its own output; a
     /// chunk with output follows the start of its item, and the finish chunk writes nothing.
