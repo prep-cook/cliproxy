@@ -153,26 +153,7 @@ impl codec::RequestEgress for Egress {
 }
 fn normalize(owner: &mut Writer, doc: &mut Document, operation: Operation) -> Result<()> {
     let root = doc.root();
-    let collision = doc.remove(root, "x_ck")?;
-    let x = doc.set(root, "x_ck", Value::Object)?;
-    doc.set(x, "v", Value::Unsigned(1))?;
-    doc.set(x, "original_protocol", Value::Text("anthropic"))?;
-    doc.set(
-        x,
-        "operation",
-        Value::Text(if operation == Operation::Generate {
-            "generate"
-        } else {
-            "count_tokens"
-        }),
-    )?;
-    let original = doc.set(x, "original", Value::Array)?;
-    doc.set(x, "replay", Value::Array)?;
-    doc.set(x, "cache_control", Value::Array)?;
-    doc.set(x, "anthropic_order", Value::Array)?;
-    if let Some(node) = collision {
-        preserve(owner, doc, original, root, node, None)?;
-    }
+    let (x, original) = envelope(owner, doc, operation)?;
     capture(
         owner,
         doc,
@@ -202,6 +183,70 @@ fn normalize(owner: &mut Writer, doc: &mut Document, operation: Operation) -> Re
         ],
         original,
     )?;
+    let (provider, native) = controls(doc, root, x)?;
+    super::content::cache(owner, doc, root)?;
+    messages(owner, doc, root)?;
+    tools(owner, doc, root, x, original)?;
+    tool_choice(owner, doc, root, original)?;
+    capture(
+        owner,
+        doc,
+        root,
+        &[
+            "x_ck",
+            "model",
+            "messages",
+            "tools",
+            "tool_choice",
+            "parallel_tool_calls",
+            "stream",
+            "max_tokens",
+            "temperature",
+            "top_p",
+            "stop",
+            "metadata",
+            "service_tier",
+            "response_format",
+        ],
+        original,
+    )?;
+    if doc.node(native)?.first.is_none() {
+        doc.remove(provider, "anthropic")?;
+    }
+    if doc.node(provider)?.first.is_none() {
+        doc.remove(x, "provider_parameters")?;
+    }
+    Ok(())
+}
+/// Replaces `x_ck` with the canonical envelope, keeping a client `x_ck` as original data;
+/// returns the envelope and its `original` array.
+fn envelope(owner: &mut Writer, doc: &mut Document, operation: Operation) -> Result<(usize, usize)> {
+    let root = doc.root();
+    let collision = doc.remove(root, "x_ck")?;
+    let x = doc.set(root, "x_ck", Value::Object)?;
+    doc.set(x, "v", Value::Unsigned(1))?;
+    doc.set(x, "original_protocol", Value::Text("anthropic"))?;
+    doc.set(
+        x,
+        "operation",
+        Value::Text(if operation == Operation::Generate {
+            "generate"
+        } else {
+            "count_tokens"
+        }),
+    )?;
+    let original = doc.set(x, "original", Value::Array)?;
+    doc.set(x, "replay", Value::Array)?;
+    doc.set(x, "cache_control", Value::Array)?;
+    doc.set(x, "anthropic_order", Value::Array)?;
+    if let Some(node) = collision {
+        preserve(owner, doc, original, root, node, None)?;
+    }
+    Ok((x, original))
+}
+/// Renames `stop_sequences` and moves thinking, output and Anthropic-only controls into
+/// `x_ck`; returns the `provider_parameters` object and its `anthropic` member.
+fn controls(doc: &mut Document, root: usize, x: usize) -> Result<(usize, usize)> {
     if let Some(stop) = doc.member(root, "stop_sequences")? {
         doc.rename(stop, "stop")?;
     }
@@ -247,7 +292,10 @@ fn normalize(owner: &mut Writer, doc: &mut Document, operation: Operation) -> Re
         }
         doc.append(native, output)?;
     }
-    super::content::cache(owner, doc, root)?;
+    Ok((provider, native))
+}
+/// Prepends `system` as a system message and normalizes every message.
+fn messages(owner: &mut Writer, doc: &mut Document, root: usize) -> Result<()> {
     let messages = doc.required(root, "messages")?;
     if !matches!(doc.node(messages)?.value, Value::Array) {
         return Err(Error::Schema);
@@ -273,98 +321,79 @@ fn normalize(owner: &mut Writer, doc: &mut Document, operation: Operation) -> Re
         super::content::normalize(owner, doc, message, message_index)?;
         message_index += 1;
     }
-    if let Some(tools) = doc.member(root, "tools")? {
-        let mut next = doc.node(tools)?.first;
-        while let Some(tool) = next {
-            next = doc.node(tool)?.next;
-            super::content::cache(owner, doc, tool)?;
-            if let Some(kind) = doc.member(tool, "type")?
-                && !doc.string_is(kind, "custom")?
-            {
-                let declarations = match doc.member(x, "tools")? {
-                    Some(n) => n,
-                    None => doc.set(x, "tools", Value::Array)?,
-                };
-                let entry = doc.add(None, Value::Object)?;
-                doc.append(declarations, entry)?;
-                doc.set(entry, "pointer", Value::Text("/tools"))?;
-                let declaration = doc.add(Some(Name::Static("declaration")), Value::Object)?;
-                doc.transplant(declaration, tool)?;
-                doc.append(entry, declaration)?;
-                doc.replace(tool, Value::Object)?;
-                doc.set(tool, "type", Value::Text("server"))?;
-                doc.bind_origin(entry, tool, None)?;
-                continue;
-            }
-            if let Some(kind) = doc.remove(tool, "type")? {
-                preserve(owner, doc, original, tool, kind, None)?;
-            }
-            let function = doc.add(Some(Name::Static("function")), Value::Object)?;
-            while let Some(field) = doc.node(tool)?.first {
-                doc.detach(tool, field)?;
-                if doc.name_is(doc.node(field)?.name.ok_or(Error::Schema)?, "input_schema")? {
-                    doc.rename(field, "parameters")?;
-                }
-                doc.append(function, field)?;
-            }
-            doc.set(tool, "type", Value::Text("function"))?;
-            doc.append(tool, function)?;
+    Ok(())
+}
+/// Keeps server tools as opaque declarations and maps custom tools to Chat functions.
+fn tools(owner: &mut Writer, doc: &mut Document, root: usize, x: usize, original: usize) -> Result<()> {
+    let Some(tools) = doc.member(root, "tools")? else {
+        return Ok(());
+    };
+    let mut next = doc.node(tools)?.first;
+    while let Some(tool) = next {
+        next = doc.node(tool)?.next;
+        super::content::cache(owner, doc, tool)?;
+        if let Some(kind) = doc.member(tool, "type")?
+            && !doc.string_is(kind, "custom")?
+        {
+            let declarations = match doc.member(x, "tools")? {
+                Some(n) => n,
+                None => doc.set(x, "tools", Value::Array)?,
+            };
+            let entry = doc.add(None, Value::Object)?;
+            doc.append(declarations, entry)?;
+            doc.set(entry, "pointer", Value::Text("/tools"))?;
+            let declaration = doc.add(Some(Name::Static("declaration")), Value::Object)?;
+            doc.transplant(declaration, tool)?;
+            doc.append(entry, declaration)?;
+            doc.replace(tool, Value::Object)?;
+            doc.set(tool, "type", Value::Text("server"))?;
+            doc.bind_origin(entry, tool, None)?;
+            continue;
         }
+        if let Some(kind) = doc.remove(tool, "type")? {
+            preserve(owner, doc, original, tool, kind, None)?;
+        }
+        let function = doc.add(Some(Name::Static("function")), Value::Object)?;
+        while let Some(field) = doc.node(tool)?.first {
+            doc.detach(tool, field)?;
+            if doc.name_is(doc.node(field)?.name.ok_or(Error::Schema)?, "input_schema")? {
+                doc.rename(field, "parameters")?;
+            }
+            doc.append(function, field)?;
+        }
+        doc.set(tool, "type", Value::Text("function"))?;
+        doc.append(tool, function)?;
     }
-    if let Some(choice) = doc.member(root, "tool_choice")? {
-        if let Some(disable) = doc.remove(choice, "disable_parallel_tool_use")? {
-            let Value::Bool(value) = doc.node(disable)?.value else {
-                return Err(Error::Schema);
-            };
-            doc.set(root, "parallel_tool_calls", Value::Bool(!value))?;
-        }
-        let kind = doc.required(choice, "type")?;
-        if doc.string_is(kind, "tool")? {
-            let name = doc.remove(choice, "name")?.ok_or(Error::Schema)?;
-            doc.replace(kind, Value::Text("function"))?;
-            let f = doc.set(choice, "function", Value::Object)?;
-            doc.append(f, name)?;
-        } else if doc.string_is(kind, "auto")? || doc.string_is(kind, "any")? || doc.string_is(kind, "none")? {
-            let value = if doc.string_is(kind, "any")? {
-                "required"
-            } else if doc.string_is(kind, "none")? {
-                "none"
-            } else {
-                "auto"
-            };
-            capture(owner, doc, choice, &["type"], original)?;
-            doc.replace(choice, Value::Text(value))?;
+    Ok(())
+}
+fn tool_choice(owner: &mut Writer, doc: &mut Document, root: usize, original: usize) -> Result<()> {
+    let Some(choice) = doc.member(root, "tool_choice")? else {
+        return Ok(());
+    };
+    if let Some(disable) = doc.remove(choice, "disable_parallel_tool_use")? {
+        let Value::Bool(value) = doc.node(disable)?.value else {
+            return Err(Error::Schema);
+        };
+        doc.set(root, "parallel_tool_calls", Value::Bool(!value))?;
+    }
+    let kind = doc.required(choice, "type")?;
+    if doc.string_is(kind, "tool")? {
+        let name = doc.remove(choice, "name")?.ok_or(Error::Schema)?;
+        doc.replace(kind, Value::Text("function"))?;
+        let f = doc.set(choice, "function", Value::Object)?;
+        doc.append(f, name)?;
+    } else if doc.string_is(kind, "auto")? || doc.string_is(kind, "any")? || doc.string_is(kind, "none")? {
+        let value = if doc.string_is(kind, "any")? {
+            "required"
+        } else if doc.string_is(kind, "none")? {
+            "none"
         } else {
-            return Err(Error::Unsupported);
-        }
-    }
-    capture(
-        owner,
-        doc,
-        root,
-        &[
-            "x_ck",
-            "model",
-            "messages",
-            "tools",
-            "tool_choice",
-            "parallel_tool_calls",
-            "stream",
-            "max_tokens",
-            "temperature",
-            "top_p",
-            "stop",
-            "metadata",
-            "service_tier",
-            "response_format",
-        ],
-        original,
-    )?;
-    if doc.node(native)?.first.is_none() {
-        doc.remove(provider, "anthropic")?;
-    }
-    if doc.node(provider)?.first.is_none() {
-        doc.remove(x, "provider_parameters")?;
+            "auto"
+        };
+        capture(owner, doc, choice, &["type"], original)?;
+        doc.replace(choice, Value::Text(value))?;
+    } else {
+        return Err(Error::Unsupported);
     }
     Ok(())
 }
