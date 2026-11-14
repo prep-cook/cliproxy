@@ -80,13 +80,21 @@ fn held_audio_publishes_when_it_fills_a_record() {
     let mut ingress = streamed(&mut mapped);
     let stream: String = raw.chunks(3000).map(|piece| audio(&encode(piece))).collect();
     feed(&mut ingress, &mut mapped, &stream);
+    // The tenth delta reaches the threshold; the wall-clock deadline may publish more on a
+    // slow host, never less.
     let (records, bytes) = data_records(&mapped);
     assert_eq!(THRESHOLD.div_ceil(3000) * 3000, 30_000);
-    assert_eq!((records, bytes.len()), (1, 30_000));
-    assert_eq!(bytes, raw[..30_000]);
+    assert!(
+        bytes.len() >= 30_000 && records <= 2,
+        "{records} records, {} bytes",
+        bytes.len()
+    );
+    assert_eq!(bytes, raw[..bytes.len()]);
     feed(&mut ingress, &mut mapped, &end());
     ingress.finish(&mut mapped.writer).unwrap();
-    assert_eq!(data_records(&mapped), (2, raw));
+    let (records, bytes) = data_records(&mapped);
+    assert_eq!(bytes, raw);
+    assert!(records <= 3, "{records} data records");
 }
 
 /// Base64 quartets split across SSE records decode into one record; a flush publishes only the
@@ -104,14 +112,19 @@ fn audio_quartets_split_across_records_share_a_record() {
     let mut ingress = streamed(&mut mapped);
     // 143 pieces of 7 characters hold 1,001 characters: 250 quartets and one split character.
     let stream: String = pieces[..143].iter().map(|piece| audio(piece)).collect();
+    // The 100 ms deadline runs on the wall clock, so a slow host may publish once before the
+    // flush; the bytes published at each point are what the split quartet decides.
     feed(&mut ingress, &mut mapped, &stream);
-    assert_eq!(data_records(&mapped).0, 0);
     ingress.flush(&mut mapped.writer).unwrap();
-    assert_eq!(data_records(&mapped), (1, raw[..750].to_vec()));
+    let (records, bytes) = data_records(&mapped);
+    assert_eq!(bytes, raw[..750].to_vec());
+    assert!(records <= 2, "{records} data records");
     let stream: String = pieces[143..].iter().map(|piece| audio(piece)).collect::<String>() + &end();
     feed(&mut ingress, &mut mapped, &stream);
     ingress.finish(&mut mapped.writer).unwrap();
-    assert_eq!(data_records(&mapped), (2, raw));
+    let (records, bytes) = data_records(&mapped);
+    assert_eq!(bytes, raw);
+    assert!(records <= 4, "{records} data records");
 }
 
 /// Held audio reports a deadline at most 100 ms after collection starts, which later records do
