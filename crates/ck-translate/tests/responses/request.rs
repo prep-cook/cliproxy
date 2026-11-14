@@ -76,3 +76,50 @@ fn chat_fields_without_a_responses_mapping_stay_out_of_the_request() {
         json!({"input":[{"type":"message","role":"user","content":"q"}],"stream":false,"model":"m"})
     );
 }
+
+#[test]
+fn native_options_tools_and_custom_outputs_round_trip() {
+    let input = json!({"model":"m",
+        "input":[
+            {"type":"custom_tool_call","call_id":"c","name":"g","input":"raw"},
+            {"type":"custom_tool_call_output","call_id":"c","output":"done"},
+        ],
+        "tools":[{"type":"function","name":"f","parameters":{}},{"type":"web_search"}],
+        "text":{"format":{"type":"json_object"}},
+        "reasoning":{"effort":"high","summary":"auto"},
+        "truncation":"auto",
+        "include":["reasoning.encrypted_content"],
+    });
+    let (output, events) = request(&input, Operation::Generate);
+    assert_eq!(output["input"][1]["type"], "custom_tool_call_output");
+    for field in ["tools", "text", "reasoning", "truncation", "include"] {
+        assert_eq!(output[field], input[field], "{field}");
+    }
+    assert!(events.iter().any(|e| e["pointer"] == "/x_ck/thinking/effort"));
+}
+
+#[test]
+fn unknown_roles_and_unlinked_tool_outputs_are_refused() {
+    for input in [
+        json!({"model":"m","input":[{"type":"message","role":"critic","content":"x"}]}),
+        json!({"model":"m","input":[{"type":"function_call_output","call_id":"c","output":"r"}]}),
+    ] {
+        let mut m = Mapped::new();
+        let mut ingress = responses::request::Ingress::new(
+            &mut m.writer,
+            &m.store,
+            identity(Direction::Request),
+            Operation::Generate,
+            1024 * 1024,
+        )
+        .unwrap();
+        ingress
+            .advance(&mut m.writer, &serde_json::to_vec(&input).unwrap())
+            .unwrap();
+        assert!(
+            ingress
+                .finish(&mut m.writer, &responses::request::ResponsesCapability)
+                .is_err()
+        );
+    }
+}

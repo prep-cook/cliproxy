@@ -299,8 +299,11 @@ fn request_media_uses_canonical_data_without_inline_copy() {
     use base64::Engine;
     let raw: Vec<u8> = (0..80_003).map(|i| (i % 251) as u8).collect();
     let encoded = base64::engine::general_purpose::STANDARD.encode(&raw);
-    let input = json!({"model":"m","input":[{"role":"user","content":[{"type":"input_image","image_url":format!("data:image/png;base64,{encoded}"),"detail":"high","ref":"literal"}]}]});
+    // The decoy has the shape of an input part outside `input` and must stay literal.
+    let input = json!({"model":"m","input":[{"role":"user","content":[{"type":"input_image","image_url":format!("data:image/png;base64,{encoded}"),"detail":"high","ref":"literal"}]}],
+        "prompt":{"item":{"content":[{"type":"input_image","image_url":"data:image/png;base64,AAEC"}]}}});
     let (out, events) = request(&input, Operation::Generate);
+    assert_eq!(out["prompt"], input["prompt"]);
     assert_eq!(
         out["input"][0]["content"][0]["image_url"],
         input["input"][0]["content"][0]["image_url"]
