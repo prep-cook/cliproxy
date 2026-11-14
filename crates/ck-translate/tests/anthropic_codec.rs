@@ -420,6 +420,16 @@ fn whole_request_preserves_signed_tool_history() {
 }
 
 #[test]
+fn url_images_and_tool_result_media_round_trip() {
+    let input = json!({"model":"m","max_tokens":20,"messages":[{"role":"assistant","content":[{"type":"tool_use","id":"c","name":"f","input":{}}]},{"role":"user","content":[{"type":"tool_result","tool_use_id":"c","content":[{"type":"image","source":{"type":"base64","media_type":"image/png","data":"AA=="}}]},{"type":"image","source":{"type":"url","url":"https://example.com/a.png"}}]}]});
+    let raw = serde_json::to_vec(&input).unwrap();
+    let (output, _) = request(&raw, Operation::Generate);
+    let mut expected = input;
+    expected["stream"] = json!(true);
+    assert_eq!(output, expected);
+}
+
+#[test]
 fn native_controls_and_colliding_unknowns_remain_distinct() {
     let input = json!({"model":"m","max_tokens":100,"stop_sequences":["done"],"stop":"literal","thinking":{"type":"enabled","budget_tokens":1024},"response_format":{"foreign":true},"parallel_tool_calls":"literal","output_config":{"effort":"high","format":{"type":"json_schema","schema":{"type":"object"}},"future":null},"cache_control":{"type":"ephemeral"},"tools":[{"type":"custom","name":"f","input_schema":{"type":"object"},"cache_control":{"type":"ephemeral","ttl":"1h"}}],"messages":[{"role":"assistant","tool_calls":"literal","content":[{"type":"thinking","thinking":"real","text":"shadow","signature":"signed=="}]},{"role":"user","content":[{"type":"image","mime":"literal","source":{"type":"base64","media_type":"image/png","data":"AA==","kind":"literal"}}]}]});
     let raw = serde_json::to_vec(&input).unwrap();
