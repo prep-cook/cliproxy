@@ -298,12 +298,14 @@ impl Egress {
             }
             list.tail = index;
         } else {
-            self.texts.insert(owner, hash, self.text_lists.len())?;
+            // Push before indexing: a quota failure on the push leaves no index entry
+            // pointing past the end of `text_lists`.
             self.text_lists.push(TextList {
                 key: index,
                 head: Some(index),
                 tail: index,
             })?;
+            self.texts.insert(owner, hash, self.text_lists.len() - 1)?;
         }
         Ok(())
     }
