@@ -9,6 +9,8 @@ pub mod codec;
 mod finish;
 #[path = "../src/gemini/boundary.rs"]
 pub mod gemini;
+#[path = "gemini/golden.rs"]
+mod golden;
 #[path = "gemini/incremental.rs"]
 mod incremental;
 #[path = "gemini/media.rs"]
