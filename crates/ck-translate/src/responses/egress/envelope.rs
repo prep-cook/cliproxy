@@ -101,6 +101,13 @@ impl<F: FnMut(&'static str, u64)> Egress<F> {
             super::super::merge(doc, doc.root(), value)?;
             return Ok(());
         }
+        if is(&incoming, root, "name", "responses.audio")? {
+            let node = self.document.absorb(incoming)?;
+            let at = self.audio_index(node)?.ok_or(Error::Schema)?;
+            let doc = &mut self.document;
+            let value = doc.required(node, "value")?;
+            return super::super::merge(doc, self.audio[at].audio, value);
+        }
         if self.mode == BodyMode::Streaming {
             return output(encode::scratch(owner, |e| super::super::opaque::write(&incoming, e))?);
         }

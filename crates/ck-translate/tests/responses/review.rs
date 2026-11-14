@@ -291,3 +291,32 @@ fn lifecycle_status_and_fields_survive_a_terminal_snapshot_without_them() {
     assert_eq!(out["vendor"], 7);
     assert_eq!(out["status"], "completed");
 }
+
+#[test]
+fn late_audio_metadata_reaches_the_client() {
+    let audio = json!({"data":"AAEC","mime_type":"audio/wav","expires_at":12,"vendor":7});
+    let records = [
+        json!({"type":"response.audio.delta","delta":"AAEC"}),
+        json!({"type":"response.audio.done"}),
+        json!({"type":"response.completed","response":{"id":"r","status":"completed","output":[],"audio":audio}}),
+    ];
+    let (out, _) = response(
+        wire(&records).as_bytes(),
+        BodyMode::Streaming,
+        BodyMode::Buffered,
+        Operation::Generate,
+    );
+    let out = String::from_utf8(out).unwrap();
+    for field in ["\"mime_type\":\"audio/wav\"", "\"expires_at\":12", "\"vendor\":7"] {
+        assert!(out.contains(field), "{field}: {out}");
+    }
+    // Audio that the snapshot starts carries its metadata in `media.start`; no second record.
+    let body = json!({"id":"r","status":"completed","output":[],"audio":audio});
+    let (_, events) = response(
+        &serde_json::to_vec(&body).unwrap(),
+        BodyMode::Buffered,
+        BodyMode::Buffered,
+        Operation::Generate,
+    );
+    assert!(!events.iter().any(|e| e["name"] == "responses.audio"));
+}

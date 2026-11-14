@@ -19,6 +19,8 @@ pub(super) struct Ingress {
     transcript_seen: bool,
     transcript_done: bool,
     closed: bool,
+    /// Started from the snapshot's `audio` object, whose metadata `media.start` already carries.
+    native: bool,
 }
 
 impl Ingress {
@@ -64,6 +66,7 @@ impl Ingress {
             transcript_seen: false,
             transcript_done: false,
             closed: false,
+            native: native.is_some(),
         })
     }
 
@@ -170,6 +173,30 @@ impl Ingress {
                 self.transcript_done(owner, emitter)?;
             }
         }
+        self.late_metadata(owner, emitter, doc, node)
+    }
+
+    /// Publishes the metadata of a snapshot `audio` object that arrives after streamed audio
+    /// started the media, as a `responses.audio` record egress merges into the audio.
+    fn late_metadata(&mut self, owner: &mut Writer, emitter: &mut Emitter, doc: &Document, node: usize) -> Result<()> {
+        let mut late = false;
+        for field in doc.children(node)? {
+            let name = doc.node(field)?.name.ok_or(Error::Schema)?;
+            late |= !doc.name_is(name, "data")? && !doc.name_is(name, "transcript")?;
+        }
+        if self.native || !late {
+            return Ok(());
+        }
+        emitter.emit(
+            owner,
+            Kind::Opaque,
+            self.scope,
+            |e| {
+                e.bytes(b",\"name\":\"responses.audio\",\"format\":\"json\",\"value\":")?;
+                super::object(doc, node, &["data", "transcript"], e)
+            },
+            |_| Ok(()),
+        )?;
         Ok(())
     }
 
