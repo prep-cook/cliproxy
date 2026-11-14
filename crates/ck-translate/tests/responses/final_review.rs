@@ -63,6 +63,14 @@ fn announced_parts_and_calls_carry_their_empty_accumulators() {
 /// Encodes `input` after the trusted reader rebuilt it from the canonical records; `edit` may
 /// change the rebuilt document first.
 fn rebuilt(input: &Value, operation: Operation, edit: impl FnOnce(&mut codec::document::Document)) -> Value {
+    try_rebuilt(input, operation, edit).unwrap()
+}
+
+fn try_rebuilt(
+    input: &Value,
+    operation: Operation,
+    edit: impl FnOnce(&mut codec::document::Document),
+) -> codec::Result<Value> {
     let mut m = Mapped::new();
     let mut ingress = responses::request::Ingress::new(
         &mut m.writer,
@@ -81,23 +89,20 @@ fn rebuilt(input: &Value, operation: Operation, edit: impl FnOnce(&mut codec::do
     let mut reader = m.store.reader(m.writer.id(), 0).unwrap();
     let (mut doc, media) = codec::chat::request::read_request(&mut m.writer, &mut reader).unwrap();
     edit(&mut doc);
-    let ready = codec::RequestFence::default()
-        .end(
-            codec::RequestView {
-                document: &doc,
-                media: &media,
-                operation,
-            },
-            &responses::request::ResponsesCapability,
-        )
-        .unwrap();
+    let ready = codec::RequestFence::default().end(
+        codec::RequestView {
+            document: &doc,
+            media: &media,
+            operation,
+        },
+        &responses::request::ResponsesCapability,
+    )?;
     let output = responses::request::Egress {
         destination: "responses",
         upstream_stream: false,
     }
-    .encode(&ready, &mut m.writer)
-    .unwrap();
-    serde_json::from_slice(&bytes(&output)).unwrap()
+    .encode(&ready, &mut m.writer)?;
+    Ok(serde_json::from_slice(&bytes(&output)).unwrap())
 }
 
 #[test]
@@ -119,4 +124,43 @@ fn provenance_survives_the_canonical_records() {
         let (direct, _) = request(&input, operation);
         assert_eq!(rebuilt(&input, operation, |_| {}), direct, "{input}");
     }
+}
+
+/// Detaches content part `part` of message `message` from a rebuilt document.
+fn detach_part(doc: &mut codec::document::Document, message: usize, part: usize) {
+    let messages = doc.required(doc.root(), "messages").unwrap();
+    let message = doc.children(messages).unwrap().nth(message).unwrap();
+    let content = doc.required(message, "content").unwrap();
+    let part = doc.children(content).unwrap().nth(part).unwrap();
+    doc.detach(content, part).unwrap();
+}
+
+#[test]
+fn deleted_encrypted_parts_take_their_replay_payload_with_them() {
+    let reasoning = |text: &str, data: &str| json!({"type":"reasoning","summary":[{"type":"summary_text","text":text}],"encrypted_content":data});
+    let input = json!({"model":"m","input":[reasoning("a","E1"), reasoning("b","E2")]});
+    let output = rebuilt(&input, Operation::Generate, |doc| detach_part(doc, 0, 1));
+    assert_eq!(
+        output["input"][0],
+        json!({"type":"reasoning","summary":[{"type":"summary_text","text":"a"}]})
+    );
+    assert_eq!(output["input"][1], reasoning("b", "E2"));
+    let output = rebuilt(&input, Operation::Generate, |doc| {
+        let messages = doc.required(doc.root(), "messages").unwrap();
+        let first = doc.node(messages).unwrap().first.unwrap();
+        doc.detach(messages, first).unwrap();
+    });
+    assert_eq!(output["input"], json!([reasoning("b", "E2")]));
+    // An encrypted part moved to another message keeps naming its own message's payload.
+    let moved = try_rebuilt(&input, Operation::Generate, |doc| {
+        let messages = doc.required(doc.root(), "messages").unwrap();
+        let [first, second] = [0, 1].map(|i| doc.children(messages).unwrap().nth(i).unwrap());
+        let [from, to] = [second, first].map(|m| doc.required(m, "content").unwrap());
+        let own = doc.children(to).unwrap().nth(1).unwrap();
+        doc.detach(to, own).unwrap();
+        let part = doc.children(from).unwrap().nth(1).unwrap();
+        doc.detach(from, part).unwrap();
+        doc.append(to, part).unwrap();
+    });
+    assert!(moved.is_err());
 }

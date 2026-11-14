@@ -345,6 +345,8 @@ fn replay_encrypted(doc: &mut Document, item: usize, content: usize, data: usize
         Value::Unsigned(doc.children(content)?.count() as u64),
     )?;
     doc.set(entry, "kind", Value::Text("responses_encrypted"))?;
+    // The binding, not `message_index`, survives deleting an earlier message.
+    doc.bind_origin(entry, item, None)?;
     doc.set(entry, "source", Value::Text("responses"))?;
     if let Some(id) = doc.member(item, "id")? {
         let id_value = doc.node(id)?.value;

@@ -43,17 +43,20 @@ pub(super) fn write_request(view: RequestView<'_>, streaming: bool, e: &mut Enco
     let root = doc.root();
     e.bytes(b"{\"input\":[")?;
     let mut first = true;
-    let mut replay = match doc.member(root, "x_ck")? {
-        Some(x) => doc
-            .member(x, "replay")?
-            .map(|r| doc.node(r))
-            .transpose()?
-            .and_then(|r| r.first),
-        None => None,
+    let mut replay = Replay {
+        next: match doc.member(root, "x_ck")? {
+            Some(x) => doc
+                .member(x, "replay")?
+                .map(|r| doc.node(r))
+                .transpose()?
+                .and_then(|r| r.first),
+            None => None,
+        },
+        index: 0,
     };
-    for (index, message) in doc.children(doc.required(root, "messages")?)?.enumerate() {
+    for message in doc.children(doc.required(root, "messages")?)? {
         if !instructions(doc, message)? {
-            write_message(view, message, (index as u64, &mut replay), &mut first, e)?;
+            write_message(view, message, &mut replay, &mut first, e)?;
         }
     }
     e.bytes(b"]")?;
@@ -271,7 +274,7 @@ fn separate(first: &mut bool, e: &mut Encoder<'_, '_>) -> Result<()> {
 fn write_message(
     view: RequestView<'_>,
     message: usize,
-    replay: (u64, &mut Option<usize>),
+    replay: &mut Replay,
     first: &mut bool,
     e: &mut Encoder<'_, '_>,
 ) -> Result<()> {
@@ -411,14 +414,33 @@ fn write_message_item(view: RequestView<'_>, message: usize, content: usize, e: 
     originals(doc, message, e, &["type", "instructions"])?;
     e.bytes(b"}")
 }
+/// A cursor over `x_ck.replay`. Encrypted parts name their entries in increasing order, so one
+/// walk serves the whole request; entries whose part was deleted are passed over.
+struct Replay {
+    next: Option<usize>,
+    index: u64,
+}
+impl Replay {
+    /// Entry `wanted`, which must be bound to `message`.
+    fn seek(&mut self, doc: &Document, wanted: u64, message: usize) -> Result<usize> {
+        while self.index < wanted {
+            self.next = doc.node(self.next.ok_or(Error::Schema)?)?.next;
+            self.index += 1;
+        }
+        let entry = self.next.filter(|_| self.index == wanted).ok_or(Error::Schema)?;
+        if doc.origin(entry)?.map(|(parent, _)| parent) != Some(message) {
+            return Err(Error::Schema);
+        }
+        Ok(entry)
+    }
+}
 /// Writes the reasoning or compaction item of `message` with its summary, full reasoning and
-/// encrypted content. `replay` holds the message index and the next unwritten replay entry;
-/// normalization records entries in message order, so one walk serves the whole request.
+/// the encrypted content its surviving encrypted parts name.
 fn write_reasoning(
     doc: &Document,
     message: usize,
     content: usize,
-    (index, replay): (u64, &mut Option<usize>),
+    replay: &mut Replay,
     e: &mut Encoder<'_, '_>,
 ) -> Result<()> {
     let compaction = typed(doc, item_type(doc, message)?, "compaction")?;
@@ -441,17 +463,13 @@ fn write_reasoning(
     if has("reasoning")? {
         write_reasoning_parts(doc, content, ("content", "reasoning", "reasoning_text"), e)?;
     }
-    while let Some(entry) = *replay {
-        let at = doc.unsigned(doc.required(entry, "message_index")?)?;
-        if at > index {
-            break;
+    let parts = matches!(doc.node(content)?.value, Value::Array).then_some(content);
+    for part in parts.map(|p| doc.children(p)).transpose()?.into_iter().flatten() {
+        if is(doc, part, "type", "encrypted")? {
+            let entry = replay.seek(doc, doc.unsigned(doc.required(part, "replay_index")?)?, message)?;
+            e.bytes(b",\"encrypted_content\":")?;
+            doc.write(doc.required(entry, "signature")?, e)?;
         }
-        if at < index {
-            return Err(Error::Schema);
-        }
-        e.bytes(b",\"encrypted_content\":")?;
-        doc.write(doc.required(entry, "signature")?, e)?;
-        *replay = doc.node(entry)?.next;
     }
     originals(doc, message, e, &["type"])?;
     e.bytes(b"}")
