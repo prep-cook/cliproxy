@@ -1,5 +1,5 @@
 //! Final codec review, continued: event classification, terminal snapshots and native schemas.
-use super::final_review::try_raw;
+use super::final_review::{try_raw, try_streamed};
 use super::*;
 
 const COMPLETED: &str =
@@ -54,4 +54,36 @@ fn unknown_sse_data_stays_opaque() {
     ] {
         assert!(before_completion(failing).is_err(), "{failing}");
     }
+}
+
+#[test]
+fn a_shorter_terminal_array_contradicts_published_parts() {
+    let message = |content: Option<Value>| {
+        let mut item = json!({"id":"i","type":"message","role":"assistant","status":"completed"});
+        if let Some(content) = content {
+            item["content"] = content;
+        }
+        item
+    };
+    let reasoning = |summary: Value| json!({"id":"i","type":"reasoning","summary":summary});
+    let text = json!([{"type":"output_text","text":"A"}]);
+    let summary = json!([{"type":"summary_text","text":"s"}]);
+    let run = |done: Value, last: Value| {
+        try_streamed(
+            &[
+                json!({"type":"response.output_item.done","output_index":0,"item":done}),
+                json!({"type":"response.completed","response":{"id":"r","status":"completed","output":[last]}}),
+            ],
+            BodyMode::Buffered,
+        )
+    };
+    assert!(run(message(Some(text.clone())), message(Some(json!([])))).is_err());
+    assert!(run(reasoning(summary.clone()), reasoning(json!([]))).is_err());
+    // Omission keeps the published parts.
+    let (out, _) = run(message(Some(text.clone())), message(None)).unwrap();
+    let body: Value = serde_json::from_slice(&out).unwrap();
+    assert_eq!(body["output"][0]["content"], text);
+    let (out, _) = run(reasoning(summary.clone()), reasoning(summary.clone())).unwrap();
+    let body: Value = serde_json::from_slice(&out).unwrap();
+    assert_eq!(body["output"][0]["summary"], summary);
 }

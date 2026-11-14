@@ -123,8 +123,18 @@ impl State {
         }
         for (name, summary) in [("content", false), ("summary", true)] {
             if let Some(parts) = doc.member(node, name)? {
+                let mut supplied = 0;
                 for (index, part) in doc.children(parts)?.enumerate() {
                     self.block(owner, at, (index as u64, summary), doc, part, (close, close))?;
+                    supplied = index as u64 + 1;
+                }
+                // A supplied array must hold every published part; omission keeps them.
+                if self.items[at]
+                    .blocks
+                    .iter()
+                    .any(|b| b.summary == summary && b.index >= supplied)
+                {
+                    return Err(Error::Schema);
                 }
             }
         }
