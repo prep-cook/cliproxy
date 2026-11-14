@@ -164,8 +164,12 @@ impl<F: FnMut(&'static str, u64)> Egress<F> {
             .member(x, "source")?
             .map(|s| is(doc, s, "protocol", "responses"))
             .transpose()?;
-        initialize_part(doc, part, native != Some(true))?;
-        doc.bind_origin(part, x, None)?;
+        if is(doc, node, "kind", "opaque")? {
+            doc.bind_origin(part, x, Some(OPAQUE_PART))?;
+        } else {
+            initialize_part(doc, part, native != Some(true))?;
+            doc.bind_origin(part, x, None)?;
+        }
         let payload = encode::scratch(owner, |e| {
             item_fields(doc, item, index, e)?;
             e.bytes(if summary {
@@ -326,7 +330,10 @@ impl<F: FnMut(&'static str, u64)> Egress<F> {
         let doc = &mut self.document;
         if let Some((part, summary, block)) = find_part(doc, item, x)? {
             restore_originals(doc, x, part)?;
-            let text = match text_done(doc, part)? {
+            let opaque = doc
+                .origin(part)?
+                .is_some_and(|(_, carrier)| carrier == Some(OPAQUE_PART));
+            let text = match text_done(doc, part)?.filter(|_| !opaque) {
                 Some((name, field)) => Some((
                     name,
                     encode::scratch(owner, |e| {

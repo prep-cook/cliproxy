@@ -232,6 +232,8 @@ fn write_lease(lease: &ScratchLease, e: &mut Encoder<'_, '_>) -> Result<()> {
 const CALL_ITEM: &str = "responses.tool";
 /// Origin carrier of a reasoning item split out of a message item.
 const REASONING_ITEM: &str = "responses.reasoning";
+/// Origin carrier of an opaque part: its members, whatever its type, carry no text semantics.
+const OPAQUE_PART: &str = "responses.opaque";
 
 /// Whether block start `node` opens readable, summary, encrypted or redacted reasoning.
 fn reasoning(doc: &Document, node: usize) -> Result<bool> {

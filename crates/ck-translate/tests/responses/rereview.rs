@@ -1,5 +1,6 @@
 //! Re-review of the final codec review: closing reconciliation, opaque parts, failures and the
 //! lifecycle a streaming client sees.
+use super::cross::client_events;
 use super::final_events::buffered_output;
 use super::final_review::try_streamed;
 use super::*;
@@ -17,6 +18,17 @@ fn closed_part(started: Value, done: Value) -> Value {
     ];
     let (out, _) = try_streamed(&records, BodyMode::Buffered).unwrap();
     serde_json::from_slice::<Value>(&out).unwrap()["output"][0]["content"][0].clone()
+}
+
+/// Client events for buffered Responses `body` replayed to a streaming client.
+fn streamed(body: &Value) -> Vec<Value> {
+    let (out, _) = response(
+        body.to_string().as_bytes(),
+        BodyMode::Buffered,
+        BodyMode::Streaming,
+        Operation::Generate,
+    );
+    client_events(&out)
 }
 
 #[test]
@@ -66,4 +78,29 @@ fn unknown_items_keep_every_member() {
         .collect();
     assert!(blocks.is_empty(), "{blocks:?}");
     assert_eq!(serde_json::from_slice::<Value>(&out).unwrap()["output"], parts);
+}
+
+#[test]
+fn opaque_summary_parts_raise_no_text_events() {
+    for kind in ["output_text", "refusal"] {
+        let part = json!({"type":kind,"text":"opaque-text","payload":7});
+        let item = json!({"id":"i","type":"reasoning","status":"completed","summary":[part]});
+        let events = streamed(&json!({"id":"r","status":"completed","output":[item]}));
+        let types: Vec<_> = events.iter().map(|e| e["type"].as_str().unwrap()).collect();
+        assert_eq!(
+            types,
+            [
+                "response.created",
+                "response.output_item.added",
+                "response.reasoning_summary_part.added",
+                "response.reasoning_summary_part.done",
+                "response.output_item.done",
+                "response.completed"
+            ]
+        );
+        for event in &events[2..4] {
+            assert_eq!(event["part"], part);
+        }
+        assert_eq!(events[5]["response"]["output"][0], item);
+    }
 }
