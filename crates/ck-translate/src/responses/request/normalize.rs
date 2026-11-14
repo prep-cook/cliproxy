@@ -72,9 +72,17 @@ fn normalize_input(doc: &mut Document, owner: &mut Writer, x: usize, original: u
             doc.rename(input, "content")?;
             doc.append(m, input)?;
         } else if matches!(doc.node(input)?.value, Value::Array) {
+            let mut items = Items {
+                messages,
+                x,
+                original,
+                index: doc.children(messages)?.count() as u64,
+                replays: 0,
+            };
             while let Some(item) = doc.node(input)?.first {
                 doc.detach(input, item)?;
-                normalize_item(doc, owner, item, messages, x, original)?;
+                normalize_item(doc, owner, item, &mut items)?;
+                items.index += 1;
             }
         } else {
             return Err(Error::Schema);
@@ -158,21 +166,25 @@ fn provider(doc: &mut Document, x: usize) -> Result<usize> {
         None => doc.set(p, "responses", Value::Object),
     }
 }
-fn normalize_item(
-    doc: &mut Document,
-    owner: &mut Writer,
-    item: usize,
+/// Where normalized input items go, with the counts their records need; every item becomes
+/// exactly one message.
+struct Items {
     messages: usize,
     x: usize,
     original: usize,
-) -> Result<()> {
-    let index = doc.children(messages)?.count() as u64;
+    /// Index of the item's message in `messages`.
+    index: u64,
+    /// Number of `x_ck.replay` entries recorded so far.
+    replays: u64,
+}
+fn normalize_item(doc: &mut Document, owner: &mut Writer, item: usize, items: &mut Items) -> Result<()> {
+    let Items { messages, original, .. } = *items;
     if is(doc, item, "type", "function_call")? || is(doc, item, "type", "custom_tool_call")? {
         normalize_call(doc, owner, item, messages, original)
     } else if is(doc, item, "type", "function_call_output")? || is(doc, item, "type", "custom_tool_call_output")? {
         normalize_output(doc, owner, item, messages, original)
     } else if is(doc, item, "type", "reasoning")? || is(doc, item, "type", "compaction")? {
-        normalize_reasoning(doc, owner, item, (messages, x, original), index)
+        normalize_reasoning(doc, owner, item, items)
     } else if (doc.member(item, "type")?.is_none() && doc.member(item, "role")?.is_some())
         || is(doc, item, "type", "message")?
     {
@@ -260,13 +272,8 @@ fn normalize_output(
 }
 /// Turns a reasoning or compaction item into an assistant message of reasoning parts; its
 /// encrypted content becomes a replay entry.
-fn normalize_reasoning(
-    doc: &mut Document,
-    owner: &mut Writer,
-    item: usize,
-    (messages, x, original): (usize, usize, usize),
-    index: u64,
-) -> Result<()> {
+fn normalize_reasoning(doc: &mut Document, owner: &mut Writer, item: usize, items: &mut Items) -> Result<()> {
+    let Items { messages, original, .. } = *items;
     let compaction = is(doc, item, "type", "compaction")?;
     doc.bind_origin(
         item,
@@ -300,29 +307,24 @@ fn normalize_reasoning(
         }
     }
     if let Some(data) = doc.remove(item, "encrypted_content")? {
-        replay_encrypted(doc, item, (x, content), data, index)?;
+        replay_encrypted(doc, item, content, data, items)?;
     }
     preserve_unknown(doc, owner, original, item, &["role", "content"])?;
     Ok(())
 }
-/// Records encrypted reasoning `data` of message `index` in `x_ck.replay` and marks its place
-/// in `content` with an encrypted part.
-fn replay_encrypted(
-    doc: &mut Document,
-    item: usize,
-    (x, content): (usize, usize),
-    data: usize,
-    index: u64,
-) -> Result<()> {
+/// Records encrypted reasoning `data` of the item's message in `x_ck.replay` and marks its
+/// place in `content` with an encrypted part.
+fn replay_encrypted(doc: &mut Document, item: usize, content: usize, data: usize, items: &mut Items) -> Result<()> {
     string(doc, data)?;
-    let replay = match doc.member(x, "replay")? {
+    let replay = match doc.member(items.x, "replay")? {
         Some(r) => r,
-        None => doc.set(x, "replay", Value::Array)?,
+        None => doc.set(items.x, "replay", Value::Array)?,
     };
-    let replay_index = doc.children(replay)?.count() as u64;
+    let replay_index = items.replays;
+    items.replays += 1;
     let entry = doc.add(None, Value::Object)?;
     doc.append(replay, entry)?;
-    doc.set(entry, "message_index", Value::Unsigned(index))?;
+    doc.set(entry, "message_index", Value::Unsigned(items.index))?;
     doc.set(
         entry,
         "block_index",

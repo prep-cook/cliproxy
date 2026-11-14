@@ -14,8 +14,8 @@ fn originals(doc: &Document, target: usize, e: &mut Encoder<'_, '_>, skip: &[&st
     let Some(original) = doc.member(x, "original")? else {
         return Ok(());
     };
-    for entry in doc.children(original)? {
-        if doc.origin(entry)?.map(|(node, _)| node) != Some(target) || !is(doc, entry, "protocol", "responses")? {
+    for entry in doc.origins(target)? {
+        if doc.node(entry)?.parent != Some(original) || !is(doc, entry, "protocol", "responses")? {
             continue;
         }
         let pointer = doc.required(entry, "pointer")?;
@@ -42,9 +42,17 @@ pub(super) fn write_request(view: RequestView<'_>, streaming: bool, e: &mut Enco
     let root = doc.root();
     e.bytes(b"{\"input\":[")?;
     let mut first = true;
+    let mut replay = match doc.member(root, "x_ck")? {
+        Some(x) => doc
+            .member(x, "replay")?
+            .map(|r| doc.node(r))
+            .transpose()?
+            .and_then(|r| r.first),
+        None => None,
+    };
     for (index, message) in doc.children(doc.required(root, "messages")?)?.enumerate() {
         if !instructions(doc, message)? {
-            write_message(view, message, index as u64, &mut first, e)?;
+            write_message(view, message, (index as u64, &mut replay), &mut first, e)?;
         }
     }
     e.bytes(b"]")?;
@@ -185,7 +193,7 @@ fn separate(first: &mut bool, e: &mut Encoder<'_, '_>) -> Result<()> {
 fn write_message(
     view: RequestView<'_>,
     message: usize,
-    index: u64,
+    replay: (u64, &mut Option<usize>),
     first: &mut bool,
     e: &mut Encoder<'_, '_>,
 ) -> Result<()> {
@@ -210,7 +218,7 @@ fn write_message(
         let reasoning = native || any_part(doc, content, true)?;
         if reasoning {
             separate(first, e)?;
-            write_reasoning(doc, message, content, index, e)?;
+            write_reasoning(doc, message, content, replay, e)?;
         }
         let text = match doc.node(content)?.value {
             Value::Array => any_part(doc, content, false)? || (!reasoning && calls.is_none()),
@@ -327,8 +335,15 @@ fn write_message_item(view: RequestView<'_>, message: usize, content: usize, e: 
     e.bytes(b"}")
 }
 /// Writes the reasoning or compaction item of `message` with its summary, full reasoning and
-/// encrypted content.
-fn write_reasoning(doc: &Document, message: usize, content: usize, index: u64, e: &mut Encoder<'_, '_>) -> Result<()> {
+/// encrypted content. `replay` holds the message index and the next unwritten replay entry;
+/// normalization records entries in message order, so one walk serves the whole request.
+fn write_reasoning(
+    doc: &Document,
+    message: usize,
+    content: usize,
+    (index, replay): (u64, &mut Option<usize>),
+    e: &mut Encoder<'_, '_>,
+) -> Result<()> {
     let compaction = doc
         .origin(message)?
         .is_some_and(|(_, carrier)| carrier == Some("responses.compaction"));
@@ -351,15 +366,17 @@ fn write_reasoning(doc: &Document, message: usize, content: usize, index: u64, e
     if has("reasoning")? {
         write_reasoning_parts(doc, content, ("content", "reasoning", "reasoning_text"), e)?;
     }
-    if let Some(x) = doc.member(doc.root(), "x_ck")?
-        && let Some(replay) = doc.member(x, "replay")?
-    {
-        for entry in doc.children(replay)? {
-            if doc.unsigned(doc.required(entry, "message_index")?)? == index {
-                e.bytes(b",\"encrypted_content\":")?;
-                doc.write(doc.required(entry, "signature")?, e)?;
-            }
+    while let Some(entry) = *replay {
+        let at = doc.unsigned(doc.required(entry, "message_index")?)?;
+        if at > index {
+            break;
         }
+        if at < index {
+            return Err(Error::Schema);
+        }
+        e.bytes(b",\"encrypted_content\":")?;
+        doc.write(doc.required(entry, "signature")?, e)?;
+        *replay = doc.node(entry)?.next;
     }
     originals(doc, message, e, &["type"])?;
     e.bytes(b"}")
