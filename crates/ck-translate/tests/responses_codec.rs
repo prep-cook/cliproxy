@@ -9,6 +9,10 @@ mod incremental;
 #[path = "responses/recordings.rs"]
 mod recordings;
 // Test-only inclusion until the framework owner declares the production module.
+// Shared by every boundary codec; this protocol uses a subset.
+#[allow(dead_code)]
+#[path = "../src/boundary.rs"]
+pub mod boundary;
 #[path = "../src/codec/mod.rs"]
 pub mod codec;
 #[path = "../src/responses/mod.rs"]
@@ -45,6 +49,20 @@ fn events(mapped: &Mapped) -> Vec<Value> {
         .filter_map(|l| l.strip_prefix("data: "))
         .map(|l| serde_json::from_str(l).unwrap())
         .collect()
+}
+/// Asserts that the last event is the boundary error the Chat codec also emits.
+fn assert_invalid_input(raw: &[u8], scope: &str) {
+    let error: Value = std::str::from_utf8(raw)
+        .unwrap()
+        .lines()
+        .rev()
+        .filter_map(|line| line.strip_prefix("data: "))
+        .find_map(|line| serde_json::from_str(line).ok())
+        .unwrap();
+    assert_eq!(error["code"], "stream.invalid_input");
+    assert_eq!(error["status"], if scope == "client" { 400 } else { 502 });
+    assert_eq!(error["message"], "Invalid boundary input");
+    assert_eq!(error["scope"], scope);
 }
 fn request(input: &Value, operation: Operation) -> (Value, Vec<Value>) {
     let mut m = Mapped::new();
@@ -322,6 +340,7 @@ fn malformed_truncated_and_contradictory_responses_never_complete() {
         let emitted = String::from_utf8(m.output(&m.writer)).unwrap();
         assert!(emitted.contains("event: x_ck.error\n"));
         assert!(!emitted.contains("event: x_ck.done\n"));
+        assert_invalid_input(emitted.as_bytes(), "upstream");
     }
 }
 
@@ -378,6 +397,7 @@ fn destination_rejection_has_no_request_end_and_cannot_be_retried() {
     let output = String::from_utf8(m.output(&m.writer)).unwrap();
     assert!(!output.contains("x_ck.request.end"));
     assert!(output.contains("x_ck.error"));
+    assert_invalid_input(output.as_bytes(), "client");
 }
 
 #[test]

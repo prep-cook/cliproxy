@@ -12,11 +12,11 @@ mod usage;
 
 const REDACTED_PREFIX: &str = "claude-redacted-thinking:";
 
+use crate::boundary::failure;
 use crate::codec::{
     Error, Result,
     document::{Document, Value},
     encode::{self, Encoder},
-    event::{Emitter, Kind, Scope},
     source::Source,
 };
 use ck_stream::Writer;
@@ -51,13 +51,6 @@ fn member(doc: &Document, parent: usize, name: &str, e: &mut Encoder<'_, '_>) ->
         e.bytes(b":")?;
         doc.write(node, e)?;
     }
-    Ok(())
-}
-
-fn failure(emitter: &mut Emitter, owner: &mut Writer, client: bool) -> Result<()> {
-    emitter.emit(owner, Kind::Error, Scope::default(), |e| {
-        e.bytes(if client { b",\"code\":\"invalid_request\",\"status\":400,\"scope\":\"client\",\"message\":\"Invalid Responses request\"" } else { b",\"code\":\"invalid_response\",\"status\":502,\"scope\":\"upstream\",\"message\":\"Invalid Responses response\"" })
-    }, |_| Ok(()))?;
     Ok(())
 }
 

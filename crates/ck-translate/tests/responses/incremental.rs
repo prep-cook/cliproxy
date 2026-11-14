@@ -101,6 +101,7 @@ fn malformed_tail_after_incremental_data_cannot_cross_request_fence() {
         assert!(output.contains("event: x_ck.error\n"));
         assert!(!output.contains("event: x_ck.request.end\n"));
         assert!(!output.contains("event: x_ck.done\n"));
+        crate::assert_invalid_input(output.as_bytes(), "client");
     }
 }
 
