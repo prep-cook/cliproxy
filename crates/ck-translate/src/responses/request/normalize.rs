@@ -98,7 +98,9 @@ fn normalize_options(doc: &mut Document, owner: &mut Writer, x: usize, original:
     }
     move_field(doc, root, "max_output_tokens", root, "max_completion_tokens")?;
     if let Some(text) = doc.remove(root, "text")? {
-        move_field(doc, text, "format", root, "response_format")?;
+        if let Some(format) = move_field(doc, text, "format", root, "response_format")? {
+            nest_schema(doc, format)?;
+        }
         if doc.node(text)?.first.is_some() {
             let provider = provider(doc, x)?;
             doc.append(provider, text)?;
@@ -118,6 +120,20 @@ fn normalize_options(doc: &mut Document, owner: &mut Writer, x: usize, original:
             let provider = provider(doc, x)?;
             doc.append(provider, value)?;
         }
+    }
+    Ok(())
+}
+/// Nests the flat Responses `json_schema` format members under the canonical `json_schema`.
+fn nest_schema(doc: &mut Document, format: usize) -> Result<()> {
+    if !matches!(doc.node(format)?.value, Value::Object)
+        || !is(doc, format, "type", "json_schema")?
+        || doc.member(format, "json_schema")?.is_some()
+    {
+        return Ok(());
+    }
+    let schema = doc.set(format, "json_schema", Value::Object)?;
+    for name in ["name", "description", "schema", "strict"] {
+        move_field(doc, format, name, schema, name)?;
     }
     Ok(())
 }

@@ -1,7 +1,7 @@
 use super::*;
 
 /// Encodes a Chat request for a Responses upstream.
-fn from_chat(input: &Value) -> Value {
+pub(super) fn from_chat(input: &Value) -> Value {
     let mut m = Mapped::new();
     let mut ingress = codec::chat::request::Ingress::new(
         &mut m.writer,

@@ -92,7 +92,7 @@ fn write_field(doc: &Document, field: usize, e: &mut Encoder<'_, '_>) -> Result<
     e.bytes(b":")?;
     if doc.name_is(name, "response_format")? {
         e.bytes(b"{\"format\":")?;
-        doc.write(field, e)?;
+        write_format(doc, field, e)?;
         e.bytes(b"}")?;
     } else if doc.name_is(name, "tools")? {
         write_tools(doc, field, e)?;
@@ -107,6 +107,27 @@ fn write_field(doc: &Document, field: usize, e: &mut Encoder<'_, '_>) -> Result<
         doc.write(field, e)?;
     }
     Ok(())
+}
+/// Writes a canonical response format; Responses spells `json_schema` members flat.
+fn write_format(doc: &Document, format: usize, e: &mut Encoder<'_, '_>) -> Result<()> {
+    let schema = match doc.node(format)?.value {
+        Value::Object => doc.member(format, "json_schema")?,
+        _ => None,
+    };
+    let Some(schema) = schema.filter(|&s| matches!(doc.node(s).map(|n| n.value), Ok(Value::Object))) else {
+        return doc.write(format, e);
+    };
+    e.bytes(b"{")?;
+    let fields = doc.children(format)?.filter(|&f| f != schema);
+    for (i, f) in fields.chain(doc.children(schema)?).enumerate() {
+        if i > 0 {
+            e.bytes(b",")?;
+        }
+        doc.write_name(doc.node(f)?.name.ok_or(Error::Schema)?, e)?;
+        e.bytes(b":")?;
+        doc.write(f, e)?;
+    }
+    e.bytes(b"}")
 }
 /// Writes the function tools, then the native tool declarations kept in `x_ck.tools`.
 fn write_tools(doc: &Document, field: usize, e: &mut Encoder<'_, '_>) -> Result<()> {

@@ -20,6 +20,8 @@ mod recordings;
 mod request;
 #[path = "responses/response.rs"]
 mod response;
+#[path = "responses/review.rs"]
+mod review;
 // Test-only inclusion until the framework owner declares the production module.
 // Shared by every boundary codec; this protocol uses a subset.
 #[allow(dead_code)]
