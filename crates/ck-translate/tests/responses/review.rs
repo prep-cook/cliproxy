@@ -272,3 +272,22 @@ fn late_part_attributes_reach_the_client() {
     let out: Value = serde_json::from_str(&raw).unwrap();
     assert_eq!(out["output"][0]["content"][0]["vendor"], part["vendor"], "{out}");
 }
+
+#[test]
+fn lifecycle_status_and_fields_survive_a_terminal_snapshot_without_them() {
+    let records = [
+        json!({"type":"response.created","response":{"id":"r","status":"queued","metadata":{"k":"v"},"vendor":7}}),
+        json!({"type":"response.completed","response":{"id":"r","status":"completed","output":[]}}),
+    ];
+    let (out, events) = response(
+        wire(&records).as_bytes(),
+        BodyMode::Streaming,
+        BodyMode::Buffered,
+        Operation::Generate,
+    );
+    assert_eq!(events[0]["status"], "queued", "{}", events[0]);
+    let out: Value = serde_json::from_slice(&out).unwrap();
+    assert_eq!(out["metadata"], json!({"k":"v"}), "{out}");
+    assert_eq!(out["vendor"], 7);
+    assert_eq!(out["status"], "completed");
+}

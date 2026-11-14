@@ -207,7 +207,16 @@ impl State {
                     for name in ["id", "model", "created"] {
                         super::member(&base, base.root(), name, e)?;
                     }
-                    Ok(())
+                    match doc {
+                        Some((d, r)) => match d.member(r, "status")? {
+                            Some(status) if string(d, status).is_ok() => {
+                                e.bytes(b",\"status\":")?;
+                                d.write(status, e)
+                            }
+                            _ => Ok(()),
+                        },
+                        None => Ok(()),
+                    }
                 },
                 |e| e.bytes(b",\"source\":{\"protocol\":\"responses\"}"),
             )?;

@@ -59,6 +59,17 @@ impl State {
             return self.complete(owner, &doc, response);
         }
         if is(&doc, root, "type", "response.created")? || is(&doc, root, "type", "response.in_progress")? {
+            // Lifecycle fields the terminal snapshot may omit; egress merges the later values over them.
+            self.emitter.emit(
+                owner,
+                Kind::Opaque,
+                Scope::default(),
+                |e| {
+                    e.bytes(b",\"name\":\"responses.response\",\"format\":\"json\",\"value\":")?;
+                    object(&doc, doc.required(root, "response")?, &["output", "usage", "audio"], e)
+                },
+                |_| Ok(()),
+            )?;
             self.unknown(owner, &doc, &["type", "response"], source, event)?;
             return Ok(());
         }
