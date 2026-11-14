@@ -252,33 +252,3 @@ fn interleaved_items_and_content_keep_native_indexes_and_final_order() {
         assert_eq!(body["output"][0]["content"], first["content"]);
     }
 }
-
-#[test]
-fn legacy_redacted_thinking_is_not_reclassified_as_an_encryption_signature() {
-    let carrier = "claude-redacted-thinking:opaque\n+/=";
-    let body = json!({"id":"r","status":"completed","output":[{"id":"reason","type":"reasoning","encrypted_content":carrier,"summary":[]}]});
-    for mode in [BodyMode::Buffered, BodyMode::Streaming] {
-        let (output, canonical) = response(
-            &serde_json::to_vec(&body).unwrap(),
-            BodyMode::Buffered,
-            mode,
-            Operation::Generate,
-        );
-        assert!(canonical.iter().any(|event| event["data"] == "opaque\n+/="));
-        assert!(!canonical.iter().any(|event| event["kind"] == "responses_encrypted"));
-        let projected: Value = if mode == BodyMode::Buffered {
-            serde_json::from_slice(&output).unwrap()
-        } else {
-            std::str::from_utf8(&output)
-                .unwrap()
-                .lines()
-                .filter_map(|line| line.strip_prefix("data: "))
-                .map(|line| serde_json::from_str::<Value>(line).unwrap())
-                .next_back()
-                .unwrap()["response"]
-                .clone()
-        };
-        assert_eq!(projected["output"][0]["encrypted_content"], carrier);
-        assert!(projected["output"][0].get("content").is_none());
-    }
-}

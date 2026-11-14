@@ -148,7 +148,7 @@ impl State {
         Ok(())
     }
 
-    /// Publishes encrypted or redacted reasoning once as its own block; a repeat must be equal.
+    /// Publishes encrypted reasoning once as its own block; a repeat must be equal.
     fn encrypted(&mut self, owner: &mut Writer, at: usize, doc: &Document, encrypted: usize) -> Result<()> {
         string(doc, encrypted)?;
         let item = &mut self.items[at];
@@ -156,48 +156,19 @@ impl State {
             if item.closed {
                 return Err(Error::Schema);
             }
-            let mut chars = doc.chars(encrypted)?;
-            let mut redacted = true;
-            for c in super::super::REDACTED_PREFIX.chars() {
-                redacted &= chars.next_scalar()? == Some(c);
-            }
-            let index = u64::MAX;
-            let scope = item.scope(Some(index));
+            let scope = item.scope(Some(u64::MAX));
             self.emitter.emit(
                 owner,
                 Kind::BlockStart,
                 scope,
-                |e| {
-                    e.bytes(if redacted {
-                        b",\"kind\":\"thinking\",\"attributes\":{\"type\":\"redacted\"}"
-                    } else {
-                        b",\"kind\":\"thinking\",\"attributes\":{\"type\":\"encrypted\"}"
-                    })
-                },
+                |e| e.bytes(b",\"kind\":\"thinking\",\"attributes\":{\"type\":\"encrypted\"}"),
                 |_| Ok(()),
             )?;
             self.emitter.emit(
                 owner,
-                if redacted {
-                    Kind::ReasoningRedacted
-                } else {
-                    Kind::ReasoningSignature
-                },
+                Kind::ReasoningSignature,
                 scope,
                 |e| {
-                    if redacted {
-                        e.bytes(b",\"data\":")?;
-                        return e.quoted_json(|e| {
-                            let mut chars = doc.chars(encrypted)?;
-                            for _ in super::super::REDACTED_PREFIX.chars() {
-                                chars.next_scalar()?;
-                            }
-                            while let Some(c) = chars.next_scalar()? {
-                                e.bytes(c.encode_utf8(&mut [0; 4]).as_bytes())?;
-                            }
-                            Ok(())
-                        });
-                    }
                     e.bytes(b",\"kind\":\"responses_encrypted\",\"fragment\":")?;
                     doc.write(encrypted, e)?;
                     e.bytes(b",\"final\":true")

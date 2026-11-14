@@ -134,6 +134,13 @@ impl<F: FnMut(&'static str, u64)> Egress<F> {
         let At { node, x, .. } = at;
         let summary = is(&self.document, node, "kind", "reasoning_summary")?;
         let thinking = is(&self.document, node, "kind", "thinking")? || is(&self.document, node, "kind", "reasoning")?;
+        let attributes = self.document.member(node, "attributes")?;
+        if is(&self.document, node, "kind", "redacted")?
+            || attributes.map_or(Ok(false), |a| is(&self.document, a, "type", "redacted"))?
+        {
+            // Its data is dropped by `redacted`; no reasoning item is split out for it.
+            return Ok(());
+        }
         let (item, index) = if (summary || thinking) && is(&self.document, at.item, "type", "message")? {
             self.reasoning_item(owner, at, output)?
         } else {
@@ -142,7 +149,7 @@ impl<F: FnMut(&'static str, u64)> Egress<F> {
         let doc = &mut self.document;
         if thinking
             && let Some(attributes) = doc.member(node, "attributes")?
-            && (is(doc, attributes, "type", "encrypted")? || is(doc, attributes, "type", "redacted")?)
+            && is(doc, attributes, "type", "encrypted")?
         {
             return Ok(());
         }
@@ -280,20 +287,9 @@ impl<F: FnMut(&'static str, u64)> Egress<F> {
         Ok(())
     }
 
-    /// Restores a redacted reasoning carrier as encrypted content.
-    pub(super) fn redacted(&mut self, owner: &mut Writer, at: At) -> Result<()> {
-        let At { node, item, .. } = at;
-        let doc = &mut self.document;
-        let data = doc.required(node, "data")?;
-        let lease = encode::scratch(owner, |e| {
-            e.bytes(b"\"")?;
-            e.bytes(super::super::REDACTED_PREFIX.as_bytes())?;
-            doc.write_contents(data, e)?;
-            e.bytes(b"\"")
-        })?;
-        let carrier = doc.import_json(owner, lease)?;
-        let target = doc.set(item, "encrypted_content", Value::Null)?;
-        doc.transplant(target, carrier)?;
+    /// Drops redacted reasoning: Responses has no place for another provider's redacted data.
+    pub(super) fn redacted(&mut self) -> Result<()> {
+        (self.diagnostic)("redacted reasoning", 0);
         Ok(())
     }
 

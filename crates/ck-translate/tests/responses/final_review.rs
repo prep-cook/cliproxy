@@ -228,3 +228,137 @@ fn the_fence_refuses_missing_text_and_null_continuations() {
         assert!(fenced(&input), "{continuation}");
     }
 }
+
+/// Canonical `records` through Responses egress in `mode`; returns the client bytes and the
+/// names of the diagnostics egress reported.
+fn egress_of(
+    records: &[(codec::event::Kind, codec::event::Scope, &str)],
+    mode: BodyMode,
+) -> (Vec<u8>, Vec<&'static str>) {
+    let mut m = Mapped::new();
+    let mut reader = m.store.reader(m.writer.id(), 0).unwrap();
+    let mut emitter = codec::event::Emitter::new(identity(Direction::Response));
+    for (kind, scope, payload) in records {
+        emitter
+            .emit(
+                &mut m.writer,
+                *kind,
+                *scope,
+                |e| e.bytes(payload.as_bytes()),
+                |_| Ok(()),
+            )
+            .unwrap();
+    }
+    let diagnostics = std::cell::RefCell::new(Vec::new());
+    let mut egress = responses::egress::Egress::new(
+        &mut m.writer,
+        identity(Direction::Response),
+        Operation::Generate,
+        mode,
+        |name, _| diagnostics.borrow_mut().push(name),
+    )
+    .unwrap();
+    let mut out = Vec::new();
+    while let std::task::Poll::Ready(Some(ck_stream::Read::Record(record))) = reader.try_next() {
+        egress
+            .advance(&mut m.writer, record, |chunk| {
+                out.extend_from_slice(&bytes(&chunk));
+                Ok(())
+            })
+            .unwrap();
+    }
+    egress.finish().unwrap();
+    drop(egress);
+    (out, diagnostics.into_inner())
+}
+
+/// A message item scope with an optional block.
+fn scope(block: Option<u64>) -> codec::event::Scope {
+    codec::event::Scope {
+        choice_index: Some(0),
+        item_id: Some(codec::event::LocalId::new("i0").unwrap()),
+        block_index: block,
+        ..codec::event::Scope::default()
+    }
+}
+
+#[test]
+fn redacted_reasoning_has_no_responses_carrier() {
+    use codec::event::{Kind, Scope};
+    // Native encrypted content is a signature whatever its spelling.
+    let carrier = "claude-redacted-thinking:opaque";
+    let body = json!({"id":"r","status":"completed","output":[{"id":"rs","type":"reasoning","summary":[],"encrypted_content":carrier}]});
+    let (out, canonical) = response(
+        body.to_string().as_bytes(),
+        BodyMode::Buffered,
+        BodyMode::Buffered,
+        Operation::Generate,
+    );
+    assert!(
+        canonical
+            .iter()
+            .any(|e| e["kind"] == "responses_encrypted" && e["fragment"] == carrier)
+    );
+    assert!(!canonical.iter().any(|e| e.get("data").is_some()));
+    assert_eq!(
+        serde_json::from_slice::<Value>(&out).unwrap()["output"][0]["encrypted_content"],
+        carrier
+    );
+    // Redacted reasoning from another protocol has no place in Responses and is dropped.
+    let chunk = r#","object":"chat.completion.chunk","id":"r","model":"m","created":1,"choices":[{"index":0,"delta":{"content":"hi"},"finish_reason":null}]"#;
+    let finish = r#","object":"chat.completion.chunk","id":"r","model":"m","created":1,"choices":[{"index":0,"delta":{},"finish_reason":"stop"}]"#;
+    for start in [
+        r#","kind":"redacted""#,
+        r#","kind":"thinking","attributes":{"type":"redacted"}"#,
+    ] {
+        let records = [
+            (
+                Kind::ResponseStart,
+                Scope::default(),
+                r#","id":"r","model":"m","created":1"#,
+            ),
+            (Kind::ItemStart, scope(None), r#","kind":"message","role":"assistant""#),
+            (Kind::BlockStart, scope(Some(0)), start),
+            (Kind::ReasoningRedacted, scope(Some(0)), r#","data":"opaque""#),
+            (Kind::BlockEnd, scope(Some(0)), ""),
+            (Kind::BlockStart, scope(Some(1)), r#","kind":"text""#),
+            (Kind::Chunk, scope(Some(1)), chunk),
+            (Kind::BlockEnd, scope(Some(1)), ""),
+            (Kind::ItemEnd, scope(None), r#","status":"completed""#),
+            (
+                Kind::Chunk,
+                Scope {
+                    choice_index: Some(0),
+                    ..Scope::default()
+                },
+                finish,
+            ),
+            (Kind::Done, Scope::default(), ""),
+        ];
+        for (records, expected) in [(
+            &records[..],
+            json!([{"type":"output_text","text":"hi","annotations":[]}]),
+        )] {
+            for mode in [BodyMode::Buffered, BodyMode::Streaming] {
+                let (out, diagnostics) = egress_of(records, mode);
+                let text = String::from_utf8(out.clone()).unwrap();
+                assert!(
+                    !text.contains("opaque") && !text.contains("encrypted_content") && !text.contains("reasoning"),
+                    "{text}"
+                );
+                let body = match mode {
+                    BodyMode::Buffered => serde_json::from_slice::<Value>(&out).unwrap(),
+                    _ => client_events(&out).last().unwrap()["response"].clone(),
+                };
+                let output = body["output"].as_array().unwrap();
+                assert_eq!(
+                    output.first().map_or(Value::Null, |item| item["content"].clone()),
+                    expected,
+                    "{text}"
+                );
+                assert!(output.len() <= 1);
+                assert!(diagnostics.contains(&"redacted reasoning"), "{diagnostics:?}");
+            }
+        }
+    }
+}

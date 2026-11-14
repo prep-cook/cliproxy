@@ -164,7 +164,7 @@ impl<F: FnMut(&'static str, u64)> Egress<F> {
             Kind::ToolResult | Kind::Grounding | Kind::CodeExecution => self.execution(owner, kind, at, output),
             Kind::Chunk => self.chunk(owner, at, output),
             Kind::ReasoningSignature => self.signature(at),
-            Kind::ReasoningRedacted => self.redacted(owner, at),
+            Kind::ReasoningRedacted => self.redacted(),
             Kind::Annotation => self.annotation(owner, at, output),
             Kind::BlockEnd => self.block_end(owner, at, output),
             Kind::ToolEnd => self.tool_end(owner, at, output),

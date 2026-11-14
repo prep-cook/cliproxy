@@ -10,8 +10,6 @@ pub mod response;
 mod snapshot;
 mod usage;
 
-const REDACTED_PREFIX: &str = "claude-redacted-thinking:";
-
 use crate::boundary::{failure, is, mapped, member, object, string};
 use crate::codec::table::Table;
 use crate::codec::{
