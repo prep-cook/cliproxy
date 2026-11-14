@@ -29,7 +29,7 @@ pub(super) fn validate(view: RequestView<'_>) -> Result<()> {
     let x = doc.required(root, "x_ck")?;
     extensions(doc, x)?;
     tools(doc, root, x)?;
-    tool_choice(doc, root)
+    tool_choice(doc, root, x)
 }
 /// Checks the top-level generation parameters and returns the messages array.
 fn parameters(doc: &Document, root: usize, operation: Operation) -> Result<usize> {
@@ -217,7 +217,7 @@ fn tools(doc: &Document, root: usize, x: usize) -> Result<()> {
     }
     Ok(())
 }
-fn tool_choice(doc: &Document, root: usize) -> Result<()> {
+fn tool_choice(doc: &Document, root: usize, x: usize) -> Result<()> {
     let Some(choice) = doc.member(root, "tool_choice")? else {
         return Ok(());
     };
@@ -235,6 +235,20 @@ fn tool_choice(doc: &Document, root: usize) -> Result<()> {
         for tool in doc.children(tools)? {
             if let Some(function) = doc.member(tool, "function")? {
                 declared |= doc.equal_strings(name, doc.required(function, "name")?)?;
+            }
+        }
+        // Server tools keep their native declaration, bound to a tools entry.
+        if let Some(declarations) = doc.member(x, "tools")? {
+            for entry in doc.children(declarations)? {
+                let bound = doc
+                    .origin(entry)?
+                    .is_some_and(|(tool, _)| doc.node(tool).is_ok_and(|node| node.parent == Some(tools)));
+                if bound
+                    && let Some(declaration) = doc.member(entry, "declaration")?
+                    && let Some(server) = doc.member(declaration, "name")?
+                {
+                    declared |= doc.equal_strings(name, server)?;
+                }
             }
         }
         if !declared {

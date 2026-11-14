@@ -1,5 +1,5 @@
 //! Regression tests for the Anthropic codec review findings.
-use crate::{BodyMode, Operation, events, json, request_fragmented, response, sse};
+use crate::{BodyMode, Operation, events, json, request, request_fragmented, response, sse};
 
 #[test]
 fn media_whose_type_follows_its_data_publishes_one_lifetime() {
@@ -48,4 +48,12 @@ fn delta_after_choice_finish_stays_stream_scoped() {
     let late = native.iter().filter(|v| v["type"] == "message_delta").nth(1).unwrap();
     assert_eq!(late["delta"], rows[2]["delta"]);
     assert_eq!(late["usage"]["output_tokens"], 3);
+}
+
+#[test]
+fn declared_server_tool_can_be_chosen_by_name() {
+    let body = json!({"model":"m","max_tokens":10,"messages":[{"role":"user","content":"x"}],"tools":[{"type":"web_search_20250305","name":"web_search"}],"tool_choice":{"type":"tool","name":"web_search"}});
+    let (out, _) = request(&serde_json::to_vec(&body).unwrap(), Operation::Generate);
+    assert_eq!(out["tool_choice"], body["tool_choice"]);
+    assert_eq!(out["tools"], body["tools"]);
 }

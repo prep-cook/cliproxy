@@ -415,6 +415,10 @@ fn undeclared_tool_choice_and_streamed_count_fail_the_request_schema() {
             json!({"model":"m","max_tokens":1,"messages":[{"role":"user","content":"x"}],"tools":[{"name":"f","input_schema":{"type":"object"}}],"tool_choice":{"type":"tool","name":"g"}}),
         ),
         (
+            Operation::Generate,
+            json!({"model":"m","max_tokens":1,"messages":[{"role":"user","content":"x"}],"tools":[{"type":"web_search_20250305","name":"web_search"}],"tool_choice":{"type":"tool","name":"g"}}),
+        ),
+        (
             Operation::CountTokens,
             json!({"model":"m","stream":true,"messages":[{"role":"user","content":"x"}]}),
         ),
