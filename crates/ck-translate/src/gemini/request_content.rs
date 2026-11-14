@@ -221,7 +221,11 @@ fn media_part(owner: &mut Writer, doc: &mut Document, part: usize, data: usize, 
     let payload = doc
         .remove(data, if inline { "data" } else { "fileUri" })?
         .ok_or(Error::Schema)?;
-    super::string(doc, payload)?;
+    // Inline data streamed during ingress is already a media reference; `register` checks
+    // that every other inline payload is a string.
+    if !inline {
+        super::string(doc, payload)?;
+    }
     let source = doc.set(part, "source", Value::Object)?;
     doc.set(source, "kind", Value::Text(if inline { "data" } else { "uri" }))?;
     doc.rename(payload, if inline { "ref" } else { "uri" })?;
@@ -261,6 +265,9 @@ pub(super) fn register(doc: &mut Document, media: &mut Registry) -> Result<()> {
                 && super::is(doc, source, "kind", "data")?
             {
                 let node = doc.required(source, "ref")?;
+                if media.get(doc, node)?.is_some() {
+                    continue;
+                }
                 let Value::String(data) = doc.node(node)?.value else {
                     return Err(Error::Schema);
                 };

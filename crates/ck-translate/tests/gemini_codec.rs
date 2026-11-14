@@ -7,6 +7,8 @@ pub mod boundary;
 pub mod codec;
 #[path = "../src/gemini/boundary.rs"]
 pub mod gemini;
+#[path = "gemini/incremental.rs"]
+mod incremental;
 #[path = "semantic/mod.rs"]
 mod semantic;
 #[path = "gemini/streams.rs"]
