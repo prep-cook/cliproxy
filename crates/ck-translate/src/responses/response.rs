@@ -220,7 +220,25 @@ impl State {
                         None => Ok(()),
                     }
                 },
-                |e| e.bytes(b",\"source\":{\"protocol\":\"responses\"}"),
+                |e| {
+                    e.bytes(b",\"source\":{\"protocol\":\"responses\"}")?;
+                    let mut first = true;
+                    for (name, native) in [("id", "id"), ("model", "model"), ("created", "created_at")] {
+                        let supplied = match doc {
+                            Some((d, r)) => d.member(r, native)?.is_some(),
+                            None => false,
+                        };
+                        if !supplied {
+                            e.bytes(if first { b",\"synthetic\":[" } else { b"," })?;
+                            first = false;
+                            e.string(name)?;
+                        }
+                    }
+                    if !first {
+                        e.bytes(b"]")?;
+                    }
+                    Ok(())
+                },
             )?;
         }
         self.base = Some(base);

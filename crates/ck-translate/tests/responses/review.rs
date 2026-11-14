@@ -478,3 +478,29 @@ fn canonical_usage_counts_win_over_the_native_value() {
     );
     assert_eq!(serde_json::from_slice::<Value>(&out).unwrap()["usage"], usage);
 }
+
+#[test]
+fn generated_response_identity_is_marked_synthetic() {
+    for (body, synthetic) in [
+        (
+            json!({"status":"completed","output":[]}),
+            Some(json!(["id", "model", "created"])),
+        ),
+        (
+            json!({"id":"r","status":"completed","output":[]}),
+            Some(json!(["model", "created"])),
+        ),
+        (
+            json!({"id":"r","model":"m","created_at":1,"status":"completed","output":[]}),
+            None,
+        ),
+    ] {
+        let (_, events) = response(
+            &serde_json::to_vec(&body).unwrap(),
+            BodyMode::Buffered,
+            BodyMode::Buffered,
+            Operation::Generate,
+        );
+        assert_eq!(events[0]["x_ck"].get("synthetic"), synthetic.as_ref(), "{}", events[0]);
+    }
+}
