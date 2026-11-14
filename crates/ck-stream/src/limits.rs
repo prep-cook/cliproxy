@@ -34,7 +34,9 @@ impl Config {
             startup_reserve_bytes: None,
             max_frames: None,
             max_event_bytes: 1024 * 1024,
-            max_metadata_bytes: 1024 * 1024,
+            // Owner number (docs/OPEN-QUESTIONS.md, Settled 48): Codex-style requests carry
+            // hundreds of tool rounds, and 1 MiB held about 73 Chat rounds.
+            max_metadata_bytes: 8 * 1024 * 1024,
             cache_ttl: Duration::from_secs(3600),
             header_slots: 4096,
             workers: std::thread::available_parallelism().map_or(1, usize::from),
