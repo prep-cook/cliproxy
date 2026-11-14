@@ -19,7 +19,9 @@ use write::write_request;
 
 pub struct Ingress {
     owner: u64,
-    input: input::Input,
+    /// The wire input until `prepare` consumes the last of it; then only `document` remains.
+    input: Option<input::Input>,
+    document: Option<Document>,
     media: Registry,
     emitter: Emitter,
     reader: ck_stream::Reader,
@@ -40,7 +42,8 @@ impl Ingress {
         }
         Ok(Self {
             owner: owner.id(),
-            input: input::Input::new(owner, limit)?,
+            input: Some(input::Input::new(owner, limit)?),
+            document: None,
             media: Registry::new(owner)?,
             emitter: Emitter::new(identity),
             reader: store.reader(owner.id(), 0)?,
@@ -50,7 +53,7 @@ impl Ingress {
         })
     }
     fn consume(&mut self, owner: &mut Writer, flush: bool) -> Result<()> {
-        self.input.consume(
+        self.input.as_mut().ok_or(Error::Closed)?.consume(
             owner,
             &mut self.media,
             &mut self.emitter,
@@ -60,9 +63,13 @@ impl Ingress {
         )
     }
     fn prepare(&mut self, owner: &mut Writer) -> Result<()> {
-        self.input.pending.finish()?;
+        self.input.as_mut().ok_or(Error::Closed)?.pending.finish()?;
         self.consume(owner, true)?;
-        let document = &mut self.input.pending.document;
+        // Release the wire scanner and node map before normalization grows the document, as
+        // the Chat codec does after its last scan: nothing reads them past the last consume.
+        let input = self.input.take().ok_or(Error::Closed)?;
+        let published_media = input.published_media;
+        let document = self.document.insert(input.into_document());
         self.media.validate_registrations(document, 0)?;
         normalize(document, owner, self.operation)?;
         self.media.relocate_ingress(document, 0)?;
@@ -84,7 +91,7 @@ impl Ingress {
             owner,
             &mut self.reader,
         )?;
-        for index in self.input.published_media..self.media.len() {
+        for index in published_media..self.media.len() {
             codec::media::publish(
                 document,
                 self.media.at(index),
@@ -99,14 +106,18 @@ impl Ingress {
 }
 impl codec::RequestIngress for Ingress {
     fn flush_deadline(&self) -> Option<std::time::Instant> {
-        self.input.deadline()
+        self.input.as_ref()?.deadline()
     }
 
     fn advance(&mut self, owner: &mut Writer, bytes: &[u8]) -> Result<()> {
         crate::boundary::enter(self.owner, owner, self.closed)?;
         let result = (|| {
             for chunk in bytes.chunks(8192) {
-                self.input.pending.advance(owner, chunk)?;
+                self.input
+                    .as_mut()
+                    .ok_or(Error::Closed)?
+                    .pending
+                    .advance(owner, chunk)?;
                 self.consume(owner, false)?;
             }
             if bytes.is_empty() {
@@ -123,7 +134,7 @@ impl codec::RequestIngress for Ingress {
         let prepared = self.prepare(owner);
         crate::boundary::reported(prepared, &mut self.emitter, owner, true)?;
         let view = RequestView {
-            document: &self.input.pending.document,
+            document: self.document.as_ref().ok_or(Error::Closed)?,
             media: &self.media,
             operation: self.operation,
         };
