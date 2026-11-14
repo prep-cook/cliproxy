@@ -256,3 +256,11 @@ fn streaming_clients_see_the_lifecycle_status() {
         ]
     );
 }
+
+#[test]
+fn function_tool_choice_keeps_its_extensions() {
+    let input = json!({"model":"m","input":"q","tools":[{"type":"function","name":"f","parameters":{}}],
+        "tool_choice":{"type":"function","name":"f","vendor":{"a":null}}});
+    let (output, _) = request(&input, Operation::Generate);
+    assert_eq!(output["tool_choice"], input["tool_choice"]);
+}

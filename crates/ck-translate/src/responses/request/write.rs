@@ -117,7 +117,18 @@ fn write_field(doc: &Document, field: usize, e: &mut Encoder<'_, '_>) -> Result<
         && matches!(doc.node(field)?.value, Value::Object)
         && is(doc, field, "type", "function")?
     {
-        e.bytes(b"{\"type\":\"function\"")?;
+        // Responses spells the function name flat; every other member, `type` first, stays.
+        let mut first = true;
+        for f in doc.children(field)? {
+            let n = doc.node(f)?.name.ok_or(Error::Schema)?;
+            if !doc.name_is(n, "function")? {
+                e.bytes(if first { b"{" } else { b"," })?;
+                first = false;
+                doc.write_name(n, e)?;
+                e.bytes(b":")?;
+                doc.write(f, e)?;
+            }
+        }
         member(doc, doc.required(field, "function")?, "name", e)?;
         e.bytes(b"}")?;
     } else {
