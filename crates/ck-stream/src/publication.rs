@@ -71,6 +71,13 @@ impl Index {
     }
 }
 
+/// The fewest entries a metadata table grows by, so small tables do not reallocate per push.
+const MIN_GROWTH: usize = 4;
+
+/// Grows `entries` to hold `needed` within `budget` bytes. A step adds a quarter of `needed`,
+/// at least [`MIN_GROWTH`]: each step multiplies the capacity by at least 1.25, so pushes stay
+/// amortized O(1), while the unused tail stays within a quarter of the use rather than the
+/// half of a doubling step, leaving that headroom to the stream's other metadata.
 fn reserve_metadata<T>(entries: &mut VecDeque<T>, needed: usize, budget: usize) -> Result<(), Error> {
     if needed <= entries.capacity() {
         return Ok(());
@@ -79,7 +86,7 @@ fn reserve_metadata<T>(entries: &mut VecDeque<T>, needed: usize, budget: usize) 
     if needed > maximum {
         return Err(Error::StorageExhausted);
     }
-    let capacity = needed.max(entries.capacity().saturating_mul(2)).min(maximum);
+    let capacity = needed.saturating_add((needed / 4).max(MIN_GROWTH)).min(maximum);
     entries
         .try_reserve_exact(capacity - entries.len())
         .map_err(|_| Error::StorageExhausted)
@@ -363,4 +370,51 @@ fn last_frame(record: Record) -> u64 {
 
 fn millis(time: Duration) -> u64 {
     u64::try_from(time.as_millis()).unwrap_or(u64::MAX)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Pushes `count` entries one by one and returns every capacity a growth step chose.
+    fn steps(count: usize, budget: usize) -> Vec<usize> {
+        let mut entries = VecDeque::<u64>::new();
+        let mut capacities = Vec::new();
+        for value in 0..count as u64 {
+            let before = entries.capacity();
+            let needed = entries.len() + 1;
+            reserve_metadata(&mut entries, needed, budget).unwrap();
+            if entries.capacity() != before {
+                capacities.push(entries.capacity());
+            }
+            entries.push_back(value);
+        }
+        capacities
+    }
+
+    #[test]
+    fn metadata_tables_grow_by_a_quarter_with_a_floor() {
+        let capacities = steps(100_000, usize::MAX);
+        // Small tables take the floor rather than one entry per push.
+        assert_eq!(capacities[..3], [5, 10, 15]);
+        for pair in capacities.windows(2) {
+            let (before, after) = (pair[0], pair[1]);
+            // `needed` is `before + 1`: a quarter of it, never a doubling.
+            assert_eq!(after, before + 1 + ((before + 1) / 4).max(MIN_GROWTH));
+        }
+        // Geometric growth: about log(100,000) / log(1.25) steps, so pushes stay O(1) amortized.
+        assert!(capacities.len() <= 50, "{} steps", capacities.len());
+    }
+
+    #[test]
+    fn metadata_tables_stop_at_the_budget() {
+        let budget = 100 * std::mem::size_of::<u64>();
+        assert_eq!(*steps(100, budget).last().unwrap(), 100);
+        let mut entries = VecDeque::<u64>::new();
+        assert!(matches!(
+            reserve_metadata(&mut entries, 101, budget),
+            Err(Error::StorageExhausted)
+        ));
+        assert_eq!(entries.capacity(), 0);
+    }
 }
