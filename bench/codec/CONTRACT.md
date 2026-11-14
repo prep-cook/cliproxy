@@ -1,6 +1,6 @@
 # External codec workload contract v1
 
-`bench/codec-gate.sh OLD_CODEC NEW_CODEC OUT` compares two executable workload harnesses, not gateway binaries. `build-baseline.sh` builds a real instrumented harness against the pinned old pair implementation. The new codec harness is future work.
+`bench/codec-gate.sh OLD_CODEC NEW_CODEC OUT` compares two executable workload harnesses, not gateway binaries. `build-baseline.sh` builds a real instrumented harness against the pinned old pair implementation. `build-new.sh` builds the new boundary-codec harness; it covers Chat and Anthropic only, so the full gate exits 2 until the other protocols merge.
 
 ## Run the gate
 
@@ -167,6 +167,27 @@ bench/codec/build-baseline.sh "$BASELINE_SOURCE" "$ARTIFACTS/baseline-build"
 The builder reads the detached HEAD file without Git writes and refuses another revision. It creates a standalone crate only in the empty external output directory. The crate depends on the baseline's `ck-core`, `ck-wire` and `ck-translate` paths and patches gjson to baseline `vendor/gjson`. It copies the original Cargo.lock, updates the external lock's root/workspace membership offline, then builds `--offline --locked --release`. It does not edit baseline production sources or workspace manifests. Retain original/resolved locks, source-file checksums, compiler/profile/features/flags, build logs, binary checksum and `provenance.json` beside `old-codec-harness` and its `baseline-harness` launcher.
 
 `--run` requires private cgroup v2 accounting and writes detailed per-workload counters/smaps/charges into `CODEC_EVIDENCE_DIR`; the driver supplies a separate directory per side/round. The launcher extracts each workload into a temporary execution manifest, records both original and execution manifest checksums, and returns records bound to the unchanged original manifest. Direct invocations default to a unique evidence directory beside the built binary. On 2026-11-14 a round over all 371 workloads exited 0 with a valid record for each, so the baseline's error paths do not abort the corpus. A 550-second launcher deadline leaves cleanup time before the driver's 600-second timeout. Keep built artifacts separate from the captured baseline. No old/new performance acceptance is possible until the new harness implements the same external work and accounting contract.
+
+## Build the new harness
+
+From a checkout whose harness inputs are committed, run:
+
+```sh
+bench/codec/build-new.sh "$SOURCE" "$ARTIFACTS/new-build"
+"$ARTIFACTS/new-build/new-harness" --describe
+```
+
+The builder refuses uncommitted changes to its inputs (`crates/ck-stream`, the S1 codec modules, `Cargo.toml`, `Cargo.lock` and the harness files) because the revision would not name the measured code. It refuses the baseline revision. It generates a standalone crate in the empty external output directory that includes the codec modules by path, as the codec integration tests do, and enables `ck-stream`'s `bench-hooks` feature for the metadata metric. Build variables and defaults match `build-baseline.sh`, with `CARGO_TARGET_DIR=/scratch/ssd/codecbench-target`. `CODEC_POOL_DIRECTORY` (default `/scratch/ram/codecbench-pool`) must be on tmpfs; it is the reported `storage_directory`.
+
+The new harness runs each request row through the client protocol's request ingress and the upstream protocol's request egress, and each response row through the upstream response ingress and the client response egress, over one ck-stream store per worker process. Each operation uses a fresh writer and ends it with `Terminal::Gone`, the release-at-completion retention. Its launcher reuses `baseline_launcher.worker`, so cgroup accounting is identical. The corpus keeps Go-era input conventions, and the harness adapts only these:
+
+- A request object without `model` gets the fixture's `model` as its first member; the old pair received it in `RequestCtx`.
+- Each recorded SSE line gets its line terminator, and every line except `event:`, `id:` and `retry:` also ends its event. A `non_stream` body recorded as SSE lines is read by streaming upstream ingress and buffered client egress.
+- A refused request emits `REFUSED:<error>`, as the baseline does; a buffered response or count that failed without output emits `REFUSED:boundary`.
+
+A workload naming a protocol without a merged codec exits nonzero. To add one, extend `Protocol` and its role constructors in `new/protocols.rs` and `CODEC_MODULES` in `build_new.py`.
+
+Until every protocol is covered, `partial.py --protocols openai,claude OLD NEW OUT` runs the gate's own manifest, describe checks, noise band, rounds and thresholds over the workloads whose client and upstream are both listed. Its summary is marked `acceptance_evidence: false`; it never replaces the gate. `report.py OUT` renders any gate or partial summary as Markdown tables of every metric.
 
 ## Run synthetic controls
 
