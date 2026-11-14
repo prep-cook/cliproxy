@@ -336,7 +336,9 @@ fn write_item(doc: &Document, item: usize, e: &mut Encoder<'_, '_>) -> Result<()
         first = false;
         doc.write_name(name, e)?;
         e.bytes(b":")?;
-        if doc.name_is(name, "content")? || doc.name_is(name, "summary")? {
+        if (doc.name_is(name, "content")? || doc.name_is(name, "summary")?)
+            && matches!(doc.node(field)?.value, Value::Array)
+        {
             e.bytes(b"[")?;
             for (i, part) in doc.children(field)?.enumerate() {
                 if i > 0 {

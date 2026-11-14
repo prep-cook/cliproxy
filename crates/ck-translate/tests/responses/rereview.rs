@@ -1,5 +1,6 @@
 //! Re-review of the final codec review: closing reconciliation, opaque parts, failures and the
 //! lifecycle a streaming client sees.
+use super::final_events::buffered_output;
 use super::final_review::try_streamed;
 use super::*;
 
@@ -42,4 +43,27 @@ fn closing_snapshots_merge_nested_and_opaque_members() {
 fn empty_arrays_first_supplied_at_close_keep_their_presence() {
     let done = json!({"type":"output_text","text":"hi","annotations":[],"logprobs":[]});
     assert_eq!(closed_part(json!({"type":"output_text","text":""}), done.clone()), done);
+}
+
+#[test]
+fn unknown_items_keep_every_member() {
+    let future = json!([{"id":"i","type":"future_tool","status":"completed","content":"opaque-content",
+        "summary":"opaque-summary","encrypted_content":"E","input":"payload","arguments":"arg"}]);
+    assert_eq!(buffered_output(future.clone()), future);
+    // Parts and encryption of an unknown item open no blocks.
+    let parts = json!([{"id":"i","type":"future_tool","status":"completed","encrypted_content":"E",
+        "content":[{"type":"output_text","text":"x"}],"summary":[{"type":"summary_text","text":"y"}]}]);
+    let body = json!({"id":"r","status":"completed","output":parts});
+    let (out, canonical) = response(
+        body.to_string().as_bytes(),
+        BodyMode::Buffered,
+        BodyMode::Buffered,
+        Operation::Generate,
+    );
+    let blocks: Vec<_> = canonical
+        .iter()
+        .filter(|e| e["x_ck"]["block_index"].is_number())
+        .collect();
+    assert!(blocks.is_empty(), "{blocks:?}");
+    assert_eq!(serde_json::from_slice::<Value>(&out).unwrap()["output"], parts);
 }

@@ -90,7 +90,7 @@ fn a_shorter_terminal_array_contradicts_published_parts() {
 }
 
 /// Buffered Responses `output` replayed to a buffered client; returns the client's output.
-fn buffered_output(output: Value) -> Value {
+pub(super) fn buffered_output(output: Value) -> Value {
     let body = json!({"id":"r","status":"completed","output":output});
     let (out, _) = response(
         body.to_string().as_bytes(),

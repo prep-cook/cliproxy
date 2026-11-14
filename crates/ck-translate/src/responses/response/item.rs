@@ -121,8 +121,11 @@ impl State {
         {
             self.image(owner, at, doc, data, None)?;
         }
+        let mapped = mapped_parts(&self.items[at].doc, self.items[at].doc.root())?;
         for (name, summary) in [("content", false), ("summary", true)] {
-            if let Some(parts) = doc.member(node, name)? {
+            if mapped.contains(&name)
+                && let Some(parts) = doc.member(node, name)?
+            {
                 let mut supplied = 0;
                 for (index, part) in doc.children(parts)?.enumerate() {
                     self.block(owner, at, (index as u64, summary), doc, part, (close, close))?;
@@ -159,11 +162,15 @@ impl State {
     /// Reconciles `encrypted_content`. A value before the item closes is provisional, since
     /// `output_item.added` may carry an incomplete one: at close the snapshot's value, else the
     /// provisional one, is published once as its own block, and later snapshots must equal it.
-    /// Null publishes nothing and stays a native attribute (`item_metadata`).
+    /// Null publishes nothing and stays a native attribute (`item_metadata`), as does the value
+    /// of an item type that maps no encryption.
     fn encrypted(&mut self, owner: &mut Writer, at: usize, doc: &Document, node: usize, close: bool) -> Result<()> {
         let incoming = doc.member(node, "encrypted_content")?;
         let item = &mut self.items[at];
         let root = item.doc.root();
+        if !mapped_parts(&item.doc, root)?.contains(&"encrypted_content") {
+            return Ok(());
+        }
         if item.encrypted {
             let published = item.doc.required(root, "encrypted_content")?;
             return match incoming {
@@ -345,8 +352,27 @@ fn item_metadata(doc: &Document, node: usize, e: &mut Encoder<'_, '_>) -> Result
         Some(value) => matches!(doc.node(value)?.value, Value::Null),
         None => false,
     };
-    let mut kept = ["content", "summary", "encrypted_content", "", "", "", ""];
-    let count = if null { 2 } else { 3 };
-    kept[count..count + consumed.len()].copy_from_slice(consumed);
-    object(doc, node, &kept[..count + consumed.len()], e)
+    let mut kept = [""; 7];
+    let mut count = 0;
+    for name in mapped_parts(doc, node)?.iter().chain(consumed) {
+        if !(null && *name == "encrypted_content") {
+            kept[count] = name;
+            count += 1;
+        }
+    }
+    object(doc, node, &kept[..count], e)
+}
+
+/// The part and encryption members that item `node`'s type maps to blocks: a message (or an
+/// untyped item) its content, reasoning all three. Other types keep them as attributes.
+fn mapped_parts(doc: &Document, node: usize) -> Result<&'static [&'static str]> {
+    Ok(
+        if doc.member(node, "type")?.is_none() || is(doc, node, "type", "message")? {
+            &["content"]
+        } else if is(doc, node, "type", "reasoning")? {
+            &["content", "summary", "encrypted_content"]
+        } else {
+            &[]
+        },
+    )
 }
