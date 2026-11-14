@@ -62,6 +62,12 @@ pub fn pointer(doc: &Document, mut node: usize, e: &mut Encoder<'_, '_>) -> Resu
     e.bytes(b"\"")
 }
 
+#[cfg(test)]
+thread_local! {
+    /// Member names [`Segment::matches`] compared on this thread, so tests can bound lookups.
+    pub(crate) static COMPARED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 /// One escaped pointer segment, decoded lazily from document storage.
 #[derive(Clone)]
 pub struct Segment<'a> {
@@ -113,6 +119,8 @@ impl Segment<'_> {
         Ok(chars.next()?.is_none())
     }
     pub fn matches(&self, doc: &Document, name: Name) -> Result<bool> {
+        #[cfg(test)]
+        COMPARED.with(|compared| compared.set(compared.get() + 1));
         let mut chars = self.clone();
         let mut name = doc.name_chars(name)?;
         loop {
@@ -179,20 +187,21 @@ pub fn resolve_parent(doc: &Document, pointer: usize) -> Result<usize> {
     resolve_to(doc, doc.chars(pointer)?, true, &mut |_, _| Ok(None))
 }
 
-/// Like [`resolve_parent`]; `element(array, index)` may name an array element without a walk.
+/// Like [`resolve_parent`]; `child(container, segment)` may name the child a segment selects
+/// without a walk or scan, and `None` falls back to one.
 pub(crate) fn resolve_parent_indexed(
     doc: &Document,
     pointer: Characters<'_>,
-    element: &mut dyn FnMut(usize, usize) -> Result<Option<usize>>,
+    child: &mut dyn FnMut(usize, &Segment<'_>) -> Result<Option<usize>>,
 ) -> Result<usize> {
-    resolve_to(doc, pointer, true, element)
+    resolve_to(doc, pointer, true, child)
 }
 
 fn resolve_to(
     doc: &Document,
     mut chars: Characters<'_>,
     parent_only: bool,
-    element: &mut dyn FnMut(usize, usize) -> Result<Option<usize>>,
+    child: &mut dyn FnMut(usize, &Segment<'_>) -> Result<Option<usize>>,
 ) -> Result<usize> {
     match chars.next_scalar()? {
         None => return Ok(doc.root()),
@@ -205,33 +214,28 @@ fn resolve_to(
         if last && parent_only {
             return Ok(parent);
         }
-        parent = match doc.node(parent)?.value {
-            Value::Object => {
-                // ponytail: scans members; `read_request` indexes them only for placement, so
-                // descents stay quadratic. The metadata quota bounds the member count, not the
-                // decoded name length each comparison reads; about 0.3 ms is one sampled shape,
-                // not a ceiling (docs/DEFERRED-OPTIONS.md).
-                let mut found = None;
-                for child in doc.children(parent)? {
-                    if name.matches(doc, doc.node(child)?.name.ok_or(Error::Schema)?)? {
-                        found = Some(child);
-                        break;
-                    }
-                }
-                found.ok_or(Error::Schema)?
-            }
-            Value::Array => {
-                let index = name.index()?;
-                // ponytail: an element other than the indexed last one is reached by walking;
-                // binding restore pays this per entry. The default metadata quota limits the
-                // entries; 0.06 ms is one sampled shape, not a ceiling (docs/DEFERRED-OPTIONS.md).
-                match element(parent, index)? {
-                    Some(child) => child,
-                    None => doc.children(parent)?.nth(index).ok_or(Error::Schema)?,
+        let value = doc.node(parent)?.value;
+        if !matches!(value, Value::Object | Value::Array) {
+            return Err(Error::Schema);
+        }
+        if let Some(found) = child(parent, &name)? {
+            parent = found;
+        } else if matches!(value, Value::Object) {
+            // Without an index, as in binding restore, scan the members.
+            let mut found = None;
+            for member in doc.children(parent)? {
+                if name.matches(doc, doc.node(member)?.name.ok_or(Error::Schema)?)? {
+                    found = Some(member);
+                    break;
                 }
             }
-            _ => return Err(Error::Schema),
-        };
+            parent = found.ok_or(Error::Schema)?;
+        } else {
+            // ponytail: an element other than the indexed last one is reached by walking;
+            // binding restore pays this per entry. The default metadata quota limits the
+            // entries; 0.06 ms is one sampled shape, not a ceiling (docs/DEFERRED-OPTIONS.md).
+            parent = doc.children(parent)?.nth(name.index()?).ok_or(Error::Schema)?;
+        }
         if last {
             return Ok(parent);
         }

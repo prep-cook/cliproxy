@@ -93,7 +93,8 @@ pub fn read_request(owner: &mut Writer, reader: &mut Reader) -> Result<(Document
     }
 }
 
-/// Indexes of the containers that fields fill, so placing a field never walks earlier siblings.
+/// Indexes of the containers that fields fill and descend through, so neither placing a field
+/// nor resolving its parent walks earlier siblings.
 /// An array keeps its child count and last child: fields arrive in order, so the element a field
 /// appends or descends into is nearly always the last one. An object maps the hash of each
 /// member name to the member, under the build that indexed it; a field whose hash is absent
@@ -198,8 +199,12 @@ fn field(doc: &mut Document, counts: &mut Counts, mut event: Document) -> Result
         counts.replaced(doc.root());
         return Ok(doc.root());
     }
-    let parent = provenance::resolve_parent_indexed(doc, doc.text_chars(pointer)?, &mut |array, index| {
-        let (count, last) = *counts.get(doc, array)?;
+    let parent = provenance::resolve_parent_indexed(doc, doc.text_chars(pointer)?, &mut |container, name| {
+        if !matches!(doc.node(container)?.value, Value::Array) {
+            return counts.member(doc, container, name);
+        }
+        let index = name.clone().index()?;
+        let (count, last) = *counts.get(doc, container)?;
         Ok(last.filter(|_| index + 1 == count))
     })?;
     let array = matches!(doc.node(parent)?.value, Value::Array);
@@ -330,4 +335,52 @@ fn register(
         return Err(Error::Schema);
     }
     Ok(registry)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::{ChatCapability, Ingress};
+    use crate::codec::{
+        Operation, RequestIngress,
+        event::{Direction, Identity, LocalId},
+        provenance::COMPARED,
+    };
+
+    /// Resolving each field's parent through objects with n members compares a bounded number
+    /// of names per field, rather than scanning the members before it.
+    #[test]
+    fn object_valued_metadata_keys_resolve_in_linear_comparisons() {
+        let n = 4000;
+        let keys: Vec<_> = (0..n).map(|i| format!(r#""k{i}":{{"a":1}}"#)).collect();
+        let input = format!(
+            r#"{{"model":"m","metadata":{{{}}},"messages":[{{"role":"user","content":"hi"}}]}}"#,
+            keys.join(",")
+        );
+        let directory = std::env::temp_dir().join(format!("ck-records-members-{}", uuid::Uuid::new_v4()));
+        let mut config = ck_stream::Config::new(directory.clone());
+        config.workers = 1;
+        let mut store =
+            ck_stream::Store::with_clock(config, std::sync::Arc::new(ck_stream::ManualClock::default())).unwrap();
+        let mut owner = store.create().unwrap();
+        let identity = Identity {
+            request_id: LocalId::new("request").unwrap(),
+            stream_id: LocalId::new("stream").unwrap(),
+            attempt: 1,
+            direction: Direction::Request,
+        };
+        let mut ingress = Ingress::new(&mut owner, &store, identity, Operation::Generate, 1 << 30).unwrap();
+        ingress.advance(&mut owner, input.as_bytes()).unwrap();
+        ingress.finish(&mut owner, &ChatCapability).unwrap();
+        drop(ingress);
+        let mut reader = store.reader(owner.id(), 0).unwrap();
+        let before = COMPARED.with(|compared| compared.get());
+        let (doc, _) = super::read_request(&mut owner, &mut reader).unwrap();
+        let compared = COMPARED.with(|compared| compared.get()) - before;
+        assert!(compared <= 4 * n, "{compared} name comparisons for {n} keys");
+        let metadata = doc.required(doc.root(), "metadata").unwrap();
+        assert_eq!(doc.children(metadata).unwrap().count(), n);
+        drop((doc, reader, owner));
+        store.shutdown().unwrap();
+        std::fs::remove_dir_all(directory).unwrap();
+    }
 }
