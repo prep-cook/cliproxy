@@ -1,5 +1,5 @@
 use super::Table;
-use crate::codec::{Error, Result};
+use crate::codec::Result;
 use ck_stream::Writer;
 use std::hash::{BuildHasher, Hash, Hasher};
 
@@ -66,37 +66,6 @@ impl Index {
         }
         Ok(found)
     }
-    /// Drops `position` from `hash`, shifting later cluster entries back so probes stay unbroken.
-    pub fn remove(&mut self, hash: u64, position: usize) -> Result<()> {
-        if self.slots.is_empty() {
-            return Err(Error::Schema);
-        }
-        let mut hole = self.home(hash);
-        while self.slots[hole] != (hash, position) {
-            if self.slots[hole].1 == EMPTY {
-                return Err(Error::Schema);
-            }
-            hole = self.next(hole);
-        }
-        let mut slot = self.next(hole);
-        while self.slots[slot].1 != EMPTY {
-            let home = self.home(self.slots[slot].0);
-            // Move the entry into the hole unless its home lies cyclically in (hole, slot].
-            let stays = if hole < slot {
-                hole < home && home <= slot
-            } else {
-                hole < home || home <= slot
-            };
-            if !stays {
-                self.slots[hole] = self.slots[slot];
-                hole = slot;
-            }
-            slot = self.next(slot);
-        }
-        self.slots[hole] = (0, EMPTY);
-        self.len -= 1;
-        Ok(())
-    }
     fn home(&self, hash: u64) -> usize {
         hash as usize & (self.slots.len() - 1)
     }
@@ -109,7 +78,7 @@ impl Index {
 mod tests {
     use super::*;
 
-    /// Clustered hashes, growth and backward-shift removal agree with a scan in order.
+    /// Clustered hashes and growth agree with a scan in order.
     #[test]
     fn lookups_match_an_ordered_scan() {
         let directory = std::env::temp_dir().join(format!("ck-anthropic-index-{}", uuid::Uuid::new_v4()));
@@ -129,19 +98,13 @@ mod tests {
             seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
             // Hashes 0..24 share few home slots, so clusters wrap and interleave.
             let hash = (seed >> 33) % 24 * 8;
-            if seed >> 62 == 0 && !live.is_empty() {
-                let (hash, position) = live.remove((seed >> 20) as usize % live.len());
-                index.remove(hash, position).unwrap();
-            } else {
-                index.insert(&mut owner, hash, position).unwrap();
-                live.push((hash, position));
-            }
+            index.insert(&mut owner, hash, position).unwrap();
+            live.push((hash, position));
             for hash in (0..24).map(|h| h * 8) {
                 let expected = live.iter().filter(|e| e.0 == hash).map(|e| e.1).min();
                 assert_eq!(index.find(hash, |_| Ok(true)).unwrap(), expected);
             }
         }
-        assert!(index.remove(1, 0).is_err());
         // Growth reinserts a cluster that wrapped past the last slot in slot order, so later
         // positions can come first in the probe; lookups still return the earliest.
         let mut index = Index::new(&mut owner).unwrap();

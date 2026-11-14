@@ -52,6 +52,9 @@ fn canonical() -> Vec<(u32, Option<String>, Value)> {
         json!({"type":"message_delta","delta":{"stop_reason":"end_turn"}}),
         json!({"type":"message_stop"}),
     ]);
+    records(&rows)
+}
+fn records(rows: &[Value]) -> Vec<(u32, Option<String>, Value)> {
     let mut mapped = Mapped::new();
     let mut ingress = anthropic::response::Ingress::new(
         &mut mapped.writer,
@@ -61,7 +64,7 @@ fn canonical() -> Vec<(u32, Option<String>, Value)> {
         1024 * 1024,
     )
     .unwrap();
-    ingress.advance(&mut mapped.writer, &sse(&rows)).unwrap();
+    ingress.advance(&mut mapped.writer, &sse(rows)).unwrap();
     ingress.finish(&mut mapped.writer).unwrap();
     let mut reader = mapped.store.reader(mapped.writer.id(), 0).unwrap();
     let mut records = Vec::new();
@@ -156,4 +159,55 @@ fn egress_blocks_need_a_unique_open_block() {
     let (native, _) = egress(&edited);
     let starts = native.iter().filter(|e| e["type"] == "content_block_start").count();
     assert_eq!(starts, 3, "native={native:?}");
+}
+
+/// A text delta without a block index goes to the earliest open text block of its item, however
+/// the overlapping blocks of that kind open and close around it.
+#[test]
+fn unindexed_text_goes_to_the_earliest_open_block() {
+    let start = |i: u64| json!({"type":"content_block_start","index":i,"content_block":{"type":"text","text":""}});
+    let delta = |i: u64| json!({"type":"content_block_delta","index":i,"delta":{"type":"text_delta","text":"a"}});
+    let stop = |i: u64| json!({"type":"content_block_stop","index":i});
+    let rows = [
+        json!({"type":"message_start","message":{"id":"r","model":"m"}}),
+        start(0),
+        start(1),
+        start(2),
+        start(3),
+        delta(3),
+        stop(1),
+        delta(3),
+        stop(0),
+        delta(3),
+        stop(2),
+        delta(3),
+        stop(3),
+        json!({"type":"message_delta","delta":{"stop_reason":"end_turn"}}),
+        json!({"type":"message_stop"}),
+    ];
+    let mut records = records(&rows);
+    // Once every block closed, two more deltas share one new block.
+    let last = records
+        .iter()
+        .rposition(|r| r.1.is_none() && r.2["x_ck"]["block_index"] == 3)
+        .unwrap();
+    let end = position(&records, "x_ck.block.end", 3);
+    records.insert(end + 1, records[last].clone());
+    records.insert(end + 1, records[last].clone());
+    for record in records
+        .iter_mut()
+        .filter(|r| r.1.is_none() && r.2["x_ck"]["block_index"].is_u64())
+    {
+        record.2["x_ck"].as_object_mut().unwrap().remove("block_index");
+    }
+    let (native, rejected) = egress(&records);
+    // The finish then refuses the extra block, which nothing ended.
+    assert_eq!(rejected, Some(end + 4), "native={native:?}");
+    let deltas: Vec<_> = native
+        .iter()
+        .filter(|e| e["type"] == "content_block_delta" && e["delta"]["text"] == "a")
+        .map(|e| e["index"].as_u64().unwrap())
+        .collect();
+    // The earliest of four, past a closed later block, past closed earlier ones, then a new one.
+    assert_eq!(deltas, [0, 0, 2, 3, 4, 4], "native={native:?}");
 }

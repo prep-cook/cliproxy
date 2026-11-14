@@ -28,8 +28,18 @@ struct Block {
     tool: Option<u64>,
     explicit_block: bool,
     start_origin: Option<Document>,
-    /// The text kind under which `Egress::texts` lists this block while it is open.
+    /// The text kind whose list in `Egress::text_lists` holds this block while it is open.
     text: Option<&'static str>,
+    /// The next block started under the same text key, in start order.
+    next_text: Option<usize>,
+}
+/// The open text blocks of one (item, kind), linked through `Block::next_text` in start order.
+/// `key` is a block naming the pair. Closed blocks leave the list once they reach `head`, so
+/// `head` is always the earliest open block, or `None` when none is open.
+struct TextList {
+    key: usize,
+    head: Option<usize>,
+    tail: usize,
 }
 pub struct Egress {
     owner: u64,
@@ -39,11 +49,12 @@ pub struct Egress {
     sequence: u64,
     base: Option<Document>,
     blocks: Table<Block>,
-    /// `blocks` positions by (item, block index), by tool index, and open text blocks by
-    /// (item, kind).
+    /// `blocks` positions by (item, block index) and by tool index, and `text_lists` positions
+    /// by (item, kind).
     named: Index,
     tools: Index,
     texts: Index,
+    text_lists: Table<TextList>,
     usage: Option<Document>,
     finish: Option<Document>,
     start_origin: Option<Document>,
@@ -77,6 +88,7 @@ impl Egress {
             named: Index::new(owner)?,
             tools: Index::new(owner)?,
             texts: Index::new(owner)?,
+            text_lists: Table::new(owner)?,
             usage: None,
             finish: None,
             start_origin: None,

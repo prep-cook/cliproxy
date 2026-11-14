@@ -71,6 +71,7 @@ impl Egress {
             explicit_block: true,
             start_origin: Some(doc),
             text: matches!(native, "text" | "thinking").then_some(native),
+            next_text: None,
         })?;
         self.listed(owner, index as usize)?;
         if matches!(native, "text" | "thinking") {
@@ -285,11 +286,35 @@ impl Egress {
         };
         let hash = self.named.hash((item.as_str(), canonical));
         self.named.insert(owner, hash, index)?;
-        if let Some(native) = text {
-            let hash = self.texts.hash((item.as_str(), native));
-            self.texts.insert(owner, hash, index)?;
+        let Some(native) = text else {
+            return Ok(());
+        };
+        let (hash, list) = self.text_list(item, native)?;
+        if let Some(list) = list {
+            let list = &mut self.text_lists[list];
+            match list.head {
+                Some(_) => self.blocks[list.tail].next_text = Some(index),
+                None => list.head = Some(index),
+            }
+            list.tail = index;
+        } else {
+            self.texts.insert(owner, hash, self.text_lists.len())?;
+            self.text_lists.push(TextList {
+                key: index,
+                head: Some(index),
+                tail: index,
+            })?;
         }
         Ok(())
+    }
+    /// The hash of (item, kind) and the position of its list in `text_lists`, if it has one.
+    fn text_list(&self, item: LocalId, native: &'static str) -> Result<(u64, Option<usize>)> {
+        let hash = self.texts.hash((item.as_str(), native));
+        let list = self.texts.find(hash, |list| {
+            let b = &self.blocks[self.text_lists[list].key];
+            Ok(b.item == item && b.text == Some(native))
+        })?;
+        Ok((hash, list))
     }
     pub(super) fn find_or_tool(&mut self, owner: &mut Writer, doc: &Document, x: usize) -> Result<usize> {
         if doc.member(x, "block_index")?.is_some() {
@@ -307,6 +332,7 @@ impl Egress {
             explicit_block: false,
             start_origin: None,
             text: None,
+            next_text: None,
         })?;
         self.listed(owner, index)?;
         Ok(index)
@@ -323,12 +349,9 @@ impl Egress {
             return self.find(doc, x);
         }
         let item = local(doc, doc.required(x, "item_id")?)?;
-        let hash = self.texts.hash((item.as_str(), native));
-        let open = self.texts.find(hash, |position| {
-            let b = &self.blocks[position];
-            Ok(b.item == item && b.text == Some(native))
-        })?;
-        if let Some(index) = open {
+        if let (_, Some(list)) = self.text_list(item, native)?
+            && let Some(index) = self.text_lists[list].head
+        {
             return Ok(index);
         }
         let index = self.blocks.len();
@@ -346,6 +369,7 @@ impl Egress {
             explicit_block: false,
             start_origin: None,
             text: Some(native),
+            next_text: None,
         })?;
         self.listed(owner, index)?;
         self.start_block(owner, index, output)?;
@@ -403,8 +427,13 @@ impl Egress {
             })?)?;
         }
         if let Some(native) = text {
-            let hash = self.texts.hash((item.as_str(), native));
-            self.texts.remove(hash, index)?;
+            let list = self.text_list(item, native)?.1.ok_or(Error::Schema)?;
+            let list = &mut self.text_lists[list];
+            while let Some(head) = list.head
+                && !self.blocks[head].open
+            {
+                list.head = self.blocks[head].next_text;
+            }
         }
         Ok(())
     }
