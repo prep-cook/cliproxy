@@ -109,7 +109,16 @@ impl<F: FnMut(&'static str, u64)> Egress<F> {
         output: &mut impl FnMut(ScratchLease) -> Result<()>,
     ) -> Result<()> {
         let doc = &mut self.document;
-        let (part, _, block) = find_part(doc, item, x)?.ok_or(Error::Schema)?;
+        // Chat logprobs may arrive without block correlation (§3.1); they belong to the item's
+        // latest content part.
+        let found = match find_part(doc, item, x)? {
+            Some((part, _, block)) => Some((part, block)),
+            None => last_part(doc, item)?,
+        };
+        let Some((part, block)) = found else {
+            (self.diagnostic)("logprobs without a content part", index);
+            return Ok(());
+        };
         let payload = encode::scratch(owner, |e| {
             item_fields(doc, item, index, e)?;
             e.bytes(b",\"content_index\":")?;
@@ -132,4 +141,15 @@ impl<F: FnMut(&'static str, u64)> Egress<F> {
             output,
         )
     }
+}
+
+/// The last content part of `item` with its native content index.
+fn last_part(doc: &Document, item: usize) -> Result<Option<(usize, u64)>> {
+    let Some(parts) = doc.member(item, "content")? else {
+        return Ok(None);
+    };
+    let Some((index, part)) = doc.children(parts)?.enumerate().last() else {
+        return Ok(None);
+    };
+    Ok(Some((part, native_index(doc, part, "content_index", index as u64)?)))
 }

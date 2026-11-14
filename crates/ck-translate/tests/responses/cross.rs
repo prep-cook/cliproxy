@@ -114,3 +114,26 @@ fn failed_chat_stream_ends_with_response_failed() {
     let last = client_events(&output).pop().unwrap();
     assert_eq!(last["type"], "response.failed");
 }
+
+#[test]
+fn chat_logprobs_without_a_block_join_the_open_text_part() {
+    let logprobs = json!({"content":[{"token":"hi","logprob":-0.5,"bytes":[104,105],"top_logprobs":[]}]});
+    let input = sse(&[
+        json!({"id":"c","model":"m","created":5,"choices":[{"index":0,"delta":{"role":"assistant","content":"hi"},"logprobs":logprobs,"finish_reason":null}]}),
+        json!({"id":"c","model":"m","created":5,"choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}),
+    ]);
+    let output = chat_to_responses(input.as_bytes(), BodyMode::Streaming, BodyMode::Streaming);
+    let events = client_events(&output);
+    let delta = events
+        .iter()
+        .find(|e| e["type"] == "response.output_text.delta" && e.get("logprobs").is_some())
+        .unwrap();
+    assert_eq!(
+        (delta["content_index"].clone(), delta["delta"].clone()),
+        (json!(0), json!(""))
+    );
+    assert_eq!(delta["logprobs"], logprobs["content"]);
+    let response = &events.last().unwrap()["response"];
+    assert_eq!(response["status"], "completed");
+    assert_eq!(response["output"][0]["content"][0]["logprobs"], logprobs["content"]);
+}
