@@ -195,14 +195,23 @@ impl State {
         {
             return self.finish_choice(owner, doc, delta, Some(origin));
         }
+        // After the choice finished, a late delta carries stream-level metadata only.
+        let (scope, choices): (_, &[u8]) = if self.finished {
+            (Scope::default(), b",\"choices\":[]")
+        } else {
+            (
+                self.scope()?,
+                b",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":null}]",
+            )
+        };
         let base = self.base.as_ref().ok_or(Error::Schema)?;
         self.emitter.emit(
             owner,
             Kind::Chunk,
-            self.scope()?,
+            scope,
             |e| {
                 base_fields(base, e)?;
-                e.bytes(b",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":null}]")
+                e.bytes(choices)
             },
             |e| {
                 provenance_as(source, event, Some("message_delta"), e)?;

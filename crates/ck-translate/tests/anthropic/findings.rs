@@ -1,5 +1,5 @@
 //! Regression tests for the Anthropic codec review findings.
-use crate::{Operation, request_fragmented};
+use crate::{BodyMode, Operation, events, json, request_fragmented, response, sse};
 
 #[test]
 fn media_whose_type_follows_its_data_publishes_one_lifetime() {
@@ -16,4 +16,36 @@ fn media_whose_type_follows_its_data_publishes_one_lifetime() {
     assert_eq!(content[2]["source"]["data"], payload);
     let starts = canonical.iter().filter(|v| v.get("encoding").is_some()).count();
     assert_eq!(starts, 3, "one media lifetime per image");
+}
+
+#[test]
+fn delta_after_choice_finish_stays_stream_scoped() {
+    let rows = [
+        json!({"type":"message_start","message":{"id":"r","model":"m"}}),
+        json!({"type":"message_delta","delta":{"stop_reason":"end_turn"}}),
+        json!({"type":"message_delta","delta":{"stop_reason":null,"future":1},"usage":{"output_tokens":3}}),
+        json!({"type":"message_stop"}),
+    ];
+    let (out, canonical) = response(
+        &sse(&rows),
+        BodyMode::Streaming,
+        BodyMode::Streaming,
+        Operation::Generate,
+        7,
+    );
+    let end = canonical
+        .iter()
+        .position(|v| v["choices"][0]["finish_reason"] == "stop")
+        .unwrap();
+    for late in &canonical[end + 1..] {
+        assert!(
+            late["choices"].as_array().is_none_or(Vec::is_empty),
+            "post-finish: {late}"
+        );
+        assert!(late["x_ck"].get("choice_index").is_none(), "post-finish: {late}");
+    }
+    let native = events(&out);
+    let late = native.iter().filter(|v| v["type"] == "message_delta").nth(1).unwrap();
+    assert_eq!(late["delta"], rows[2]["delta"]);
+    assert_eq!(late["usage"]["output_tokens"], 3);
 }
