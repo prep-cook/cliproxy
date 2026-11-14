@@ -8,6 +8,20 @@ use crate::codec::{
 };
 use ck_stream::{ScratchLease, Writer};
 
+mod delta;
+mod envelope;
+mod item;
+mod media;
+
+/// The absorbed event and the output item it belongs to, with that item's native index.
+#[derive(Clone, Copy)]
+struct At {
+    node: usize,
+    x: usize,
+    item: usize,
+    index: u64,
+}
+
 pub struct Egress<F: FnMut(&'static str, u64)> {
     owner: u64,
     mode: BodyMode,
@@ -90,87 +104,13 @@ impl<F: FnMut(&'static str, u64)> Egress<F> {
                 return Ok(());
             }
         }
-        if matches!(kind, Kind::Heartbeat) {
-            return Ok(());
-        }
-        if matches!(kind, Kind::Error | Kind::Cancelled) {
-            self.terminal = true;
-            let failed = encode::scratch(owner, |e| {
-                if self.mode == BodyMode::Streaming {
-                    e.bytes(b"event: response.failed\ndata: ")?;
-                }
-                e.bytes(b"{\"type\":\"response.failed\",\"error\":{\"code\":\"upstream_error\",\"message\":\"Response failed\"}}")?;
-                if self.mode == BodyMode::Streaming {
-                    e.bytes(b"\n\n")?;
-                }
-                Ok(())
-            })?;
-            return output(failed);
-        }
-        if kind == Kind::ResponseStart {
-            let doc = &mut self.document;
-            let target = doc.root();
-            let node = doc.absorb(incoming)?;
-            for (from, to) in [("id", "id"), ("model", "model"), ("created", "created_at")] {
-                if let Some(value) = doc.remove(node, from)? {
-                    let target = doc.set(target, to, Value::Null)?;
-                    doc.transplant(target, value)?;
-                }
-            }
-            let response = encode::scratch(owner, |e| doc.write(target, e))?;
-            return self.emit(
-                owner,
-                "response.created",
-                |e| {
-                    e.bytes(b",\"response\":")?;
-                    write_lease(&response, e)
-                },
-                output,
-            );
-        }
-        if kind == Kind::Done {
-            if self.images.iter().any(|image| !image.closed) || self.audio.iter().any(|audio| !audio.closed) {
-                return Err(Error::Truncated);
-            }
-            self.terminal = true;
-            let doc = &mut self.document;
-            let root = doc.root();
-            if is(doc, root, "status", "in_progress")? {
-                doc.set(root, "status", Value::Text("completed"))?;
-            }
-            order_array(doc, doc.required(root, "output")?, "output_index", owner)?;
-            let response = encode::scratch(owner, |e| write_response(doc, e))?;
-            if self.mode == BodyMode::Buffered {
-                return output(response);
-            }
-            let name = if is(doc, root, "status", "incomplete")? {
-                "response.incomplete"
-            } else {
-                "response.completed"
-            };
-            return self.emit(
-                owner,
-                name,
-                |e| {
-                    e.bytes(b",\"response\":")?;
-                    write_lease(&response, e)
-                },
-                output,
-            );
-        }
-        if kind == Kind::Opaque {
-            if is(&incoming, root, "name", "responses.response")? {
-                let doc = &mut self.document;
-                let node = doc.absorb(incoming)?;
-                let value = doc.required(node, "value")?;
-                super::opaque::preserve_carrier_collision(doc, value)?;
-                super::merge(doc, doc.root(), value)?;
-                return Ok(());
-            }
-            if self.mode == BodyMode::Streaming {
-                return output(encode::scratch(owner, |e| super::opaque::write(&incoming, e))?);
-            }
-            return super::opaque::retain(&mut self.document, incoming);
+        match kind {
+            Kind::Heartbeat => return Ok(()),
+            Kind::Error | Kind::Cancelled => return self.failed(owner, output),
+            Kind::ResponseStart => return self.response_start(owner, incoming, output),
+            Kind::Done => return self.done(owner, output),
+            Kind::Opaque => return self.opaque(owner, incoming, output),
+            _ => {}
         }
         let native_execution = incoming
             .member(x, "source")?
@@ -184,540 +124,47 @@ impl<F: FnMut(&'static str, u64)> Egress<F> {
             return Ok(());
         }
         let node = self.document.absorb(incoming)?;
-        let doc = &mut self.document;
-        let x = doc.required(node, "x_ck")?;
-        let output_node = doc.required(doc.root(), "output")?;
-        if kind == Kind::MediaStart && is(doc, node, "kind", "audio")? {
-            self.audio.push(super::audio::Projection::start(doc, node)?)?;
-            return Ok(());
+        if kind == Kind::MediaStart && is(&self.document, node, "kind", "audio")? {
+            return self.audio_start(node);
         }
         if matches!(kind, Kind::Data | Kind::MediaTranscript | Kind::MediaEnd)
-            && let Some(id) = doc.member(x, "media_id")?
+            && let Some(index) = self.audio_index(node)?
         {
-            let mut found = None;
-            for (index, audio) in self.audio.iter().enumerate() {
-                if super::snapshot::equal(doc, audio.id, doc, id)? {
-                    found = Some(index);
-                    break;
-                }
-            }
-            if let Some(index) = found {
-                let audio = &mut self.audio[index];
-                let (name, payload) = match kind {
-                    Kind::Data => {
-                        let payload = encode::scratch(owner, |e| {
-                            e.bytes(b",\"delta\":")?;
-                            doc.write(doc.required(node, "bytes")?, e)
-                        })?;
-                        audio.append(doc, node)?;
-                        ("response.audio.delta", payload)
-                    }
-                    Kind::MediaTranscript => {
-                        let final_value = matches!(doc.node(doc.required(node, "final")?)?.value, Value::Bool(true));
-                        let text = doc.required(node, "text")?;
-                        let nonempty = doc.chars(text)?.next_scalar()?.is_some();
-                        let payload = encode::scratch(owner, |e| {
-                            e.bytes(b",\"delta\":")?;
-                            doc.write(text, e)?;
-                            super::member(doc, node, "timing", e)
-                        })?;
-                        audio.transcript(doc, node)?;
-                        if final_value {
-                            if nonempty {
-                                self.emit(
-                                    owner,
-                                    "response.audio.transcript.delta",
-                                    |e| write_lease(&payload, e),
-                                    output,
-                                )?;
-                            }
-                            return self.emit(owner, "response.audio.transcript.done", |_| Ok(()), output);
-                        }
-                        ("response.audio.transcript.delta", payload)
-                    }
-                    Kind::MediaEnd => {
-                        audio.end(doc, node)?;
-                        return self.emit(owner, "response.audio.done", |_| Ok(()), output);
-                    }
-                    _ => return Err(Error::Schema),
-                };
-                return self.emit(owner, name, |e| write_lease(&payload, e), output);
-            }
+            return self.audio_media(owner, kind, node, index, output);
         }
-        if matches!(kind, Kind::Data | Kind::MediaEnd) {
-            let id = doc.required(x, "media_id")?;
-            let mut found = None;
-            for (index, image) in self.images.iter().enumerate() {
-                if super::snapshot::equal(doc, image.id, doc, id)? {
-                    found = Some(index);
-                    break;
-                }
-            }
-            let image = &mut self.images[found.ok_or(Error::Schema)?];
-            if kind == Kind::Data {
-                return image.append(doc, node);
-            }
-            image.end(doc, node)?;
-            if let Some(partial) = image.partial {
-                if self.mode == BodyMode::Buffered {
-                    let array = match doc.member(doc.root(), "x_ck_opaque")? {
-                        Some(n) => n,
-                        None => doc.set(doc.root(), "x_ck_opaque", Value::Array)?,
-                    };
-                    let entry = doc.add(None, Value::Object)?;
-                    doc.append(array, entry)?;
-                    doc.set(
-                        entry,
-                        "type",
-                        Value::Text("response.image_generation_call.partial_image"),
-                    )?;
-                    doc.set(entry, "output_index", Value::Unsigned(image.output_index))?;
-                    doc.set(entry, "partial_image_index", Value::Unsigned(partial))?;
-                    doc.rename(image.data, "partial_image_b64")?;
-                    doc.append(entry, image.data)?;
-                    return Ok(());
-                }
-                let payload = encode::scratch(owner, |e| {
-                    item_fields(doc, image.item, image.output_index, e)?;
-                    e.bytes(b",\"partial_image_index\":")?;
-                    e.unsigned(partial)?;
-                    e.bytes(b",\"partial_image_b64\":")?;
-                    doc.write(image.data, e)
-                })?;
-                return self.emit(
-                    owner,
-                    "response.image_generation_call.partial_image",
-                    |e| write_lease(&payload, e),
-                    output,
-                );
-            }
-            return Ok(());
+        match kind {
+            Kind::Data | Kind::MediaEnd => return self.image_media(owner, kind, node, output),
+            Kind::Usage => return self.usage(node),
+            Kind::Compact => return self.compact(node),
+            Kind::ItemStart => return self.item_start(owner, node, output),
+            _ => {}
         }
-        if kind == Kind::Usage {
-            let usage = doc.required(node, "usage")?;
-            let value = if let Some(native) = doc.member(usage, "native")? {
-                if is(doc, native, "protocol", "responses")? {
-                    doc.required(native, "value")?
-                } else {
-                    usage
-                }
-            } else {
-                usage
-            };
-            let target = doc.set(doc.root(), "usage", Value::Null)?;
-            doc.transplant(target, value)?;
-            return Ok(());
-        }
-        if kind == Kind::Compact {
-            let item = doc.required(node, "item")?;
-            doc.detach(node, item)?;
-            doc.append(output_node, item)?;
-            return Ok(());
-        }
-        if kind == Kind::ItemStart {
-            let item = doc.add(None, Value::Object)?;
-            doc.append(output_node, item)?;
-            if let Some(attributes) = doc.member(node, "attributes")? {
-                super::merge(doc, item, attributes)?;
-            }
-            if doc.member(item, "type")?.is_none() {
-                doc.set(item, "type", Value::Text("message"))?;
-            }
-            if doc.member(item, "id")?.is_none() {
-                let id = doc.node(doc.required(x, "item_id")?)?.value;
-                doc.set(item, "id", id)?;
-            }
-            doc.set(item, "status", Value::Text("in_progress"))?;
-            if is(doc, item, "type", "message")? {
-                if doc.member(item, "role")?.is_none() {
-                    doc.set(item, "role", Value::Text("assistant"))?;
-                }
-                doc.set(item, "content", Value::Array)?;
-            } else if is(doc, item, "type", "reasoning")? {
-                doc.set(item, "summary", Value::Array)?;
-            }
-            doc.bind_origin(item, x, None)?;
-            let index = native_index(doc, item, "output_index", doc.children(output_node)?.count() as u64 - 1)?;
-            let payload = encode::scratch(owner, |e| {
-                e.bytes(b",\"output_index\":")?;
-                e.unsigned(index)?;
-                e.bytes(b",\"item\":")?;
-                write_item(doc, item, e)
-            })?;
-            return self.emit(
-                owner,
-                "response.output_item.added",
-                |e| write_lease(&payload, e),
-                output,
-            );
-        }
-        let Some((item, index)) = find_item(doc, output_node, x)? else {
+        let doc = &self.document;
+        let x = doc.required(node, "x_ck")?;
+        let Some((item, index)) = find_item(doc, doc.required(doc.root(), "output")?, x)? else {
             if kind == Kind::Chunk {
                 return self.finish_chunk(node);
             }
             return Err(Error::Schema);
         };
-        if kind == Kind::MediaStart {
-            self.images
-                .push(super::image::Projection::start(doc, node, item, index)?)?;
-            return Ok(());
+        let at = At { node, x, item, index };
+        match kind {
+            Kind::MediaStart => self.image_start(at),
+            Kind::ToolStart => self.tool_start(at),
+            Kind::BlockStart => self.block_start(owner, at, output),
+            Kind::ToolResult | Kind::Grounding | Kind::CodeExecution => self.execution(owner, kind, at, output),
+            Kind::Chunk => self.chunk(owner, at, output),
+            Kind::ReasoningSignature => self.signature(at),
+            Kind::ReasoningRedacted => self.redacted(owner, at),
+            Kind::Annotation => self.annotation(owner, at, output),
+            Kind::BlockEnd => self.block_end(owner, at, output),
+            Kind::ToolEnd => self.tool_end(owner, at, output),
+            Kind::ItemEnd => self.item_end(owner, at, output),
+            _ => {
+                (self.diagnostic)("unsupported event", 0);
+                Ok(())
+            }
         }
-        if kind == Kind::ToolStart {
-            if is(doc, node, "kind", "server")? && super::response::Server::from_item(doc, item)?.is_some() {
-                return Ok(());
-            }
-            if is(doc, node, "kind", "custom")? {
-                doc.set(item, "type", Value::Text("custom_tool_call"))?;
-            } else {
-                doc.set(item, "type", Value::Text("function_call"))?;
-            }
-            for name in ["name", "namespace"] {
-                if let Some(value) = doc.member(node, name)? {
-                    let target = doc.set(item, name, Value::Null)?;
-                    doc.transplant(target, value)?;
-                }
-            }
-            if let Some(source) = doc.member(x, "source")?
-                && let Some(ids) = doc.member(source, "ids")?
-            {
-                for name in ["id", "call_id"] {
-                    if let Some(value) = doc.member(ids, name)? {
-                        let target = doc.set(item, name, Value::Null)?;
-                        doc.transplant(target, value)?;
-                    }
-                }
-            }
-            if doc.member(item, "call_id")?.is_none() {
-                let value = doc.node(doc.required(x, "tool_call_id")?)?.value;
-                doc.set(item, "call_id", value)?;
-            }
-            return Ok(());
-        }
-        if kind == Kind::BlockStart {
-            let summary = is(doc, node, "kind", "reasoning_summary")?;
-            let thinking = is(doc, node, "kind", "thinking")? || is(doc, node, "kind", "reasoning")?;
-            if thinking
-                && let Some(attributes) = doc.member(node, "attributes")?
-                && (is(doc, attributes, "type", "encrypted")? || is(doc, attributes, "type", "redacted")?)
-            {
-                return Ok(());
-            }
-            let parts = match doc.member(item, if summary { "summary" } else { "content" })? {
-                Some(p) => p,
-                None => doc.set(item, if summary { "summary" } else { "content" }, Value::Array)?,
-            };
-            let part = doc.add(None, Value::Object)?;
-            doc.append(parts, part)?;
-            if let Some(attrs) = doc.member(node, "attributes")? {
-                super::merge(doc, part, attrs)?;
-            }
-            let refusal = is(doc, node, "kind", "refusal")?;
-            doc.set(
-                part,
-                "type",
-                Value::Text(if refusal {
-                    "refusal"
-                } else if summary {
-                    "summary_text"
-                } else if thinking {
-                    "reasoning_text"
-                } else {
-                    "output_text"
-                }),
-            )?;
-            doc.bind_origin(part, x, None)?;
-            let payload = encode::scratch(owner, |e| {
-                item_fields(doc, item, index, e)?;
-                e.bytes(if summary {
-                    b",\"summary_index\":"
-                } else {
-                    b",\"content_index\":"
-                })?;
-                e.unsigned(native_index(
-                    doc,
-                    part,
-                    if summary { "summary_index" } else { "content_index" },
-                    doc.children(parts)?.count() as u64 - 1,
-                )?)?;
-                e.bytes(b",\"part\":")?;
-                write_part(doc, part, e)
-            })?;
-            return self.emit(
-                owner,
-                if summary {
-                    "response.reasoning_summary_part.added"
-                } else {
-                    "response.content_part.added"
-                },
-                |e| write_lease(&payload, e),
-                output,
-            );
-        }
-        if matches!(kind, Kind::ToolResult | Kind::Grounding | Kind::CodeExecution) {
-            let source = doc.member(x, "source")?;
-            let server = super::response::Server::from_item(doc, item)?;
-            if let (Some(source), Some(server)) = (source, server)
-                && is(doc, source, "protocol", "responses")?
-            {
-                let value = doc.required(node, "value")?;
-                if kind == Kind::CodeExecution
-                    && server == super::response::Server::Code
-                    && is(doc, node, "phase", "code")?
-                {
-                    if matches!(doc.node(value)?.value, Value::Null) {
-                        doc.set(item, "code", Value::Null)?;
-                        return Ok(());
-                    }
-                    let done = is(doc, source, "event", "response.code_interpreter_call_code.done")?;
-                    if let Some(code) = doc.member(item, "code")?
-                        && matches!(doc.node(code)?.value, Value::Null)
-                    {
-                        doc.remove(item, "code")?;
-                    }
-                    doc.detach(node, value)?;
-                    append_fragment(doc, item, "code", value)?;
-                    let payload = encode::scratch(owner, |e| {
-                        item_fields(doc, item, index, e)?;
-                        if done {
-                            super::member(doc, item, "code", e)
-                        } else {
-                            e.bytes(b",\"delta\":")?;
-                            doc.write(value, e)
-                        }
-                    })?;
-                    return self.emit(
-                        owner,
-                        if done {
-                            "response.code_interpreter_call_code.done"
-                        } else {
-                            "response.code_interpreter_call_code.delta"
-                        },
-                        |e| write_lease(&payload, e),
-                        output,
-                    );
-                }
-                for field in server.fields() {
-                    if is(doc, x, "responses_field", field)? {
-                        let target = doc.set(item, field, Value::Null)?;
-                        doc.transplant(target, value)?;
-                        return Ok(());
-                    }
-                }
-            }
-            (self.diagnostic)("unsupported execution event", 0);
-            return Ok(());
-        }
-        if kind == Kind::Chunk {
-            let choices = doc.required(node, "choices")?;
-            if let Some(choice) = doc.node(choices)?.first {
-                let delta = doc.required(choice, "delta")?;
-                if let Some(calls) = doc.member(delta, "tool_calls")? {
-                    for call in doc.children(calls)? {
-                        let function = doc.required(call, "function")?;
-                        if let Some(args) = doc.member(function, "arguments")? {
-                            let custom = is(doc, item, "type", "custom_tool_call")?;
-                            let field = if custom { "input" } else { "arguments" };
-                            let payload = encode::scratch(owner, |e| {
-                                item_fields(doc, item, index, e)?;
-                                e.bytes(b",\"delta\":")?;
-                                doc.write(args, e)
-                            })?;
-                            doc.detach(function, args)?;
-                            append_fragment(doc, item, field, args)?;
-                            let name = if custom {
-                                "response.custom_tool_call_input.delta"
-                            } else if is(doc, item, "type", "mcp_call")? {
-                                "response.mcp_call_arguments.delta"
-                            } else {
-                                "response.function_call_arguments.delta"
-                            };
-                            // One canonical event contains at most one tool delta.
-                            return self.emit(owner, name, |e| write_lease(&payload, e), output);
-                        }
-                    }
-                }
-                for (from, native, delta_name) in [
-                    ("content", "text", "response.output_text.delta"),
-                    ("refusal", "refusal", "response.refusal.delta"),
-                    ("reasoning_content", "text", "response.reasoning_summary_text.delta"),
-                ] {
-                    if let Some(value) = doc.member(delta, from)? {
-                        let (part, summary, block) = find_part(doc, item, x)?.ok_or(Error::Schema)?;
-                        let delta_name = if from == "reasoning_content" && !summary {
-                            "response.reasoning_text.delta"
-                        } else {
-                            delta_name
-                        };
-                        let payload = encode::scratch(owner, |e| {
-                            item_fields(doc, item, index, e)?;
-                            e.bytes(if summary {
-                                b",\"summary_index\":"
-                            } else {
-                                b",\"content_index\":"
-                            })?;
-                            e.unsigned(block)?;
-                            e.bytes(b",\"delta\":")?;
-                            doc.write(value, e)?;
-                            super::member(doc, choice, "logprobs", e)
-                        })?;
-                        doc.detach(delta, value)?;
-                        append_fragment(doc, part, native, value)?;
-                        return self.emit(owner, delta_name, |e| write_lease(&payload, e), output);
-                    }
-                }
-                if let Some(logprobs) = doc.member(choice, "logprobs")?
-                    && let Some(tokens) = doc.member(logprobs, "content")?
-                {
-                    let (part, _, block) = find_part(doc, item, x)?.ok_or(Error::Schema)?;
-                    let payload = encode::scratch(owner, |e| {
-                        item_fields(doc, item, index, e)?;
-                        e.bytes(b",\"content_index\":")?;
-                        e.unsigned(block)?;
-                        e.bytes(b",\"delta\":\"\",\"logprobs\":")?;
-                        doc.write(tokens, e)
-                    })?;
-                    let target = match doc.member(part, "logprobs")? {
-                        Some(n) => n,
-                        None => doc.set(part, "logprobs", Value::Array)?,
-                    };
-                    while let Some(token) = doc.node(tokens)?.first {
-                        doc.detach(tokens, token)?;
-                        doc.append(target, token)?;
-                    }
-                    return self.emit(
-                        owner,
-                        "response.output_text.delta",
-                        |e| write_lease(&payload, e),
-                        output,
-                    );
-                }
-            }
-            return self.finish_chunk(node);
-        }
-        if kind == Kind::ReasoningSignature {
-            let fragment = doc.required(node, "fragment")?;
-            doc.detach(node, fragment)?;
-            append_fragment(doc, item, "encrypted_content", fragment)?;
-            return Ok(());
-        }
-        if kind == Kind::ReasoningRedacted {
-            let data = doc.required(node, "data")?;
-            let lease = encode::scratch(owner, |e| {
-                e.bytes(b"\"")?;
-                e.bytes(super::REDACTED_PREFIX.as_bytes())?;
-                doc.write_contents(data, e)?;
-                e.bytes(b"\"")
-            })?;
-            let carrier = doc.import_json(owner, lease)?;
-            let target = doc.set(item, "encrypted_content", Value::Null)?;
-            doc.transplant(target, carrier)?;
-            return Ok(());
-        }
-        if kind == Kind::Annotation {
-            let (part, _, block) = find_part(doc, item, x)?.ok_or(Error::Schema)?;
-            let annotations = match doc.member(part, "annotations")? {
-                Some(a) => a,
-                None => doc.set(part, "annotations", Value::Array)?,
-            };
-            let value = doc.required(node, "value")?;
-            doc.detach(node, value)?;
-            doc.append(annotations, value)?;
-            let payload = encode::scratch(owner, |e| {
-                item_fields(doc, item, index, e)?;
-                e.bytes(b",\"content_index\":")?;
-                e.unsigned(block)?;
-                e.bytes(b",\"annotation\":")?;
-                doc.write(value, e)
-            })?;
-            return self.emit(
-                owner,
-                "response.output_text.annotation.added",
-                |e| write_lease(&payload, e),
-                output,
-            );
-        }
-        if kind == Kind::BlockEnd {
-            let Some((part, summary, block)) = find_part(doc, item, x)? else {
-                return Ok(());
-            };
-            let payload = encode::scratch(owner, |e| {
-                item_fields(doc, item, index, e)?;
-                e.bytes(if summary {
-                    b",\"summary_index\":"
-                } else {
-                    b",\"content_index\":"
-                })?;
-                e.unsigned(block)?;
-                e.bytes(b",\"part\":")?;
-                write_part(doc, part, e)
-            })?;
-            return self.emit(
-                owner,
-                if summary {
-                    "response.reasoning_summary_part.done"
-                } else {
-                    "response.content_part.done"
-                },
-                |e| write_lease(&payload, e),
-                output,
-            );
-        }
-        if kind == Kind::ToolEnd {
-            if let Some(server) = super::response::Server::from_item(doc, item)?
-                && (server != super::response::Server::Mcp || doc.member(item, "arguments")?.is_none())
-            {
-                return Ok(());
-            }
-            let custom = is(doc, item, "type", "custom_tool_call")?;
-            let mcp = is(doc, item, "type", "mcp_call")?;
-            let field = if custom { "input" } else { "arguments" };
-            let payload = encode::scratch(owner, |e| {
-                item_fields(doc, item, index, e)?;
-                super::member(doc, item, field, e)
-            })?;
-            return self.emit(
-                owner,
-                if custom {
-                    "response.custom_tool_call_input.done"
-                } else if mcp {
-                    "response.mcp_call_arguments.done"
-                } else {
-                    "response.function_call_arguments.done"
-                },
-                |e| write_lease(&payload, e),
-                output,
-            );
-        }
-        if kind == Kind::ItemEnd {
-            if let Some(attrs) = doc.member(node, "attributes")? {
-                super::merge(doc, item, attrs)?;
-            }
-            if doc.member(item, "status")?.is_none() || is(doc, item, "status", "in_progress")? {
-                doc.set(
-                    item,
-                    "status",
-                    Value::Text(if is(doc, node, "status", "incomplete")? {
-                        "incomplete"
-                    } else {
-                        "completed"
-                    }),
-                )?;
-            }
-            for (field, index_field) in [("content", "content_index"), ("summary", "summary_index")] {
-                if let Some(parts) = doc.member(item, field)? {
-                    order_array(doc, parts, index_field, owner)?;
-                }
-            }
-            let payload = encode::scratch(owner, |e| {
-                e.bytes(b",\"output_index\":")?;
-                e.unsigned(index)?;
-                e.bytes(b",\"item\":")?;
-                write_item(doc, item, e)
-            })?;
-            return self.emit(owner, "response.output_item.done", |e| write_lease(&payload, e), output);
-        }
-        (self.diagnostic)("unsupported event", 0);
-        Ok(())
     }
     fn finish_chunk(&mut self, node: usize) -> Result<()> {
         let doc = &mut self.document;
