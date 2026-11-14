@@ -24,9 +24,11 @@ impl State {
             Some(block) => block,
             None => self.open_block(owner, at, (index, summary), doc, part)?,
         };
-        self.block_text(owner, at, block, doc, part, snapshot)?;
-        self.block_logprobs(owner, at, block, doc, part, snapshot)?;
-        self.block_annotations(owner, at, block, doc, part, snapshot)?;
+        if !self.items[at].blocks[block].opaque {
+            self.block_text(owner, at, block, doc, part, snapshot)?;
+            self.block_logprobs(owner, at, block, doc, part, snapshot)?;
+            self.block_annotations(owner, at, block, doc, part, snapshot)?;
+        }
         let item = &mut self.items[at];
         if close && !item.blocks[block].closed {
             // Attributes the closing snapshot adds after the block started travel as originals.
@@ -52,20 +54,26 @@ impl State {
         part: usize,
     ) -> Result<usize> {
         let item = &mut self.items[at];
-        let lease = encode::scratch(owner, |e| {
-            object(doc, part, &["text", "refusal", "annotations", "logprobs"], e)
-        })?;
-        let value = item.doc.import_json(owner, lease)?;
-        let scope = item.scope(Some(item.blocks.len() as u64));
         let kind = if summary {
             "reasoning_summary"
         } else if is(doc, part, "type", "reasoning_text")? {
             "thinking"
         } else if is(doc, part, "type", "refusal")? {
             "refusal"
-        } else {
+        } else if doc.member(part, "type")?.is_none() || is(doc, part, "type", "output_text")? {
             "text"
+        } else {
+            "opaque"
         };
+        let opaque = kind == "opaque";
+        let content: &[&str] = if opaque {
+            &[]
+        } else {
+            &["text", "refusal", "annotations", "logprobs"]
+        };
+        let lease = encode::scratch(owner, |e| object(doc, part, content, e))?;
+        let value = item.doc.import_json(owner, lease)?;
+        let scope = item.scope(Some(item.blocks.len() as u64));
         self.emitter.emit(
             owner,
             Kind::BlockStart,
@@ -92,6 +100,7 @@ impl State {
             summary,
             value,
             closed: false,
+            opaque,
         })
     }
 

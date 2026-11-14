@@ -226,19 +226,22 @@ impl<F: FnMut(&'static str, u64)> Egress<F> {
             super::super::merge(doc, part, attrs)?;
         }
         let refusal = is(doc, node, "kind", "refusal")?;
-        doc.set(
-            part,
-            "type",
-            Value::Text(if refusal {
-                "refusal"
-            } else if summary {
-                "summary_text"
-            } else if thinking {
-                "reasoning_text"
-            } else {
-                "output_text"
-            }),
-        )?;
+        // An opaque part keeps the type its attributes carry.
+        if !is(doc, node, "kind", "opaque")? || doc.member(part, "type")?.is_none() {
+            doc.set(
+                part,
+                "type",
+                Value::Text(if refusal {
+                    "refusal"
+                } else if summary {
+                    "summary_text"
+                } else if thinking {
+                    "reasoning_text"
+                } else {
+                    "output_text"
+                }),
+            )?;
+        }
         doc.bind_origin(part, x, None)?;
         let payload = encode::scratch(owner, |e| {
             item_fields(doc, item, index, e)?;

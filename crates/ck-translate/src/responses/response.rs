@@ -119,6 +119,8 @@ struct Block {
     summary: bool,
     value: usize,
     closed: bool,
+    /// A part type without a canonical mapping: its members stay attributes, never content.
+    opaque: bool,
 }
 struct Item {
     index: u64,

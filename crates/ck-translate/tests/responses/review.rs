@@ -320,3 +320,29 @@ fn late_audio_metadata_reaches_the_client() {
     );
     assert!(!events.iter().any(|e| e["name"] == "responses.audio"));
 }
+
+#[test]
+fn unknown_content_parts_stay_opaque() {
+    let part = json!({"type":"future_part","text":"t","payload":{"a":null}});
+    let input = json!({"id":"r","status":"completed","output":[
+        {"id":"i","type":"message","role":"assistant","content":[part]}]});
+    for downstream in [BodyMode::Buffered, BodyMode::Streaming] {
+        let (out, events) = response(
+            &serde_json::to_vec(&input).unwrap(),
+            BodyMode::Buffered,
+            downstream,
+            Operation::Generate,
+        );
+        let start = events
+            .iter()
+            .find(|e| e.get("kind").is_some() && e["x_ck"]["block_index"] == 0)
+            .unwrap();
+        assert_eq!(start["kind"], "opaque", "{start}");
+        assert!(!events.iter().any(|e| e["choices"][0]["delta"].get("content").is_some()));
+        let body = match downstream {
+            BodyMode::Buffered => serde_json::from_slice(&out).unwrap(),
+            BodyMode::Streaming => super::cross::client_events(&out).last().unwrap()["response"].clone(),
+        };
+        assert_eq!(body["output"][0]["content"][0], part, "{body}");
+    }
+}
