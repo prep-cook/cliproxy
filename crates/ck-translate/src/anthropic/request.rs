@@ -379,6 +379,12 @@ fn normalize(owner: &mut Writer, doc: &mut Document, operation: Operation) -> Re
         ],
         original,
     )?;
+    if doc.node(native)?.first.is_none() {
+        doc.remove(provider, "anthropic")?;
+    }
+    if doc.node(provider)?.first.is_none() {
+        doc.remove(x, "provider_parameters")?;
+    }
     Ok(())
 }
 pub(super) fn capture(

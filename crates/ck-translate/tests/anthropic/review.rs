@@ -334,3 +334,36 @@ fn buffered_conversion_reports_only_unrepresentable_native_metadata() {
     assert_eq!(serde_json::from_slice::<Value>(&output).unwrap()["future_finish"], 9);
     assert!(LOSSES.lock().unwrap().is_empty());
 }
+
+#[test]
+fn native_temperature_and_top_p_reach_chat_together() {
+    let input = br#"{"model":"m","max_tokens":100,"temperature":0.1,"top_p":0.9,"messages":[{"role":"user","content":"hello"}]}"#;
+    for upstream_stream in [false, true] {
+        let mut mapped = Mapped::new();
+        let mut ingress = anthropic::request::Ingress::new(
+            &mut mapped.writer,
+            &mapped.store,
+            identity(Direction::Request),
+            Operation::Generate,
+            4096,
+        )
+        .unwrap();
+        for chunk in input.chunks(3) {
+            ingress.advance(&mut mapped.writer, chunk).unwrap();
+        }
+        let ready = ingress
+            .finish(&mut mapped.writer, &codec::chat::request::ChatCapability)
+            .unwrap();
+        let output = codec::chat::request::Egress {
+            destination: "chat",
+            upstream_stream,
+        }
+        .encode(&ready, &mut mapped.writer)
+        .unwrap();
+        let body: Value = serde_json::from_slice(&bytes(&output)).unwrap();
+        assert_eq!(body["temperature"], 0.1);
+        assert_eq!(body["top_p"], 0.9);
+        assert_eq!(body["messages"], json!([{"role":"user","content":"hello"}]));
+        assert_eq!(body["stream"], upstream_stream);
+    }
+}
