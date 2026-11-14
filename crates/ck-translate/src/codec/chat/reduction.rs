@@ -148,8 +148,15 @@ impl Reduction {
             legacy,
         })?;
         let source = doc.required(x, "source")?;
-        let ids = doc.required(source, "ids")?;
-        let id = doc.required(ids, "id")?;
+        // A provider call without its own id (Gemini) takes the canonical call id.
+        let id = match doc
+            .member(source, "ids")?
+            .map(|ids| doc.member(ids, "id"))
+            .transpose()?
+        {
+            Some(Some(id)) => id,
+            _ => doc.required(x, "tool_call_id")?,
+        };
         let name = doc.required(root, "name")?;
         mapped_document(owner, |e| {
             e.bytes(b"{")?;
