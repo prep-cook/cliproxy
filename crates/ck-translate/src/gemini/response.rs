@@ -233,7 +233,7 @@ impl State {
         owner: &mut Writer,
         scope: Scope,
         delta: impl Fn(&mut Encoder<'_, '_>) -> Result<()>,
-        finish: Option<(&Document, usize)>,
+        finish: Option<&str>,
         logprobs: Option<(&Document, usize)>,
         provenance: impl Fn(&mut Encoder<'_, '_>) -> Result<()>,
     ) -> Result<()> {
@@ -249,14 +249,8 @@ impl State {
                 e.bytes(b",\"delta\":")?;
                 delta(e)?;
                 e.bytes(b",\"finish_reason\":")?;
-                if let Some((doc, n)) = finish {
-                    e.string(if doc.string_is(n, "STOP")? {
-                        "stop"
-                    } else if doc.string_is(n, "MAX_TOKENS")? {
-                        "length"
-                    } else {
-                        "content_filter"
-                    })?;
+                if let Some(reason) = finish {
+                    e.string(reason)?;
                 } else {
                     e.bytes(b"null")?;
                 }

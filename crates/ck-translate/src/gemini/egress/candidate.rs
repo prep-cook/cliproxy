@@ -32,27 +32,22 @@ impl Egress {
             None => None,
         };
         let finish = match present(&event, choice, "finish_reason")? {
-            Some(finish) => {
-                let native = event.member(x, "native_finish_reason")?;
-                let reason = if event.string_is(finish, "length")? {
-                    "MAX_TOKENS"
-                } else if event.string_is(finish, "content_filter")? {
-                    "SAFETY"
-                } else {
-                    "STOP"
-                };
-                Some(mapped(owner, |e| match native {
-                    Some(native) => event.write(native, e),
-                    None => e.string(reason),
-                })?)
-            }
+            Some(finish) => Some(mapped(owner, |e| finish_reason(&event, x, finish, e))?),
             None => None,
+        };
+        let message = match native(&event, x)? {
+            true => finish_message(owner, &event, x)?,
+            false => None,
         };
         if let Some(delta) = event.member(choice, "delta")? {
             self.delta(owner, event, delta, output)?;
         }
         self.choices[slot].finished = finish.is_some();
-        for (name, value) in [("logprobsResult", logprobs), ("finishReason", finish)] {
+        for (name, value) in [
+            ("logprobsResult", logprobs),
+            ("finishReason", finish),
+            ("finishMessage", message),
+        ] {
             if let Some(value) = value {
                 self.candidate_field(owner, output, slot, name, |e| value.write(value.root(), e))?;
             }
@@ -331,4 +326,44 @@ fn project_usage(event: &Document, usage: usize, e: &mut Encoder<'_, '_>) -> Res
         e.unsigned(candidates)?;
     }
     e.bytes(b"}")
+}
+
+/// A Gemini source keeps its exact native reason; any other source maps its Chat reason, so a
+/// foreign native spelling such as `end_turn` never reaches a Gemini client.
+fn finish_reason(event: &Document, x: usize, finish: usize, e: &mut Encoder<'_, '_>) -> Result<()> {
+    if native(event, x)?
+        && let Some(reason) = event.member(x, "native_finish_reason")?
+    {
+        return event.write(reason, e);
+    }
+    e.string(if event.string_is(finish, "length")? {
+        "MAX_TOKENS"
+    } else if event.string_is(finish, "content_filter")? {
+        "SAFETY"
+    } else if ["stop", "tool_calls", "function_call"]
+        .iter()
+        .try_fold(false, |found, name| {
+            Ok::<_, Error>(found || event.string_is(finish, name)?)
+        })?
+    {
+        "STOP"
+    } else {
+        "OTHER"
+    })
+}
+
+/// The native `finishMessage` that the ingress carried as an original record on the finish.
+fn finish_message(owner: &mut Writer, event: &Document, x: usize) -> Result<Option<Document>> {
+    let Some(original) = event.member(x, "original")? else {
+        return Ok(None);
+    };
+    for entry in event.children(original)? {
+        if super::super::is(event, entry, "protocol", "gemini")?
+            && super::super::is(event, entry, "pointer", "/finishMessage")?
+            && let Some(value) = event.member(entry, "value")?
+        {
+            return Ok(Some(mapped(owner, |e| event.write(value, e))?));
+        }
+    }
+    Ok(None)
 }

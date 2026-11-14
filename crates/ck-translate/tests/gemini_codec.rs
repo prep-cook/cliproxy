@@ -5,6 +5,8 @@
 pub mod boundary;
 #[path = "../src/codec/mod.rs"]
 pub mod codec;
+#[path = "gemini/finish.rs"]
+mod finish;
 #[path = "../src/gemini/boundary.rs"]
 pub mod gemini;
 #[path = "gemini/incremental.rs"]

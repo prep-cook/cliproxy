@@ -19,6 +19,18 @@ const CANDIDATE_KNOWN: &[&str] = &[
     "urlContextMetadata",
     "logprobsResult",
 ];
+/// A finished candidate's `finishMessage` travels on its finish chunk.
+const FINISHED_KNOWN: &[&str] = &[
+    "index",
+    "content",
+    "finishReason",
+    "finishMessage",
+    "groundingMetadata",
+    "citationMetadata",
+    "safetyRatings",
+    "urlContextMetadata",
+    "logprobsResult",
+];
 /// Response members with their own canonical record; the rest travel as `gemini.response`.
 const RESPONSE_KNOWN: &[&str] = &[
     "candidates",
@@ -181,17 +193,31 @@ impl State {
                 |_| Ok(()),
             )?;
         }
-        self.extras(owner, doc, candidate, Some(index), CANDIDATE_KNOWN)?;
-        if let Some(finish) = doc.member(candidate, "finishReason")? {
-            self.finish(owner, doc, finish, slot)?;
+        let finish = doc.member(candidate, "finishReason")?;
+        let known = if finish.is_some() {
+            FINISHED_KNOWN
+        } else {
+            CANDIDATE_KNOWN
+        };
+        self.extras(owner, doc, candidate, Some(index), known)?;
+        if let Some(finish) = finish {
+            self.finish(owner, doc, candidate, finish, slot)?;
         }
         Ok(())
     }
-    fn finish(&mut self, owner: &mut Writer, doc: &Document, finish: usize, slot: usize) -> Result<()> {
+    /// Publishes the finish chunk: the Chat reason, the exact native reason and the native
+    /// `finishMessage`, which belongs to the finish rather than to the candidate's extras.
+    fn finish(
+        &mut self,
+        owner: &mut Writer,
+        doc: &Document,
+        candidate: usize,
+        finish: usize,
+        slot: usize,
+    ) -> Result<()> {
         super::super::string(doc, finish)?;
-        if doc.string_is(finish, "FINISH_REASON_UNSPECIFIED")? {
-            return Err(Error::Schema);
-        }
+        let reason = reason(doc, finish, self.choices[slot].next_tool != 0)?;
+        let message = doc.member(candidate, "finishMessage")?;
         let scope = Scope {
             choice_index: Some(self.choices[slot].index),
             ..Scope::default()
@@ -200,11 +226,17 @@ impl State {
             owner,
             scope,
             |e| e.bytes(b"{}"),
-            Some((doc, finish)),
+            Some(reason),
             None,
             |e| {
                 e.bytes(b",\"native_finish_reason\":")?;
-                doc.write(finish, e)
+                doc.write(finish, e)?;
+                if let Some(message) = message {
+                    e.bytes(b",\"original\":[{\"protocol\":\"gemini\",\"pointer\":\"/finishMessage\",\"value\":")?;
+                    doc.write(message, e)?;
+                    e.bytes(b"}]")?;
+                }
+                Ok(())
             },
         )?;
         self.choices[slot].finished = true;
@@ -283,4 +315,31 @@ impl State {
         )?;
         Ok(())
     }
+}
+
+/// The Chat finish reason for a native one. Chat has no value for the other native reasons
+/// (`OTHER`, `MALFORMED_FUNCTION_CALL`, `FINISH_REASON_UNSPECIFIED`, future ones), so they
+/// finish as `stop`; the exact native reason rides along as `native_finish_reason`.
+fn reason(doc: &Document, finish: usize, called: bool) -> Result<&'static str> {
+    const FILTERED: &[&str] = &[
+        "SAFETY",
+        "RECITATION",
+        "BLOCKLIST",
+        "PROHIBITED_CONTENT",
+        "SPII",
+        "IMAGE_SAFETY",
+        "IMAGE_PROHIBITED_CONTENT",
+        "IMAGE_RECITATION",
+    ];
+    Ok(if doc.string_is(finish, "MAX_TOKENS")? {
+        "length"
+    } else if FILTERED.iter().try_fold(false, |found, name| {
+        Ok::<_, Error>(found || doc.string_is(finish, name)?)
+    })? {
+        "content_filter"
+    } else if called && doc.string_is(finish, "STOP")? {
+        "tool_calls"
+    } else {
+        "stop"
+    })
 }
