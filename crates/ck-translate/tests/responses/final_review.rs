@@ -377,3 +377,130 @@ fn redacted_reasoning_has_no_responses_carrier() {
         }
     }
 }
+
+/// Streamed Responses `records` replayed to a client in `downstream` mode, or the ingress error.
+fn try_streamed(records: &[Value], downstream: BodyMode) -> codec::Result<(Vec<u8>, Vec<Value>)> {
+    let mut m = Mapped::new();
+    let mut ingress = responses::response::Ingress::new(
+        &mut m.writer,
+        identity(Direction::Response),
+        Operation::Generate,
+        BodyMode::Streaming,
+        1024 * 1024,
+    )?;
+    let mut reader = m.store.reader(m.writer.id(), 0).unwrap();
+    let mut egress = responses::egress::Egress::new(
+        &mut m.writer,
+        identity(Direction::Response),
+        Operation::Generate,
+        downstream,
+        |_, _| {},
+    )?;
+    let ingested = ingress
+        .advance(&mut m.writer, wire(records).as_bytes())
+        .and_then(|()| ingress.finish(&mut m.writer));
+    let mut out = Vec::new();
+    while let std::task::Poll::Ready(Some(ck_stream::Read::Record(lease))) = reader.try_next() {
+        egress.advance(&mut m.writer, lease, |chunk| {
+            out.extend_from_slice(&bytes(&chunk));
+            Ok(())
+        })?;
+    }
+    ingested?;
+    egress.finish()?;
+    Ok((out, events(&m)))
+}
+
+#[test]
+fn encrypted_content_may_be_null_or_provisional() {
+    let item = |encrypted: Value| json!({"id":"i","type":"reasoning","summary":[],"encrypted_content":encrypted});
+    let body = json!({"id":"r","status":"completed","output":[item(Value::Null)]});
+    for mode in [BodyMode::Buffered, BodyMode::Streaming] {
+        let (out, canonical) = response(
+            body.to_string().as_bytes(),
+            BodyMode::Buffered,
+            mode,
+            Operation::Generate,
+        );
+        assert!(!canonical.iter().any(|e| e["kind"] == "responses_encrypted"));
+        let body = match mode {
+            BodyMode::Buffered => serde_json::from_slice::<Value>(&out).unwrap(),
+            _ => client_events(&out).last().unwrap()["response"].clone(),
+        };
+        assert_eq!(body["output"][0]["encrypted_content"], Value::Null);
+        assert!(body["output"][0].as_object().unwrap().contains_key("encrypted_content"));
+    }
+    let lifecycle = |done: Option<Value>, last: Value| {
+        let mut records = vec![json!({"type":"response.output_item.added","output_index":0,"item":item(json!("abc"))})];
+        if let Some(done) = done {
+            records.push(json!({"type":"response.output_item.done","output_index":0,"item":done}));
+        }
+        records.push(json!({"type":"response.completed","response":{"id":"r","status":"completed","output":[last]}}));
+        records
+    };
+    // The added value is provisional; the closing snapshot's value is published once.
+    let (out, canonical) = try_streamed(
+        &lifecycle(Some(item(json!("abcdef"))), item(json!("abcdef"))),
+        BodyMode::Buffered,
+    )
+    .unwrap();
+    let fragments: Vec<_> = canonical
+        .iter()
+        .filter(|e| e["kind"] == "responses_encrypted")
+        .collect();
+    assert_eq!(fragments.len(), 1);
+    assert_eq!(fragments[0]["fragment"], "abcdef");
+    assert_eq!(
+        serde_json::from_slice::<Value>(&out).unwrap()["output"][0]["encrypted_content"],
+        "abcdef"
+    );
+    // A closing snapshot without the member keeps the provisional value; null clears it.
+    let (out, _) = try_streamed(
+        &lifecycle(None, json!({"id":"i","type":"reasoning","summary":[]})),
+        BodyMode::Buffered,
+    )
+    .unwrap();
+    assert_eq!(
+        serde_json::from_slice::<Value>(&out).unwrap()["output"][0]["encrypted_content"],
+        "abc"
+    );
+    let (out, canonical) = try_streamed(
+        &lifecycle(Some(item(Value::Null)), item(Value::Null)),
+        BodyMode::Buffered,
+    )
+    .unwrap();
+    assert!(!canonical.iter().any(|e| e["kind"] == "responses_encrypted"));
+    assert_eq!(
+        serde_json::from_slice::<Value>(&out).unwrap()["output"][0]["encrypted_content"],
+        Value::Null
+    );
+    // A null at the start gives way to the closing value.
+    let records = [
+        json!({"type":"response.output_item.added","output_index":0,"item":item(Value::Null)}),
+        json!({"type":"response.output_item.done","output_index":0,"item":item(json!("abcdef"))}),
+        json!({"type":"response.completed","response":{"id":"r","status":"completed","output":[item(json!("abcdef"))]}}),
+    ];
+    for mode in [BodyMode::Buffered, BodyMode::Streaming] {
+        let (out, _) = try_streamed(&records, mode).unwrap();
+        let body = match mode {
+            BodyMode::Buffered => serde_json::from_slice::<Value>(&out).unwrap(),
+            _ => client_events(&out).last().unwrap()["response"].clone(),
+        };
+        assert_eq!(body["output"][0]["encrypted_content"], "abcdef");
+    }
+    // Once published, a snapshot must agree.
+    assert!(
+        try_streamed(
+            &lifecycle(Some(item(json!("abcdef"))), item(json!("x"))),
+            BodyMode::Buffered
+        )
+        .is_err()
+    );
+    assert!(
+        try_streamed(
+            &lifecycle(Some(item(json!("abcdef"))), item(Value::Null)),
+            BodyMode::Buffered
+        )
+        .is_err()
+    );
+}

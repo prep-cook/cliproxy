@@ -280,6 +280,12 @@ impl<F: FnMut(&'static str, u64)> Egress<F> {
         let doc = &mut self.document;
         let fragment = doc.required(node, "fragment")?;
         doc.detach(node, fragment)?;
+        // A provisional null from the item's start attributes gives way to the content.
+        if let Some(previous) = doc.member(item, "encrypted_content")?
+            && matches!(doc.node(previous)?.value, Value::Null)
+        {
+            doc.remove(item, "encrypted_content")?;
+        }
         append_fragment(doc, item, "encrypted_content", fragment)?;
         Ok(())
     }

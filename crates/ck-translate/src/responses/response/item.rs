@@ -139,57 +139,68 @@ impl State {
                 return Err(Error::Truncated);
             }
         }
-        if let Some(encrypted) = doc.member(node, "encrypted_content")? {
-            self.encrypted(owner, at, doc, encrypted)?;
-        }
+        self.encrypted(owner, at, doc, node, close)?;
         if close && !self.items[at].closed {
             self.close_item(owner, at, doc, node)?;
         }
         Ok(())
     }
 
-    /// Publishes encrypted reasoning once as its own block; a repeat must be equal.
-    fn encrypted(&mut self, owner: &mut Writer, at: usize, doc: &Document, encrypted: usize) -> Result<()> {
-        string(doc, encrypted)?;
+    /// Reconciles `encrypted_content`. A value before the item closes is provisional, since
+    /// `output_item.added` may carry an incomplete one: at close the snapshot's value, else the
+    /// provisional one, is published once as its own block, and later snapshots must equal it.
+    /// Null publishes nothing and stays a native attribute (`item_metadata`).
+    fn encrypted(&mut self, owner: &mut Writer, at: usize, doc: &Document, node: usize, close: bool) -> Result<()> {
+        let incoming = doc.member(node, "encrypted_content")?;
         let item = &mut self.items[at];
-        if !item.encrypted {
-            if item.closed {
-                return Err(Error::Schema);
-            }
-            let scope = item.scope(Some(u64::MAX));
-            self.emitter.emit(
-                owner,
-                Kind::BlockStart,
-                scope,
-                |e| e.bytes(b",\"kind\":\"thinking\",\"attributes\":{\"type\":\"encrypted\"}"),
-                |_| Ok(()),
-            )?;
-            self.emitter.emit(
-                owner,
-                Kind::ReasoningSignature,
-                scope,
-                |e| {
-                    e.bytes(b",\"kind\":\"responses_encrypted\",\"fragment\":")?;
-                    doc.write(encrypted, e)?;
-                    e.bytes(b",\"final\":true")
-                },
-                |_| Ok(()),
-            )?;
-            self.emitter
-                .emit(owner, Kind::BlockEnd, scope, |_| Ok(()), |_| Ok(()))?;
-            let lease = encode::scratch(owner, |e| doc.write(encrypted, e))?;
-            let imported = item.doc.import_json(owner, lease)?;
-            item.doc.rename(imported, "encrypted_content")?;
-            item.doc.append(item.doc.root(), imported)?;
-            item.encrypted = true;
-        } else if !equal(
-            &item.doc,
-            item.doc.required(item.doc.root(), "encrypted_content")?,
-            doc,
-            encrypted,
-        )? {
-            return Err(Error::Schema);
+        let root = item.doc.root();
+        if item.encrypted {
+            let published = item.doc.required(root, "encrypted_content")?;
+            return match incoming {
+                Some(value) if !equal(&item.doc, published, doc, value)? => Err(Error::Schema),
+                _ => Ok(()),
+            };
         }
+        if let Some(value) = incoming {
+            if let Some(provisional) = item.doc.member(root, "encrypted_content")? {
+                item.doc.detach(root, provisional)?;
+            }
+            if !matches!(doc.node(value)?.value, Value::Null) {
+                string(doc, value)?;
+                if item.closed {
+                    return Err(Error::Schema);
+                }
+                let lease = encode::scratch(owner, |e| doc.write(value, e))?;
+                let imported = item.doc.import_json(owner, lease)?;
+                item.doc.rename(imported, "encrypted_content")?;
+                item.doc.append(root, imported)?;
+            }
+        }
+        let Some(value) = item.doc.member(root, "encrypted_content")?.filter(|_| close) else {
+            return Ok(());
+        };
+        let scope = item.scope(Some(u64::MAX));
+        self.emitter.emit(
+            owner,
+            Kind::BlockStart,
+            scope,
+            |e| e.bytes(b",\"kind\":\"thinking\",\"attributes\":{\"type\":\"encrypted\"}"),
+            |_| Ok(()),
+        )?;
+        self.emitter.emit(
+            owner,
+            Kind::ReasoningSignature,
+            scope,
+            |e| {
+                e.bytes(b",\"kind\":\"responses_encrypted\",\"fragment\":")?;
+                item.doc.write(value, e)?;
+                e.bytes(b",\"final\":true")
+            },
+            |_| Ok(()),
+        )?;
+        self.emitter
+            .emit(owner, Kind::BlockEnd, scope, |_| Ok(()), |_| Ok(()))?;
+        item.encrypted = true;
         Ok(())
     }
 
@@ -358,5 +369,16 @@ fn item_metadata(doc: &Document, node: usize, e: &mut Encoder<'_, '_>) -> Result
     } else {
         &["content", "summary", "arguments", "input", "encrypted_content"]
     };
-    object(doc, node, fields, e)
+    // A null `encrypted_content` publishes no block, so it stays an attribute.
+    let null = match doc.member(node, "encrypted_content")? {
+        Some(value) => matches!(doc.node(value)?.value, Value::Null),
+        None => false,
+    };
+    let mut kept = [""; 8];
+    let mut count = 0;
+    for field in fields.iter().filter(|field| !null || **field != "encrypted_content") {
+        kept[count] = field;
+        count += 1;
+    }
+    object(doc, node, &kept[..count], e)
 }
