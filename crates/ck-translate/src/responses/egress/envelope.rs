@@ -47,7 +47,7 @@ impl<F: FnMut(&'static str, u64)> Egress<F> {
             ("status", "status"),
         ] {
             if let Some(value) = doc.remove(node, from)?
-                && !synthetic(doc, node, from)?
+                && !codec::identity::synthetic(doc, node, from)?
             {
                 let target = doc.set(target, to, Value::Null)?;
                 doc.transplant(target, value)?;
@@ -194,20 +194,4 @@ impl<F: FnMut(&'static str, u64)> Egress<F> {
         doc.append(output_node, item)?;
         Ok(())
     }
-}
-
-/// Whether the canonical start `node` names `field` as generated rather than supplied.
-fn synthetic(doc: &Document, node: usize, field: &str) -> Result<bool> {
-    let Some(x) = doc.member(node, "x_ck")? else {
-        return Ok(false);
-    };
-    let Some(names) = doc.member(x, "synthetic")? else {
-        return Ok(false);
-    };
-    for name in doc.children(names)? {
-        if doc.string_is(name, field)? {
-            return Ok(true);
-        }
-    }
-    Ok(false)
 }

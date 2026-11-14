@@ -47,11 +47,11 @@ impl<F: FnMut(&'static str, u64)> Egress<F> {
             return Err(Error::Unsupported);
         }
         // The response id when the source supplies none: generated here, never a source value.
-        let id = codec::media::local_id(b's', owner.id())?;
+        let id = codec::identity::response_id("resp_", owner.id())?;
         let document = super::mapped(owner, |e| {
-            e.bytes(b"{\"id\":\"resp_")?;
-            e.bytes(id.as_str().as_bytes())?;
-            e.bytes(b"\",\"object\":")?;
+            e.bytes(b"{\"id\":")?;
+            e.string(id.as_str())?;
+            e.bytes(b",\"object\":")?;
             e.string(if operation == Operation::Compact {
                 "response.compaction"
             } else {

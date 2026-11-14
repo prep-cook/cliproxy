@@ -9,7 +9,7 @@ impl Egress {
         output: &mut impl FnMut(ScratchLease) -> Result<()>,
     ) -> Result<()> {
         // Source metadata can replace a synthetic response.start after a heartbeat.
-        if !self.started && metadata_changed(self.base.as_ref().ok_or(Error::Schema)?, &doc)? {
+        if !self.started && metadata_changed(self.base.as_ref().ok_or(Error::Schema)?, &doc, self.metadata_keys())? {
             self.refresh_base(owner, &doc)?;
         }
         let mut finished = false;
@@ -18,8 +18,17 @@ impl Egress {
         }
         self.chunk_origin(owner, doc, finished, output)
     }
+    /// Base members a chunk's metadata may replace; an issued id is not one of them.
+    fn metadata_keys(&self) -> &'static [&'static str] {
+        if self.own_id {
+            &["model", "created"]
+        } else {
+            &["id", "model", "created"]
+        }
+    }
     fn refresh_base(&mut self, owner: &mut Writer, doc: &Document) -> Result<()> {
         let root = doc.root();
+        let keys = self.metadata_keys();
         let base = self.base.as_mut().ok_or(Error::Schema)?;
         let update = mapped(owner, |e| {
             e.bytes(b"{")?;
@@ -29,7 +38,9 @@ impl Egress {
                 }
                 e.string(key)?;
                 e.bytes(b":")?;
-                if let Some(n) = doc.member(root, key)? {
+                if keys.contains(key)
+                    && let Some(n) = doc.member(root, key)?
+                {
                     doc.write(n, e)?;
                 } else {
                     base.write(base.required(base.root(), key)?, e)?;

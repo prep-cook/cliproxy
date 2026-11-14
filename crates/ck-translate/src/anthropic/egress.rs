@@ -7,7 +7,7 @@ use crate::codec::{
     document::{Document, Value},
     encode::{self, Encoder},
     event::{Identity, Kind, LocalId},
-    internal,
+    identity, internal,
 };
 use ck_stream::{Lease, ScratchLease, Writer};
 
@@ -48,6 +48,8 @@ pub struct Egress {
     mode: BodyMode,
     sequence: u64,
     base: Option<Document>,
+    /// The base id was issued here because the source supplied none; it stays for the response.
+    own_id: bool,
     blocks: Table<Block>,
     /// `blocks` positions by (item, block index) and by tool index, and `text_lists` positions
     /// by (item, kind).
@@ -84,6 +86,7 @@ impl Egress {
             mode,
             sequence: 0,
             base: None,
+            own_id: false,
             blocks: Table::new(owner)?,
             named: Index::new(owner)?,
             tools: Index::new(owner)?,
@@ -213,7 +216,7 @@ impl Egress {
         if self.terminal || self.failed {
             return Err(Error::Closed);
         }
-        let (kind, doc) = internal::decode(owner, lease)?;
+        let (kind, mut doc) = internal::decode(owner, lease)?;
         let root = doc.root();
         let x = doc.required(root, "x_ck")?;
         if doc.unsigned(doc.required(x, "seq")?)? != self.sequence
@@ -235,6 +238,11 @@ impl Egress {
             Kind::ResponseStart => {
                 if self.base.is_some() {
                     return Err(Error::Schema);
+                }
+                let root = doc.root();
+                if identity::supplied_id(&doc, root)?.is_none() {
+                    doc.set_id(root, "id", identity::response_id("msg_", owner.id())?)?;
+                    self.own_id = true;
                 }
                 self.base = Some(doc);
             }
@@ -510,8 +518,8 @@ fn raw_string(doc: &Document, node: usize, e: &mut Encoder<'_, '_>, multiline: b
     Ok(())
 }
 
-fn metadata_changed(base: &Document, incoming: &Document) -> Result<bool> {
-    for key in ["id", "model", "created"] {
+fn metadata_changed(base: &Document, incoming: &Document, keys: &[&str]) -> Result<bool> {
+    for &key in keys {
         let Some(next) = incoming.member(incoming.root(), key)? else {
             continue;
         };
