@@ -122,7 +122,7 @@ impl<F: FnMut(&'static str, u64)> Egress<F> {
             Kind::ResponseStart => return self.response_start(incoming),
             Kind::Done => return self.done(owner, output),
             Kind::Opaque => return self.opaque(owner, incoming, output),
-            Kind::Usage => {}
+            Kind::Usage | Kind::Chunk => {}
             _ => self.created(owner, output)?,
         }
         let native_execution = incoming

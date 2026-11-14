@@ -214,16 +214,10 @@ fn unnamed_data_is_not_classified_by_its_first_byte() {
     }
 }
 
-/// Streaming client JSON events for the queued → in progress → completed lifecycle after
-/// `prefix`; an unknown text record passes through as it is.
-fn lifecycle(prefix: &str) -> Vec<Value> {
-    let response = |status: &str| json!({"id":"r","status":status,"output":[]});
-    let records = [
-        json!({"type":"response.created","response":response("queued")}),
-        json!({"type":"response.in_progress","response":response("in_progress")}),
-        json!({"type":"response.completed","response":response("completed")}),
-    ];
-    let (out, _) = try_raw(format!("{prefix}{}", wire(&records)).as_bytes(), BodyMode::Streaming).unwrap();
+/// Streaming client JSON events for Responses SSE `input`; an unknown text record passes
+/// through as it is.
+fn json_events(input: &str) -> Vec<Value> {
+    let (out, _) = try_raw(input.as_bytes(), BodyMode::Streaming).unwrap();
     std::str::from_utf8(&out)
         .unwrap()
         .lines()
@@ -233,11 +227,20 @@ fn lifecycle(prefix: &str) -> Vec<Value> {
 
 #[test]
 fn a_heartbeat_before_creation_fixes_no_identity() {
-    for prefix in [": ping\n\n", "data: ordinary text\n\n"] {
-        let events = lifecycle(prefix);
+    let response = |status: &str| json!({"id":"r","status":status,"output":[]});
+    let lifecycle = wire(&[
+        json!({"type":"response.created","response":response("queued")}),
+        json!({"type":"response.in_progress","response":response("in_progress")}),
+        json!({"type":"response.completed","response":response("completed")}),
+    ]);
+    for prefix in [": ping\n\n", "data: ordinary text\n\n", "data: {diagnostic}\n\n"] {
+        let events = json_events(&format!("{prefix}{lifecycle}"));
         let created = events.iter().find(|e| e["type"] == "response.created").unwrap();
         assert_eq!(created["response"]["status"], "queued", "{prefix}");
-        for event in events.iter().filter(|e| e.get("response").is_some()) {
+        // A stream whose only snapshot is the terminal one takes its identity from it.
+        let terminal = json_events(&format!("{prefix}{COMPLETED}"));
+        assert_eq!(terminal[0]["type"], "response.created");
+        for event in events.iter().chain(&terminal).filter(|e| e.get("response").is_some()) {
             assert_eq!(event["response"]["id"], "r", "{prefix}");
         }
     }

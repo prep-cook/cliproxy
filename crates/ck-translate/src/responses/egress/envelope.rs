@@ -55,7 +55,8 @@ impl<F: FnMut(&'static str, u64)> Egress<F> {
     }
 
     /// Publishes the owed `response.created` with the response as it stands. Every event other
-    /// than a heartbeat, usage, start or opaque record calls it before its own output.
+    /// than a heartbeat, usage, start, opaque record or chunk calls it before its own output; a
+    /// chunk with output follows the start of its item, and the finish chunk writes nothing.
     pub(super) fn created(
         &mut self,
         owner: &mut Writer,
@@ -123,32 +124,26 @@ impl<F: FnMut(&'static str, u64)> Egress<F> {
     ) -> Result<()> {
         let root = incoming.root();
         if is(&incoming, root, "name", "responses.response")? {
-            let source = match incoming
+            let progress = match incoming
                 .member(root, "x_ck")?
                 .map(|x| incoming.member(x, "source"))
                 .transpose()?
             {
-                Some(Some(source)) => Some(source),
-                _ => None,
+                Some(Some(source)) => is(&incoming, source, "event", "response.in_progress")?,
+                _ => false,
             };
-            let event = |name| source.map_or(Ok(false), |source| is(&incoming, source, "event", name));
-            let (creation, progress) = (event("response.created")?, event("response.in_progress")?);
-            // The creation snapshot completes the owed `response.created`; any other snapshot
-            // follows it.
-            if !creation {
-                self.created(owner, output)?;
-            }
             let doc = &mut self.document;
             let node = doc.absorb(incoming)?;
             let value = doc.required(node, "value")?;
             super::super::opaque::preserve_carrier_collision(doc, value)?;
             super::super::merge(doc, doc.root(), value)?;
-            if creation {
-                return self.created(owner, output);
-            }
+            // Every snapshot carries the native identity, so the owed `response.created` follows
+            // its merge rather than a synthesized start.
+            self.created(owner, output)?;
             if !progress || self.mode == BodyMode::Buffered {
                 return Ok(());
             }
+            let doc = &self.document;
             let response = encode::scratch(owner, |e| write_response(doc, e))?;
             return self.emit(
                 owner,
