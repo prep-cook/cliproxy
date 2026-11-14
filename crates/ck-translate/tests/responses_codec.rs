@@ -1,5 +1,7 @@
 #[path = "responses/audio.rs"]
 mod audio;
+#[path = "responses/cross.rs"]
+mod cross;
 #[path = "responses/execution.rs"]
 mod execution;
 #[path = "responses/finish.rs"]
