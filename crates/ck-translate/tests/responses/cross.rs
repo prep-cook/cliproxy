@@ -198,3 +198,66 @@ fn chat_text_and_multiple_calls_remain_separate_output_items() {
         }
     }
 }
+
+/// The final Responses object of a buffered body or a streamed `response.completed`.
+fn final_response(output: &[u8], downstream: BodyMode) -> Value {
+    if downstream == BodyMode::Buffered {
+        return serde_json::from_slice(output).unwrap();
+    }
+    client_events(output)
+        .into_iter()
+        .find(|event| event["type"] == "response.completed")
+        .unwrap()["response"]
+        .clone()
+}
+
+#[test]
+fn chat_usage_projects_native_token_details_without_control_fields() {
+    let usage = json!({"prompt_tokens":0,"completion_tokens":3,"prompt_tokens_details":{"cached_tokens":0,"audio_tokens":2},"completion_tokens_details":{"reasoning_tokens":1,"audio_tokens":2,"rejected_prediction_tokens":0}});
+    let input = json!({"id":"chat-r","model":"m","choices":[{"index":0,"message":{"role":"assistant","content":"x"},"finish_reason":"stop"}],"usage":usage});
+    for downstream in [BodyMode::Buffered, BodyMode::Streaming] {
+        let output = chat_to_responses(&serde_json::to_vec(&input).unwrap(), BodyMode::Buffered, downstream);
+        let out = final_response(&output, downstream);
+        assert_eq!(
+            out["usage"],
+            json!({"input_tokens":0,"output_tokens":3,"total_tokens":3,"input_tokens_details":{"cached_tokens":0,"audio_tokens":2},"output_tokens_details":{"reasoning_tokens":1,"audio_tokens":2}})
+        );
+        let provenance = out["x_ck_opaque"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|entry| entry["name"] == "usage.snapshot")
+            .unwrap();
+        assert_eq!(provenance["value"]["native"]["value"], usage);
+        assert!(provenance["value"]["final"].is_boolean());
+    }
+}
+
+#[test]
+fn corrected_usage_replaces_counts_and_preserves_native_null() {
+    let input = sse(&[
+        json!({"id":"r","choices":[{"index":0,"delta":{"content":"x"},"finish_reason":null}]}),
+        json!({"id":"r","choices":[],"usage":{"prompt_tokens":7,"completion_tokens":3}}),
+        json!({"id":"r","choices":[],"usage":{"prompt_tokens":null}}),
+        json!({"id":"r","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}),
+    ]);
+    let output = chat_to_responses(input.as_bytes(), BodyMode::Streaming, BodyMode::Buffered);
+    let out = final_response(&output, BodyMode::Buffered);
+    assert_eq!(out["usage"], json!({"output_tokens":3}));
+    let snapshots: Vec<_> = out["x_ck_opaque"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|entry| entry["name"] == "usage.snapshot")
+        .collect();
+    assert_eq!(snapshots.len(), 1);
+    assert_eq!(snapshots[0]["value"]["native"]["value"]["prompt_tokens"], Value::Null);
+    assert_eq!(snapshots[0]["value"]["native"]["value"]["completion_tokens"], 3);
+    let absent = json!({"choices":[{"index":0,"message":{"content":"x"},"finish_reason":"stop"}]});
+    let output = chat_to_responses(
+        &serde_json::to_vec(&absent).unwrap(),
+        BodyMode::Buffered,
+        BodyMode::Buffered,
+    );
+    assert!(final_response(&output, BodyMode::Buffered).get("usage").is_none());
+}

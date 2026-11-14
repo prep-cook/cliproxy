@@ -31,6 +31,8 @@ pub struct Egress<F: FnMut(&'static str, u64)> {
     diagnostic: F,
     images: Table<super::image::Projection>,
     audio: Table<super::audio::Projection>,
+    /// Value slot of the retained canonical usage snapshot in the opaque carrier.
+    usage_snapshot: Option<usize>,
 }
 impl<F: FnMut(&'static str, u64)> Egress<F> {
     pub fn new(
@@ -63,6 +65,7 @@ impl<F: FnMut(&'static str, u64)> Egress<F> {
             diagnostic,
             images: Table::new(owner)?,
             audio: Table::new(owner)?,
+            usage_snapshot: None,
         })
     }
     fn emit(

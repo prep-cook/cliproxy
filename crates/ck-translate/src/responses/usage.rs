@@ -112,3 +112,68 @@ impl Usage {
         e.bytes(b"}")
     }
 }
+
+/// Responses usage for canonical snapshot `usage`: a Responses source's native value, or the
+/// mapped counts. The snapshot itself replaces the one retained in the `usage.snapshot` opaque
+/// carrier, whose value slot `retained` tracks.
+pub(super) fn project(doc: &mut Document, usage: usize, retained: &mut Option<usize>) -> Result<usize> {
+    if let Some(native) = doc.member(usage, "native")?
+        && super::is(doc, native, "protocol", "responses")?
+    {
+        return doc.required(native, "value");
+    }
+    let result = doc.add(None, Value::Object)?;
+    for name in [
+        "input_tokens",
+        "output_tokens",
+        "total_tokens",
+        "input_uncached_tokens",
+        "cache_write_tokens",
+        "cache_write_by_ttl",
+    ] {
+        super::move_field(doc, usage, name, result, name)?;
+    }
+    for (name, fields) in [
+        (
+            "input_tokens_details",
+            &[
+                ("cache_read_tokens", "cached_tokens"),
+                ("input_audio_tokens", "audio_tokens"),
+            ][..],
+        ),
+        (
+            "output_tokens_details",
+            &[
+                ("reasoning_tokens", "reasoning_tokens"),
+                ("output_audio_tokens", "audio_tokens"),
+            ][..],
+        ),
+    ] {
+        let mut details = None;
+        for &(from, to) in fields {
+            if doc.member(usage, from)?.is_some() {
+                let target = match details {
+                    Some(target) => target,
+                    None => *details.insert(doc.set(result, name, Value::Object)?),
+                };
+                super::move_field(doc, usage, from, target, to)?;
+            }
+        }
+    }
+    let slot = match *retained {
+        Some(slot) => slot,
+        None => {
+            let carrier = match doc.member(doc.root(), "x_ck_opaque")? {
+                Some(carrier) => carrier,
+                None => doc.set(doc.root(), "x_ck_opaque", Value::Array)?,
+            };
+            let entry = doc.add(None, Value::Object)?;
+            doc.append(carrier, entry)?;
+            doc.set(entry, "name", Value::Text("usage.snapshot"))?;
+            doc.set(entry, "format", Value::Text("json"))?;
+            *retained.insert(doc.set(entry, "value", Value::Null)?)
+        }
+    };
+    doc.transplant(slot, usage)?;
+    Ok(result)
+}

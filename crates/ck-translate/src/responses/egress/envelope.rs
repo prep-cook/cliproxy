@@ -107,22 +107,14 @@ impl<F: FnMut(&'static str, u64)> Egress<F> {
         super::super::opaque::retain(&mut self.document, incoming)
     }
 
-    /// Stores the usage object: the native value when the source was Responses.
+    /// Stores the usage object: the native value when the source was Responses, otherwise the
+    /// Responses projection of the canonical snapshot, which itself stays in the opaque carrier.
     pub(super) fn usage(&mut self, node: usize) -> Result<()> {
         let doc = &mut self.document;
         let usage = doc.required(node, "usage")?;
-        let value = if let Some(native) = doc.member(usage, "native")? {
-            if is(doc, native, "protocol", "responses")? {
-                doc.required(native, "value")?
-            } else {
-                usage
-            }
-        } else {
-            usage
-        };
+        let value = super::super::usage::project(doc, usage, &mut self.usage_snapshot)?;
         let target = doc.set(doc.root(), "usage", Value::Null)?;
-        doc.transplant(target, value)?;
-        Ok(())
+        doc.transplant(target, value)
     }
 
     /// Appends one compact output item.
