@@ -192,25 +192,32 @@ impl Document {
         let s = grown(self.sources.len(), sources, self.sources.capacity(), 4)?;
         let i = grown(self.ids.len(), ids, self.ids.capacity(), 4)?;
         self.metadata.resize(Self::table_bytes(n, s, i).ok_or(Error::Limit)?)?;
-        if n > self.nodes.capacity() {
-            self.nodes
-                .try_reserve_exact(n - self.nodes.len())
-                .map_err(|_| Error::Limit)?;
-        }
-        if s > self.sources.capacity() {
-            self.sources
-                .try_reserve_exact(s - self.sources.len())
-                .map_err(|_| Error::Limit)?;
-        }
-        if i > self.ids.capacity() {
-            self.ids
-                .try_reserve_exact(i - self.ids.len())
-                .map_err(|_| Error::Limit)?;
-        }
+        let grew = self.grow(n, s, i);
+        // Charge what the tables hold now, also when one of them failed to grow after others
+        // did, so a failed allocation leaves no charge behind.
         self.metadata.resize(
             Self::table_bytes(self.nodes.capacity(), self.sources.capacity(), self.ids.capacity())
                 .ok_or(Error::Limit)?,
         )?;
+        grew
+    }
+
+    fn grow(&mut self, nodes: usize, sources: usize, ids: usize) -> Result<()> {
+        if nodes > self.nodes.capacity() {
+            self.nodes
+                .try_reserve_exact(nodes - self.nodes.len())
+                .map_err(|_| Error::Limit)?;
+        }
+        if sources > self.sources.capacity() {
+            self.sources
+                .try_reserve_exact(sources - self.sources.len())
+                .map_err(|_| Error::Limit)?;
+        }
+        if ids > self.ids.capacity() {
+            self.ids
+                .try_reserve_exact(ids - self.ids.len())
+                .map_err(|_| Error::Limit)?;
+        }
         Ok(())
     }
 
