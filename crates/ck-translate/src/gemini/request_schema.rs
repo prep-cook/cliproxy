@@ -147,6 +147,15 @@ fn controls(doc: &Document) -> Result<()> {
             return Err(Error::Unsupported);
         }
     }
+    if let Some(format) = doc.member(root, "response_format")?
+        && !["text", "json_object", "json_schema"]
+            .iter()
+            .try_fold(false, |yes, kind| {
+                Ok::<_, Error>(yes || super::is(doc, format, "type", kind)?)
+            })?
+    {
+        return Err(Error::Unsupported);
+    }
     if let Some(tools) = doc.member(root, "tools")? {
         super::array(doc, tools)?;
         for tool in doc.children(tools)? {

@@ -108,3 +108,22 @@ fn id_less_gemini_call_reaches_chat() {
     assert!(call["id"].as_str().is_some_and(|id| !id.is_empty()), "{out}");
     assert_eq!(out["choices"][0]["finish_reason"], "tool_calls");
 }
+
+/// Chat controls the fence accepts reach Gemini with their meaning.
+#[test]
+fn chat_controls_keep_their_meaning() {
+    use super::regressions::{chat_to_gemini, validate};
+    let config = |extra: &str| {
+        let body = format!(r#"{{"model":"m","messages":[{{"role":"user","content":"hi"}}],{extra}}}"#);
+        chat_to_gemini(body.as_bytes())["generationConfig"].clone()
+    };
+    assert_eq!(config(r#""max_completion_tokens":17"#), json!({"maxOutputTokens":17}));
+    assert_eq!(
+        config(r#""response_format":{"type":"json_object"}"#),
+        json!({"responseMimeType":"application/json"})
+    );
+    assert_eq!(config(r#""stop":"END""#), json!({"stopSequences":["END"]}));
+    assert_eq!(config(r#""stop":["A","B"]"#), json!({"stopSequences":["A","B"]}));
+    let unknown = json!({"model":"m","messages":[{"role":"user","content":"hi"}],"response_format":{"type":"grammar"}});
+    assert!(matches!(validate(&unknown), Err(codec::Error::Unsupported)));
+}

@@ -97,6 +97,7 @@ fn config(doc: &Document, x: Option<usize>, native: Option<usize>, e: &mut Encod
     let config_present = native_config.is_some()
         || thinking.is_some()
         || doc.member(root, "response_format")?.is_some()
+        || doc.member(root, "max_completion_tokens")?.is_some()
         || super::request::config().iter().try_fold(false, |yes, (_, key)| {
             Ok::<_, Error>(yes || doc.member(root, key)?.is_some())
         })?;
@@ -126,12 +127,27 @@ fn generation_config(
             e.bytes(b":")?;
             if canonical == "modalities" {
                 modalities(doc, n, e)?;
+            } else if canonical == "stop" && !matches!(doc.node(n)?.value, Value::Array) {
+                e.bytes(b"[")?;
+                doc.write(n, e)?;
+                e.bytes(b"]")?;
             } else {
                 doc.write(n, e)?;
             }
         }
     }
+    if doc.member(root, "max_tokens")?.is_none()
+        && let Some(n) = doc.member(root, "max_completion_tokens")?
+    {
+        comma(&mut first, e)?;
+        e.bytes(b"\"maxOutputTokens\":")?;
+        doc.write(n, e)?;
+    }
     if let Some(format) = doc.member(root, "response_format")? {
+        if super::is(doc, format, "type", "json_object")? {
+            comma(&mut first, e)?;
+            e.bytes(b"\"responseMimeType\":\"application/json\"")?;
+        }
         for key in ["responseMimeType", "responseSchema", "responseJsonSchema"] {
             if let Some(n) = doc.member(format, key)? {
                 comma(&mut first, e)?;
