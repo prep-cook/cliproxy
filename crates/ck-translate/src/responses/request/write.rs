@@ -81,8 +81,13 @@ fn write_field(doc: &Document, field: usize, e: &mut Encoder<'_, '_>) -> Result<
     if doc.name_is(name, "messages")? || doc.name_is(name, "stream")? || doc.name_is(name, "x_ck")? {
         return Ok(());
     }
+    // Chat's `max_tokens` is the older spelling of the same limit; `max_completion_tokens` wins.
+    let legacy = doc.name_is(name, "max_tokens")?;
+    if legacy && doc.member(doc.root(), "max_completion_tokens")?.is_some() {
+        return Ok(());
+    }
     e.bytes(b",")?;
-    if doc.name_is(name, "max_completion_tokens")? {
+    if legacy || doc.name_is(name, "max_completion_tokens")? {
         e.string("max_output_tokens")?;
     } else if doc.name_is(name, "response_format")? {
         e.string("text")?;

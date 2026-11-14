@@ -47,6 +47,21 @@ fn continuation_tool_outputs_link_to_the_referenced_state() {
     }
 }
 
+/// Runs `input` through `ingress` and Responses request egress; returns the raw upstream body.
+fn encoded(ingress: &mut impl RequestIngress, writer: &mut ck_stream::Writer, input: &Value) -> String {
+    ingress.advance(writer, &serde_json::to_vec(input).unwrap()).unwrap();
+    let ready = ingress
+        .finish(writer, &responses::request::ResponsesCapability)
+        .unwrap();
+    let output = responses::request::Egress {
+        destination: "responses",
+        upstream_stream: false,
+    }
+    .encode(&ready, writer)
+    .unwrap();
+    String::from_utf8(bytes(&output)).unwrap()
+}
+
 /// Encodes a Responses request and returns the raw upstream body.
 fn raw_request(input: &Value) -> String {
     let mut m = Mapped::new();
@@ -58,19 +73,7 @@ fn raw_request(input: &Value) -> String {
         1024 * 1024,
     )
     .unwrap();
-    ingress
-        .advance(&mut m.writer, &serde_json::to_vec(input).unwrap())
-        .unwrap();
-    let ready = ingress
-        .finish(&mut m.writer, &responses::request::ResponsesCapability)
-        .unwrap();
-    let output = responses::request::Egress {
-        destination: "responses",
-        upstream_stream: false,
-    }
-    .encode(&ready, &mut m.writer)
-    .unwrap();
-    String::from_utf8(bytes(&output)).unwrap()
+    encoded(&mut ingress, &mut m.writer, input)
 }
 
 #[test]
@@ -80,4 +83,36 @@ fn text_format_and_verbosity_share_one_text_object() {
     assert_eq!(raw.matches("\"text\":").count(), 1, "{raw}");
     let output: Value = serde_json::from_str(&raw).unwrap();
     assert_eq!(output["text"], input["text"]);
+}
+
+/// Encodes a Chat request for a Responses upstream and returns the raw body.
+fn chat_raw(input: &Value) -> String {
+    let mut m = Mapped::new();
+    let mut ingress = codec::chat::request::Ingress::new(
+        &mut m.writer,
+        &m.store,
+        identity(Direction::Request),
+        Operation::Generate,
+        1024 * 1024,
+    )
+    .unwrap();
+    encoded(&mut ingress, &mut m.writer, input)
+}
+
+#[test]
+fn chat_token_limits_become_max_output_tokens() {
+    let messages = json!([{"role":"user","content":"q"}]);
+    for (input, limit) in [
+        (json!({"model":"m","messages":messages,"max_tokens":17}), 17),
+        (
+            json!({"model":"m","messages":messages,"max_tokens":17,"max_completion_tokens":9}),
+            9,
+        ),
+    ] {
+        let raw = chat_raw(&input);
+        assert_eq!(raw.matches("\"max_output_tokens\":").count(), 1, "{raw}");
+        let output: Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(output["max_output_tokens"], limit, "{output}");
+        assert!(output.get("max_tokens").is_none(), "{output}");
+    }
 }
