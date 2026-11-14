@@ -1,7 +1,8 @@
 use super::*;
 
-/// Input held per data record. Advance feeds at most 8,192 bytes between steps, and decoding
-/// never grows bytes, so held input plus one step stays within a 36,864-byte decoded chunk.
+/// Input held per data record, counting an incomplete scalar or escape. Advance feeds at most
+/// 8,192 bytes between steps, and decoding never grows bytes, so held input plus one step stays
+/// within a 36,864-byte decoded chunk.
 const HELD_BYTES: u64 = 36_864 - 8_192;
 /// Collection delay of held input (docs/INTERNAL-STREAM.md, §3.4).
 pub(super) const FLUSH_DELAY: std::time::Duration = std::time::Duration::from_millis(100);
@@ -209,9 +210,11 @@ impl Ingress {
     fn append_string(&mut self, owner: &mut Writer, wire: json::Node, force: bool) -> Result<bool> {
         let pending = self.string.as_mut().ok_or(Error::Schema)?;
         let ended = wire.span.end != 0;
+        // An incomplete scalar or escape after the validated end decodes with the next step.
+        let received = self.document.input().len();
         if wire.validated_end > pending.offset {
             let since = *pending.held.get_or_insert_with(std::time::Instant::now);
-            if !ended && !force && wire.validated_end - pending.offset < HELD_BYTES && since.elapsed() < FLUSH_DELAY {
+            if !ended && !force && received - pending.offset < HELD_BYTES && since.elapsed() < FLUSH_DELAY {
                 return Ok(false);
             }
         }

@@ -527,3 +527,42 @@ fn long_streamed_string_fills_data_records() {
     let wire = String::from_utf8(mapped.output(&mapped.writer)).unwrap();
     assert_eq!(wire.matches("event: x_ck.data\n").count(), 4);
 }
+
+/// Input split inside a scalar or escape just below the record threshold still fits one data
+/// record when the next 8,192-byte piece completes it.
+#[test]
+fn split_scalar_at_the_record_threshold_fits_a_record() {
+    for (carry, rest, scalar) in [
+        (&b"\xf0\x9f\x9a"[..], &b"\x80"[..], "🚀"),
+        (br"\u4e2", br"d", "中"),
+        (br"\ud83d\ude8", br"0", "🚀"),
+    ] {
+        let mut mapped = Mapped::new();
+        let mut ingress = Ingress::new(
+            &mut mapped.writer,
+            &mapped.store,
+            identity(Direction::Request),
+            Operation::Generate,
+            100_000,
+        )
+        .unwrap();
+        let mut first = br#"{"model":"m","messages":[{"role":"user","content":""#.to_vec();
+        first.extend(std::iter::repeat_n(b'a', 28_671));
+        first.extend_from_slice(carry);
+        ingress.advance(&mut mapped.writer, &first).unwrap();
+        let mut second = rest.to_vec();
+        second.resize(8192, b'a');
+        ingress.advance(&mut mapped.writer, &second).unwrap();
+        ingress.advance(&mut mapped.writer, br#""}]}"#).unwrap();
+        let ready = ingress.finish(&mut mapped.writer, &ChatCapability).unwrap();
+        let output = Egress {
+            destination: "chat",
+            upstream_stream: false,
+        }
+        .encode(&ready, &mut mapped.writer)
+        .unwrap();
+        let output: serde_json::Value = serde_json::from_slice(&bytes(&output)).unwrap();
+        let content = format!("{}{scalar}{}", "a".repeat(28_671), "a".repeat(8192 - rest.len()));
+        assert_eq!(output["messages"][0]["content"], content);
+    }
+}
