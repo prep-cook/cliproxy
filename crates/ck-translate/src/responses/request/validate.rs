@@ -2,7 +2,20 @@ use super::super::{is, string};
 use crate::codec::{
     Error, Operation, RequestView, Result,
     document::{Document, Value},
+    table::Table,
 };
+use std::collections::hash_map::RandomState;
+
+/// Tool call IDs by hash, then message ordinal, then ID node: one sorted index replaces a
+/// history rescan for every tool output.
+type CallIndex = Table<(u64, u64, usize)>;
+/// The call index and the ordinal of the message being validated.
+#[derive(Clone, Copy)]
+struct Calls<'a> {
+    index: &'a CallIndex,
+    hasher: &'a RandomState,
+    ordinal: u64,
+}
 
 pub(super) fn validate(view: RequestView<'_>) -> Result<()> {
     if view.operation == Operation::CountTokens {
@@ -41,9 +54,19 @@ pub(super) fn validate(view: RequestView<'_>) -> Result<()> {
         Some(x) => continued(doc, x)?,
         None => false,
     };
-    for message in doc.children(messages)? {
-        validate_message(view, messages, message, continued)?;
-    }
+    doc.with_table(|index| {
+        let hasher = RandomState::new();
+        index_calls(doc, messages, index, &hasher)?;
+        for (ordinal, message) in doc.children(messages)?.enumerate() {
+            let calls = Calls {
+                index,
+                hasher: &hasher,
+                ordinal: ordinal as u64,
+            };
+            validate_message(view, message, calls, continued)?;
+        }
+        Ok(())
+    })?;
     if let Some(x) = x {
         validate_extensions(doc, x)?;
     }
@@ -65,9 +88,47 @@ fn continued(doc: &Document, x: usize) -> Result<bool> {
         None => false,
     })
 }
+/// Indexes every call ID. A repeated ID is accepted: the Responses API documents no uniqueness
+/// rule for `call_id`, and an output then links to any earlier call with it.
+fn index_calls(doc: &Document, messages: usize, index: &mut CallIndex, hasher: &RandomState) -> Result<()> {
+    for (ordinal, message) in doc.children(messages)?.enumerate() {
+        if let Some(list) = doc.member(message, "tool_calls")? {
+            for call in doc.children(list)? {
+                let id = doc.required(call, "id")?;
+                string(doc, id)?;
+                index.push((string_hash(doc, id, hasher)?, ordinal as u64, id))?;
+            }
+        }
+    }
+    index.sort_unstable();
+    Ok(())
+}
+/// Whether a call in a message before `calls.ordinal` has the ID `id`.
+fn prior_call(doc: &Document, calls: Calls<'_>, id: usize) -> Result<bool> {
+    let hash = string_hash(doc, id, calls.hasher)?;
+    let first = calls.index.partition_point(|entry| entry.0 < hash);
+    for &(_, _, call) in calls.index[first..]
+        .iter()
+        .take_while(|entry| entry.0 == hash && entry.1 < calls.ordinal)
+    {
+        if doc.equal_strings(call, id)? {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+fn string_hash(doc: &Document, node: usize, hasher: &RandomState) -> Result<u64> {
+    use std::hash::{BuildHasher, Hasher};
+    let mut state = hasher.build_hasher();
+    let mut chars = doc.chars(node)?;
+    while let Some(c) = chars.next_scalar()? {
+        state.write_u32(c as u32);
+    }
+    Ok(state.finish())
+}
 /// Validates one message; a tool output must follow its call unless `continued` stored state
 /// may own the call.
-fn validate_message(view: RequestView<'_>, messages: usize, message: usize, continued: bool) -> Result<()> {
+fn validate_message(view: RequestView<'_>, message: usize, calls: Calls<'_>, continued: bool) -> Result<()> {
     let doc = view.document;
     let role = doc.required(message, "role")?;
     let mut valid = false;
@@ -77,24 +138,10 @@ fn validate_message(view: RequestView<'_>, messages: usize, message: usize, cont
     if !valid {
         return Err(Error::Unsupported);
     }
-    // ponytail: the linkage scan is quadratic in history; the 1 MiB metadata default bounds a
-    // request to about 10 call turns. Replace it with a metadata-charged call-id index when
-    // that bound rises (docs/DEFERRED-OPTIONS.md).
     if is(doc, message, "role", "tool")? {
         let id = doc.required(message, "tool_call_id")?;
         string(doc, id)?;
-        let mut found = false;
-        for previous in doc.children(messages)? {
-            if previous == message {
-                break;
-            }
-            if let Some(calls) = doc.member(previous, "tool_calls")? {
-                for call in doc.children(calls)? {
-                    found |= doc.equal_strings(doc.required(call, "id")?, id)?;
-                }
-            }
-        }
-        if !found && !continued {
+        if !continued && !prior_call(doc, calls, id)? {
             return Err(Error::Schema);
         }
     }
