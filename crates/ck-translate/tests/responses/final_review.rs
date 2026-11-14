@@ -44,6 +44,11 @@ fn announced_parts_and_calls_carry_their_empty_accumulators() {
     let added = named(&events, "response.output_item.added");
     let call = added.iter().find(|e| e["item"]["type"] == "function_call").unwrap();
     assert_eq!(call["item"]["arguments"], "");
+    // A call split out of a message does not announce the message, which stays empty (F7).
+    assert_eq!(added.len(), 1);
+    let buffered = chat_to_responses(chat.as_bytes(), BodyMode::Streaming, BodyMode::Buffered);
+    let body: Value = serde_json::from_slice(&buffered).unwrap();
+    assert_eq!(body["output"].as_array().unwrap().len(), 1, "{body}");
     let text = sse(&[
         json!({"id":"c","object":"chat.completion.chunk","created":1,"model":"m","choices":[{"index":0,"delta":{"role":"assistant","content":"hi"},"finish_reason":null}]}),
         json!({"id":"c","object":"chat.completion.chunk","created":1,"model":"m","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}),
@@ -335,10 +340,20 @@ fn redacted_reasoning_has_no_responses_carrier() {
             ),
             (Kind::Done, Scope::default(), ""),
         ];
-        for (records, expected) in [(
-            &records[..],
-            json!([{"type":"output_text","text":"hi","annotations":[]}]),
-        )] {
+        // Without the text block the message has no content and is not written at all.
+        let redacted_only: Vec<_> = records
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| !(5..8).contains(i))
+            .map(|(_, r)| *r)
+            .collect();
+        for (records, expected) in [
+            (
+                &records[..],
+                json!([{"type":"output_text","text":"hi","annotations":[]}]),
+            ),
+            (&redacted_only[..], Value::Null),
+        ] {
             for mode in [BodyMode::Buffered, BodyMode::Streaming] {
                 let (out, diagnostics) = egress_of(records, mode);
                 let text = String::from_utf8(out.clone()).unwrap();

@@ -2,18 +2,18 @@
 use super::*;
 
 impl<F: FnMut(&'static str, u64)> Egress<F> {
-    /// Announces the pending message item before event `kind` adds content, a call or media to
-    /// it; role-only and finish chunks, reasoning block starts and its own end do not.
+    /// Announces the pending message item when event `kind` gives it content, a content block. A
+    /// call or reasoning split out of it and a dropped redacted block do not; Responses egress
+    /// refuses media inside a message item.
     pub(super) fn announce_for(
         &mut self,
         owner: &mut Writer,
         (kind, node, item): (Kind, usize, usize),
         output: &mut impl FnMut(ScratchLease) -> Result<()>,
     ) -> Result<()> {
-        if self.pending == Some(item)
-            && !matches!(kind, Kind::ItemEnd | Kind::Chunk)
-            && !(kind == Kind::BlockStart && reasoning(&self.document, node)?)
-        {
+        let doc = &self.document;
+        let content = kind == Kind::BlockStart && !reasoning(doc, node)? && !redacted(doc, node)?;
+        if self.pending == Some(item) && content {
             self.announce(owner, output)?;
         }
         Ok(())

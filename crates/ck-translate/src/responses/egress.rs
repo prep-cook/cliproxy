@@ -239,6 +239,13 @@ fn reasoning(doc: &Document, node: usize) -> Result<bool> {
         || is(doc, node, "kind", "thinking")?
         || is(doc, node, "kind", "reasoning")?)
 }
+/// Whether block start `node` opens redacted reasoning, which egress drops.
+fn redacted(doc: &Document, node: usize) -> Result<bool> {
+    Ok(is(doc, node, "kind", "redacted")?
+        || doc
+            .member(node, "attributes")?
+            .map_or(Ok(false), |attributes| is(doc, attributes, "type", "redacted"))?)
+}
 /// Position of `item` in the response output.
 fn position(doc: &Document, item: usize) -> Result<u64> {
     let output = doc.required(doc.root(), "output")?;

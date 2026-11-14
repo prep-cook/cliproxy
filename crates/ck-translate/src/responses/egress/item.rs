@@ -134,10 +134,7 @@ impl<F: FnMut(&'static str, u64)> Egress<F> {
         let At { node, x, .. } = at;
         let summary = is(&self.document, node, "kind", "reasoning_summary")?;
         let thinking = is(&self.document, node, "kind", "thinking")? || is(&self.document, node, "kind", "reasoning")?;
-        let attributes = self.document.member(node, "attributes")?;
-        if is(&self.document, node, "kind", "redacted")?
-            || attributes.map_or(Ok(false), |a| is(&self.document, a, "type", "redacted"))?
-        {
+        if super::redacted(&self.document, node)? {
             // Its data is dropped by `redacted`; no reasoning item is split out for it.
             return Ok(());
         }
