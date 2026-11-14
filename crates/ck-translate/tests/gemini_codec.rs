@@ -19,6 +19,8 @@ mod media;
 mod quota;
 #[path = "gemini/regressions.rs"]
 mod regressions;
+#[path = "gemini/roundtrip.rs"]
+mod roundtrip;
 #[path = "semantic/mod.rs"]
 mod semantic;
 #[path = "gemini/streams.rs"]
