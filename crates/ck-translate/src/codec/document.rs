@@ -2,6 +2,8 @@ mod edit;
 mod iter;
 #[path = "document_pending.rs"]
 pub(crate) mod pending;
+#[cfg(test)]
+mod tests;
 
 pub use iter::{Characters, Children, EncodedCharacters, FragmentCharacters};
 
@@ -10,6 +12,7 @@ use ck_stream::{MetadataPermit, Writer};
 use super::{
     Error, Result,
     encode::Encoder,
+    event::LocalId,
     json,
     source::{Source, Span},
     table::grown,
@@ -41,8 +44,13 @@ pub enum Value {
     Null,
     Text(&'static str),
     Unsigned(u64),
-    Id(super::event::LocalId),
+    Id(IdIndex),
 }
+
+/// A gateway id held in its document's id table, so a [`Value`] stays at the size of a
+/// [`Text`] rather than of an inline [`LocalId`]. It is meaningful only in that document.
+#[derive(Clone, Copy, Debug)]
+pub struct IdIndex(u32);
 
 #[derive(Clone, Copy, Debug)]
 pub struct Node {
@@ -70,6 +78,8 @@ pub struct Node {
 pub struct Document {
     sources: Vec<Source>,
     nodes: Vec<Node>,
+    /// The ids [`Value::Id`] nodes name; charged to `metadata` with the node and source tables.
+    ids: Vec<LocalId>,
     metadata: MetadataPermit,
     /// Charges transient indexes that read-only validation builds; see [`Self::with_table`].
     scratch: std::sync::Mutex<Option<MetadataPermit>>,
@@ -94,6 +104,7 @@ impl Document {
         let mut doc = Self {
             sources: Vec::new(),
             nodes: Vec::new(),
+            ids: Vec::new(),
             metadata: owner.reserve_metadata(0)?,
             scratch: std::sync::Mutex::new(Some(owner.reserve_metadata(0)?)),
             records: None,
@@ -107,12 +118,13 @@ impl Document {
         let mut doc = Self {
             sources: Vec::new(),
             nodes: Vec::new(),
+            ids: Vec::new(),
             metadata: owner.reserve_metadata(0)?,
             scratch: std::sync::Mutex::new(Some(owner.reserve_metadata(0)?)),
             records: None,
             root: 0,
         };
-        doc.reserve(1, 1)?;
+        doc.reserve(1, 1, 0)?;
         doc.sources.push(Source::new(owner)?);
         doc.add(None, Value::Object)?;
         Ok(doc)
@@ -173,16 +185,13 @@ impl Document {
         Ok(target)
     }
 
-    /// Makes room for `nodes` and `sources` more entries. The permit is charged for the new
-    /// capacity before the tables grow, then for the capacity actually allocated.
-    fn reserve(&mut self, nodes: usize, sources: usize) -> Result<()> {
+    /// Makes room for `nodes`, `sources` and `ids` more entries. The permit is charged for the
+    /// new capacity before the tables grow, then for the capacity actually allocated.
+    fn reserve(&mut self, nodes: usize, sources: usize, ids: usize) -> Result<()> {
         let n = grown(self.nodes.len(), nodes, self.nodes.capacity(), 4)?;
         let s = grown(self.sources.len(), sources, self.sources.capacity(), 4)?;
-        self.metadata.resize(
-            n.checked_mul(std::mem::size_of::<Node>())
-                .and_then(|v| v.checked_add(s * std::mem::size_of::<Source>()))
-                .ok_or(Error::Limit)?,
-        )?;
+        let i = grown(self.ids.len(), ids, self.ids.capacity(), 4)?;
+        self.metadata.resize(Self::table_bytes(n, s, i).ok_or(Error::Limit)?)?;
         if n > self.nodes.capacity() {
             self.nodes
                 .try_reserve_exact(n - self.nodes.len())
@@ -193,11 +202,35 @@ impl Document {
                 .try_reserve_exact(s - self.sources.len())
                 .map_err(|_| Error::Limit)?;
         }
+        if i > self.ids.capacity() {
+            self.ids
+                .try_reserve_exact(i - self.ids.len())
+                .map_err(|_| Error::Limit)?;
+        }
         self.metadata.resize(
-            self.nodes.capacity() * std::mem::size_of::<Node>()
-                + self.sources.capacity() * std::mem::size_of::<Source>(),
+            Self::table_bytes(self.nodes.capacity(), self.sources.capacity(), self.ids.capacity())
+                .ok_or(Error::Limit)?,
         )?;
         Ok(())
+    }
+
+    fn table_bytes(nodes: usize, sources: usize, ids: usize) -> Option<usize> {
+        nodes
+            .checked_mul(std::mem::size_of::<Node>())?
+            .checked_add(sources.checked_mul(std::mem::size_of::<Source>())?)?
+            .checked_add(ids.checked_mul(std::mem::size_of::<LocalId>())?)
+    }
+
+    /// Sets member `name` of `parent` to the gateway id `id`, kept in this document's id table.
+    pub fn set_id(&mut self, parent: usize, name: &'static str, id: LocalId) -> Result<usize> {
+        let index = IdIndex(u32::try_from(self.ids.len()).map_err(|_| Error::Limit)?);
+        self.reserve(0, 0, 1)?;
+        self.ids.push(id);
+        self.set(parent, name, Value::Id(index))
+    }
+
+    pub fn local_id(&self, index: IdIndex) -> Result<&LocalId> {
+        self.ids.get(index.0 as usize).ok_or(Error::Position)
     }
 
     fn import(&mut self, source: Source, scanner: &json::Scanner) -> Result<usize> {
@@ -205,7 +238,7 @@ impl Document {
         if source.stream_id() != self.stream_id() {
             return Err(Error::Position);
         }
-        self.reserve(scanner.nodes().len(), 1)?;
+        self.reserve(scanner.nodes().len(), 1, 0)?;
         let part = self.sources.len();
         let base = self.nodes.len();
         for n in scanner.nodes() {
@@ -265,15 +298,20 @@ impl Document {
         if self.stream_id() != other.stream_id() {
             return Err(Error::Position);
         }
-        self.reserve(other.nodes.len(), other.sources.len())?;
+        self.reserve(other.nodes.len(), other.sources.len(), other.ids.len())?;
         let base = self.nodes.len();
         let source_base = self.sources.len();
+        // Every remapped id index stays below this sum, so a u32 holds it.
+        u32::try_from(self.ids.len() + other.ids.len()).map_err(|_| Error::Limit)?;
+        let id_base = self.ids.len() as u32;
         for mut node in other.nodes.drain(..) {
             if let Some(Name::Mapped(text) | Name::Pointer(text)) = &mut node.name {
                 text.source += source_base;
             }
-            if let Value::String(text) | Value::Number(text) = &mut node.value {
-                text.source += source_base;
+            match &mut node.value {
+                Value::String(text) | Value::Number(text) => text.source += source_base,
+                Value::Id(IdIndex(id)) => *id += id_base,
+                _ => {}
             }
             node.first = node.first.map(|i| i + base);
             node.next = node.next.map(|i| i + base);
@@ -290,6 +328,7 @@ impl Document {
             self.nodes.push(node);
         }
         self.sources.append(&mut other.sources);
+        self.ids.append(&mut other.ids);
         Ok(base + other.root)
     }
 
@@ -522,7 +561,7 @@ impl Document {
             Value::String(t) | Value::Number(t) => e.span(self.source(t)?, t.span),
             Value::Text(s) => e.string(s),
             Value::Unsigned(n) => e.unsigned(n),
-            Value::Id(id) => e.string(id.as_str()),
+            Value::Id(id) => e.string(self.local_id(id)?.as_str()),
             Value::Bool(b) => e.bytes(if b { b"true" } else { b"false" }),
             Value::Null => e.bytes(b"null"),
         }

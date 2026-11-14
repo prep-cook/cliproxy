@@ -300,7 +300,7 @@ fn replay(doc: &mut Document, part: usize, message_index: u64, block_index: u64,
     doc.append(list, entry)?;
     doc.set(entry, "message_index", Value::Unsigned(message_index))?;
     doc.set(entry, "block_index", Value::Unsigned(block_index))?;
-    doc.set(entry, "item_id", Value::Id(media::local_id(b'i', message_index)?))?;
+    doc.set_id(entry, "item_id", media::local_id(b'i', message_index)?)?;
     doc.set(entry, "kind", Value::Text(kind))?;
     let source = doc.set(entry, "source", Value::Object)?;
     doc.set(source, "protocol", Value::Text("anthropic"))?;
